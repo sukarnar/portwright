@@ -1,0 +1,318 @@
+project: hr-demo
+version: 1.0.0
+server:
+  host: 127.0.0.1
+  port: 8080
+  base_path: /api
+security:
+  auth_methods:
+  - api_key
+  - jwt
+  api_key_header: X-API-Key
+  jwt:
+    secret: ${ENV:PORTWRIGHT_JWT_SECRET}
+    algorithm: HS256
+    ttl_minutes: 30
+    issuer: portwright
+    audience: portwright-api
+  rate_limit:
+    requests: 120
+    window_seconds: 60
+    login_requests: 5
+  api_keys: []
+  users: []
+  allowed_callable_modules:
+  - handlers
+  allowed_upstream_hosts:
+  - jsonplaceholder.typicode.com
+  data_root: data
+  cors_origins: []
+  max_body_bytes: 1048576
+  expose_docs: true
+  audit_log: logs/audit.jsonl
+sources:
+  hr:
+    type: sql
+    description: ''
+    read_only: false
+    pool_size: 5
+    headers: {}
+    timeout_seconds: 10.0
+    credential: hr_db
+  sales:
+    type: file
+    description: ''
+    read_only: true
+    pool_size: 5
+    path: sales.csv
+    headers: {}
+    timeout_seconds: 10.0
+  pricing:
+    type: callable
+    description: ''
+    read_only: true
+    pool_size: 5
+    headers: {}
+    timeout_seconds: 10.0
+    module: handlers.pricing
+  jsonph:
+    type: rest
+    description: Add --credential <name> for authenticated upstream APIs
+    read_only: true
+    pool_size: 5
+    base_url: https://jsonplaceholder.typicode.com
+    headers: {}
+    timeout_seconds: 10.0
+endpoints:
+- name: employees-list
+  path: /employees
+  method: GET
+  source: hr
+  description: ''
+  tags:
+  - employees
+  params:
+  - name: dept
+    type: string
+    in: query
+    required: false
+    description: ''
+    max_length: 1024
+  public: false
+  scopes:
+  - employees:read
+  operation: list
+  table: employees
+  key: id
+  columns:
+  - id
+  - name
+  - dept
+  - salary
+  filters: []
+  max_limit: 500
+- name: employees-get
+  path: /employees/{id}
+  method: GET
+  source: hr
+  description: ''
+  tags:
+  - employees
+  params:
+  - name: id
+    type: integer
+    in: path
+    required: true
+    description: ''
+    max_length: 1024
+  public: false
+  scopes:
+  - employees:read
+  operation: get
+  table: employees
+  key: id
+  columns:
+  - id
+  - name
+  - dept
+  - salary
+  filters: []
+  max_limit: 500
+- name: employees-create
+  path: /employees
+  method: POST
+  source: hr
+  description: ''
+  tags:
+  - employees
+  params:
+  - name: name
+    type: string
+    in: body
+    required: true
+    description: ''
+    max_length: 1024
+  - name: dept
+    type: string
+    in: body
+    required: false
+    description: ''
+    max_length: 1024
+  - name: salary
+    type: number
+    in: body
+    required: false
+    description: ''
+    max_length: 1024
+  public: false
+  scopes:
+  - employees:write
+  operation: create
+  table: employees
+  key: id
+  columns:
+  - id
+  - name
+  - dept
+  - salary
+  filters: []
+  max_limit: 500
+- name: employees-update
+  path: /employees/{id}
+  method: PATCH
+  source: hr
+  description: ''
+  tags:
+  - employees
+  params:
+  - name: id
+    type: integer
+    in: path
+    required: true
+    description: ''
+    max_length: 1024
+  - name: name
+    type: string
+    in: body
+    required: false
+    description: ''
+    max_length: 1024
+  - name: dept
+    type: string
+    in: body
+    required: false
+    description: ''
+    max_length: 1024
+  - name: salary
+    type: number
+    in: body
+    required: false
+    description: ''
+    max_length: 1024
+  public: false
+  scopes:
+  - employees:write
+  operation: update
+  table: employees
+  key: id
+  columns:
+  - id
+  - name
+  - dept
+  - salary
+  filters: []
+  max_limit: 500
+- name: employees-delete
+  path: /employees/{id}
+  method: DELETE
+  source: hr
+  description: ''
+  tags:
+  - employees
+  params:
+  - name: id
+    type: integer
+    in: path
+    required: true
+    description: ''
+    max_length: 1024
+  public: false
+  scopes:
+  - employees:write
+  operation: delete
+  table: employees
+  key: id
+  columns:
+  - id
+  - name
+  - dept
+  - salary
+  filters: []
+  max_limit: 500
+- name: dept-summary
+  path: /reports/departments
+  method: GET
+  source: hr
+  description: ''
+  tags: []
+  params:
+  - name: dept
+    type: string
+    in: query
+    required: false
+    description: ''
+    max_length: 1024
+  public: false
+  scopes:
+  - reports:read
+  operation: query
+  query: select dept, count(*) n, avg(salary) avg_salary from employees where (:dept
+    is null or dept = :dept) group by dept
+  filters: []
+  max_limit: 500
+- name: sales-list
+  path: /sales
+  method: GET
+  source: sales
+  description: ''
+  tags: []
+  params:
+  - name: region
+    type: string
+    in: query
+    required: false
+    description: ''
+    max_length: 1024
+  public: false
+  scopes:
+  - sales:read
+  columns:
+  - order_id
+  - region
+  - amount
+  filters:
+  - region
+  max_limit: 500
+- name: quote
+  path: /quote/{symbol}
+  method: GET
+  source: pricing
+  description: ''
+  tags: []
+  params:
+  - name: symbol
+    type: string
+    in: path
+    required: true
+    description: ''
+    max_length: 1024
+  - name: qty
+    type: integer
+    in: query
+    required: false
+    description: ''
+    max_length: 1024
+  public: false
+  scopes:
+  - pricing:read
+  filters: []
+  target: quote
+  max_limit: 500
+- name: todo
+  path: /todos/{id}
+  method: GET
+  source: jsonph
+  description: ''
+  tags: []
+  params:
+  - name: id
+    type: integer
+    in: path
+    required: true
+    description: ''
+    max_length: 1024
+  public: true
+  scopes: []
+  filters: []
+  upstream_path: /todos/{id}
+  max_limit: 500
