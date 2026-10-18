@@ -202,19 +202,56 @@ def _find_client(explicit: Path | None) -> str | None:
     return None
 
 
+def _offline_guard() -> None:
+    """Studio never installs or downloads anything at run time (offline / SSL-inspected networks).
+
+    Flet would otherwise pip-install a missing or mismatched flet-web / flet-desktop from PyPI.
+    """
+    import flet.utils.pip as flet_pip
+
+    def _refuse(package: str, *_a, **_k):
+        raise SystemExit(
+            f"{package} {ft.version.flet_version} is not installed in this Python environment.\n"
+            "Portwright Studio never downloads anything. Install the Studio add-on offline:\n"
+            "  .\\install-studio-offline.ps1      (from portwright-studio-addon-windows.zip)")
+    flet_pip.install_flet_package = _refuse
+
+
+def _has(module: str) -> bool:
+    import importlib.util
+    try:
+        return importlib.util.find_spec(module) is not None
+    except (ImportError, ValueError):
+        return False
+
+
 def launch(config_path: str | None = DEFAULT_CONFIG, web: bool = False, port: int = 8550,
-           client_path: Path | None = None) -> None:
+           client_path: Path | None = None, allow_download: bool = False, open_browser: bool = True) -> None:
     if config_path:
         config_path = resolve_config(config_path)
+    if not allow_download:
+        _offline_guard()
     if not web:
         client = _find_client(client_path)
         if client:
             os.environ["FLET_VIEW_PATH"] = client          # use the pre-downloaded client (offline servers)
         elif client_path:
             raise SystemExit(f"flet{'.exe' if os.name == 'nt' else ''} not found in {client_path}")
-        token = None
-    else:
-        token = secrets.token_urlsafe(24)
+        elif not allow_download:
+            # Flet would download the desktop client from GitHub here – which fails behind company
+            # proxies / certificate inspection. Use the browser instead: nothing to download or run.
+            print("The Studio desktop window (flet.exe) is not installed, and Portwright does not download it.\n"
+                  "Opening Studio in your browser instead (this PC only).\n"
+                  "For the window: install-studio-offline.ps1 -ClientZip <flet-windows.zip>, or --client-path.",
+                  flush=True)
+            web = True
+        if not web and not _has("flet_desktop"):
+            print("flet-desktop is not installed - opening Studio in your browser instead.", flush=True)
+            web = True
+    if web and not _has("flet_web") and not allow_download:
+        raise SystemExit("flet-web is not installed in this Python environment. Portwright Studio never "
+                         "downloads anything - install the Studio add-on (install-studio-offline.ps1).")
+    token = secrets.token_urlsafe(24) if web else None
 
     def main(page: ft.Page):
         if token is not None:
@@ -231,7 +268,8 @@ def launch(config_path: str | None = DEFAULT_CONFIG, web: bool = False, port: in
         url = f"http://127.0.0.1:{port}/?token={token}"
         os.environ["FLET_DISPLAY_URL_PREFIX"] = "portwright-studio"     # we open the browser ourselves (with token)
         print(f"Portwright Studio (web mode, this computer only): {url}", flush=True)
-        threading.Timer(2.0, lambda: webbrowser.open(url)).start()
+        if open_browser:
+            threading.Timer(2.0, lambda: webbrowser.open(url)).start()
         ft.run(main, host="127.0.0.1", port=port, view=ft.AppView.WEB_BROWSER, no_cdn=True)
     else:
         ft.run(main)

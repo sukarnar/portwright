@@ -23,7 +23,7 @@ class TestResult:
 
 # ======================================================================== sources
 class SourceService:
-    TYPES = ("sql", "file", "rest", "callable")
+    TYPES = ("sql", "file", "rest", "callable", "ldap")
 
     def __init__(self, project: Project):
         self.p = project
@@ -36,6 +36,8 @@ class SourceService:
         out = []
         for name, s in self.cfg.sources.items():
             detail = s.url or s.path or s.base_url or s.module or ""
+            if s.type == "ldap":
+                detail = (", ".join(s.servers) if s.servers else "PowerShell AD module") + f" · {s.base_dn}"
             if s.type == "sql" and not detail:
                 detail = "database (login from credential)"
             out.append({"name": name, "type": s.type, "detail": detail, "credential": s.credential,
@@ -53,7 +55,9 @@ class SourceService:
             sheet: str | None = None, base_url: str | None = None, headers: dict | None = None,
             module: str | None = None, read_write: bool = False, allow_host: bool = False,
             credential: str | None = None, allow_credentials: list[str] | None = None,
-            description: str = "", replace: bool = False) -> list[str]:
+            description: str = "", replace: bool = False, servers: list[str] | None = None,
+            base_dn: str | None = None, directory: str = "ldap", ca_file: str | None = None,
+            allow_plain_ldap: bool = False) -> list[str]:
         """Add (or with replace=True, overwrite) a source. Returns warnings."""
         warnings = []
         if name in self.cfg.sources and not replace:
@@ -71,7 +75,10 @@ class SourceService:
             spec = SourceSpec(type=type, url=url or None, path=path or None, sheet=sheet or None,
                               base_url=base_url or None, headers=headers or {}, module=module or None,
                               read_only=not read_write, credential=credential or None,
-                              credentials=allow_credentials or [], description=description)
+                              credentials=allow_credentials or [], description=description,
+                              servers=[x.strip() for x in (servers or []) if x and x.strip()],
+                              base_dn=(base_dn or "").strip() or None, directory=directory or "ldap",
+                              ca_file=ca_file or None, allow_plain_ldap=allow_plain_ldap)
         except Exception as exc:
             raise ServiceError(_clean(exc)) from None
         if credential:
@@ -147,6 +154,14 @@ class SourceService:
                         sys.path.insert(0, root)
                     importlib.import_module(spec.module)
                 return TestResult(True, f"Module '{spec.module}' imports OK" if spec.module else "No module set")
+            if spec.type == "ldap":
+                def _t():
+                    d = src.directory()
+                    try:
+                        return d.test()
+                    finally:
+                        d.close()
+                return TestResult(True, await anyio.to_thread.run_sync(_t))
             await src.startup()
             try:
                 if spec.type == "sql":
@@ -163,6 +178,54 @@ class SourceService:
             except Exception:
                 pass
             return TestResult(False, msg)
+
+    # ---------------------------------------------------------- directory
+    def _directory(self, name: str):
+        from .. import sources  # noqa: F401
+        from ..sources.base import create_source
+        spec = self.get(name)
+        if spec.type != "ldap":
+            raise ServiceError(f"'{name}' is not an ldap (Active Directory) source")
+        return create_source(name, spec, self.cfg.security, str(self.p.root), self.p.credentials()).directory()
+
+    def ad_groups(self, name: str, text: str = "", limit: int = 50) -> list[dict]:
+        """Find AD groups by name (for pickers)."""
+        from ..directory import DirectoryError
+        d = self._directory(name)
+        try:
+            return [{"dn": g.dn, "name": g.name, "sam": g.sam} for g in d.search_groups(text, limit)]
+        except DirectoryError as exc:
+            raise ServiceError(str(exc)) from None
+        finally:
+            d.close()
+
+    def ad_group(self, name: str, group: str) -> dict:
+        """One group with its member counts."""
+        from ..directory import DirectoryError
+        d = self._directory(name)
+        try:
+            g = d.resolve_group(group)
+            members = d.members(g.dn)
+            kinds: dict[str, int] = {}
+            for m in members:
+                kinds[m.kind] = kinds.get(m.kind, 0) + 1
+            return {"dn": g.dn, "name": g.name, "sam": g.sam, "members": len(members), "kinds": kinds}
+        except DirectoryError as exc:
+            raise ServiceError(str(exc)) from None
+        finally:
+            d.close()
+
+    def ad_user(self, name: str, email: str, match: list[str] | None = None) -> list[dict]:
+        from ..directory import DirectoryError
+        d = self._directory(name)
+        try:
+            found = d.find_users([email.strip().lower()], match or ["mail", "userPrincipalName"])
+            return [{"dn": e.dn, "name": e.name, "sam": e.sam, "mail": e.mail, "upn": e.upn,
+                     "disabled": e.disabled} for e in found.get(email.strip().lower(), [])]
+        except DirectoryError as exc:
+            raise ServiceError(str(exc)) from None
+        finally:
+            d.close()
 
     # ---------------------------------------------------------- introspect
     def tables(self, name: str) -> list[str]:

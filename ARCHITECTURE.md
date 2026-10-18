@@ -49,6 +49,11 @@ portwright/
     files.py         CSV / JSON / JSONL / XLSX, sandboxed to data_root
     rest.py          Upstream HTTP facade with SSRF protection
     callable.py      Allow-listed Python functions (sync or async)
+    ldap.py          Active Directory source (target of group loads; not an endpoint source)
+  directory/
+    base.py          Directory port: search, members, replace/add/remove; user lookup by mail/UPN
+    ldap.py          LdapDirectory – ldap3 over LDAPS, server pool, paged search, atomic replace
+    powershell.py    PowerShellDirectory – RSAT ActiveDirectory module as the process identity
   credentials/
     types.py         Credential types, validation, SQL URL + HTTP auth builders (OAuth2 flow)
     providers.py     Encrypted file vault, env, OS keyring, HashiCorp Vault KV v2
@@ -57,6 +62,7 @@ portwright/
     mapping.py       Row mapping: rename, transforms, typed casts, constants, auto-map
     writers.py       Insert / Replace / Upsert strategies (dialect-specific MERGE / ON CONFLICT)
     runner.py        LoadRunner: lock, read (all pages), validate vs table, rejects, one transaction, history
+    groups.py        AD group loads: e-mail -> user matching, plan (add/remove/keep), safety, apply
   services/          Use cases shared by CLI and Studio (no printing, no prompts)
   studio/            Flet 1.0 desktop/web app: app.py (shell, launcher), viewmodels.py, views/
   security/

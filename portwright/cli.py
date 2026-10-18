@@ -123,7 +123,7 @@ def init(name: str = typer.Option("portwright-project", help="Project name."),
 @source_app.command("add")
 def source_add(
     name: str,
-    type: str = typer.Option(..., "--type", "-t", help="sql | file | rest | callable"),
+    type: str = typer.Option(..., "--type", "-t", help="sql | file | rest | callable | ldap"),
     url: Optional[str] = typer.Option(None, help="SQLAlchemy URL – use ${ENV:VAR} for credentials."),
     path: Optional[str] = typer.Option(None, help="File name inside the data folder."),
     sheet: Optional[str] = typer.Option(None, help="Excel sheet name."),
@@ -135,6 +135,14 @@ def source_add(
     credential: Optional[str] = typer.Option(None, "--credential", help="Managed credential for connecting/auth."),
     allow_credential: list[str] = typer.Option([], "--allow-credential",
                                                help="Callable only: credential the handler may read (repeatable)."),
+    server: list[str] = typer.Option([], "--server", help="ldap: domain controller, e.g. ldaps://dc01.corp.local "
+                                                          "(repeatable, tried in order)."),
+    base_dn: Optional[str] = typer.Option(None, "--base-dn", help="ldap: search base, e.g. DC=corp,DC=local"),
+    directory: str = typer.Option("ldap", "--directory", help="ldap: 'ldap' (LDAPS, ldap3) or 'powershell' "
+                                                              "(ActiveDirectory module, runs as the Windows user)."),
+    ca_file: Optional[str] = typer.Option(None, "--ca-file", help="ldap: CA bundle (PEM) if the DC certificate "
+                                                                  "is not trusted by Windows."),
+    allow_plain_ldap: bool = typer.Option(False, "--allow-plain-ldap", help="ldap: allow unencrypted ldap://."),
     description: str = "",
     config: str = CONFIG_OPT,
 ):
@@ -142,9 +150,44 @@ def source_add(
     s = _svc(config)
     warnings = _run(s.sources.add, name, type, url=url, path=path, sheet=sheet, base_url=base_url,
                     headers=_kv(header), module=module, read_write=read_write, allow_host=allow_host,
-                    credential=credential, allow_credentials=allow_credential, description=description)
+                    credential=credential, allow_credentials=allow_credential, description=description,
+                    servers=server, base_dn=base_dn, directory=directory, ca_file=ca_file,
+                    allow_plain_ldap=allow_plain_ldap)
     _warn(warnings)
     _ok(f"Source '{name}' ({type}) added")
+
+
+@source_app.command("ad-groups")
+def source_ad_groups(name: str, search: str = typer.Option("", "--search", "-s", help="Part of the group name."),
+                     config: str = CONFIG_OPT):
+    """Find Active Directory groups (ldap sources)."""
+    groups = _run(_svc(config).sources.ad_groups, name, search)
+    if not groups:
+        typer.echo("No groups found.")
+    for g in groups:
+        typer.echo(f"{(g['name'] or g['sam'] or ''):<32} {g['dn']}")
+
+
+@source_app.command("ad-group")
+def source_ad_group(name: str, group: str = typer.Argument(..., help="Group DN, name or sAMAccountName."),
+                    config: str = CONFIG_OPT):
+    """Show one AD group and its member counts."""
+    g = _run(_svc(config).sources.ad_group, name, group)
+    typer.echo(f"{g['name']}  {g['dn']}")
+    typer.echo(f"  members: {g['members']}  (" + ", ".join(f"{k}: {v}" for k, v in sorted(g['kinds'].items()))
+               + ")")
+
+
+@source_app.command("ad-user")
+def source_ad_user(name: str, email: str, config: str = CONFIG_OPT):
+    """Look up the AD user for an e-mail address (mail, then userPrincipalName)."""
+    users = _run(_svc(config).sources.ad_user, name, email)
+    if not users:
+        _fail(Exception(f"no AD user with mail or userPrincipalName {email}"))
+    for u in users:
+        typer.echo(f"{u['sam']:<20} {u['name'] or '':<28} mail={u['mail']} upn={u['upn']}"
+                   + ("  DISABLED" if u["disabled"] else ""))
+        typer.echo(f"  {u['dn']}")
 
 
 @source_app.command("set-credential")
@@ -456,7 +499,7 @@ def cred_rekey(passphrase: bool = typer.Option(False, "--passphrase"), config: s
 
 
 # ------------------------------------------------------------------ loads
-load_app = typer.Typer(help="Load data from a CSV/file source or endpoint into a database table, "
+load_app = typer.Typer(help="Load data from a CSV/file source or endpoint into a database table "
                             "with source-to-target column mapping.", no_args_is_help=True)
 app.add_typer(load_app, name="load")
 
@@ -505,10 +548,24 @@ def _print_report(rep, as_json: bool) -> None:
              "skipped": "blue"}[rep.status]
     typer.secho(f"{rep.status.upper()}  load={rep.load} run={rep.run_id} mode={rep.mode} ({rep.seconds}s)",
                 fg=color, bold=True)
-    typer.echo(f"  read={rep.read} mapped={rep.mapped} rejected={rep.rejected} "
-               f"inserted={rep.inserted} updated={rep.updated} upserted={rep.upserted} deleted={rep.deleted}"
-               + (f" dropped_duplicates={rep.dropped}" if rep.dropped else "")
-               + (f" skipped_existing={rep.skipped}" if rep.skipped else ""))
+    if rep.group:
+        verb = "would add" if rep.status == "dry_run" else "added"
+        typer.echo(f"  group: {rep.group}")
+        typer.echo(f"  read={rep.read} users found={rep.mapped} rejected={rep.rejected}"
+                   + (f" repeated={rep.dropped}" if rep.dropped else "")
+                   + f"  {verb}={rep.added} {'would remove' if rep.status == 'dry_run' else 'removed'}={rep.removed}"
+                   f" kept={rep.kept}  members {rep.members_before} -> "
+                   f"{rep.members_after if rep.members_after is not None else '?'}")
+        for c in rep.changes[:20]:
+            typer.secho(f"    {'+' if c['action'] == 'add' else '-'} {c['member']}",
+                        fg="green" if c["action"] == "add" else "red")
+        if len(rep.changes) > 20:
+            typer.echo(f"    ... {len(rep.changes) - 20} more (use --json for all)")
+    else:
+        typer.echo(f"  read={rep.read} mapped={rep.mapped} rejected={rep.rejected} "
+                   f"inserted={rep.inserted} updated={rep.updated} upserted={rep.upserted} deleted={rep.deleted}"
+                   + (f" dropped_duplicates={rep.dropped}" if rep.dropped else "")
+                   + (f" skipped_existing={rep.skipped}" if rep.skipped else ""))
     if rep.source_hash:
         state = {True: "CHANGED since the last load", False: "unchanged since the last load",
                  None: "first load"}[rep.source_changed]
@@ -537,11 +594,14 @@ def _print_report(rep, as_json: bool) -> None:
 @load_app.command("create")
 def load_create(
     name: str,
-    to: str = typer.Option(..., "--to", help="Target SQL source (must be --read-write)."),
-    table: str = typer.Option(..., "--table", help="Target table, e.g. hr.emp_transfers"),
+    to: str = typer.Option(..., "--to", help="Target: SQL source (must be --read-write), or an ldap source."),
+    table: Optional[str] = typer.Option(None, "--table", help="Target table, e.g. hr.emp_transfers"),
+    ad_group: Optional[str] = typer.Option(None, "--ad-group", help="Target AD group (DN or name) instead of a table."),
+    email_column: str = typer.Option("email", "--email-column", help="AD group loads: source column with the e-mail."),
     from_endpoint: Optional[str] = typer.Option(None, "--from-endpoint", help="Read rows from this GET endpoint."),
     from_source: Optional[str] = typer.Option(None, "--from-source", help="Read rows directly from this file source."),
-    mode: str = typer.Option("insert", help="insert | replace | upsert"),
+    mode: str = typer.Option("insert", help="tables: insert | replace | upsert;  AD groups: replace (kill & fill) | "
+                                            "sync | insert (add only)"),
     key: list[str] = typer.Option([], "--key", help="Upsert key target column (repeatable)."),
     auto_map_: bool = typer.Option(False, "--auto-map", help="Suggest a mapping from the CSV header and table."),
     batch_size: int = 1000,
@@ -553,9 +613,18 @@ def load_create(
     svc = _svc(config)
     if svc.project.config.load_job(name):
         _fail(Exception(f"load '{name}' exists – edit it with 'portwright load map'"))
+    if bool(table) == bool(ad_group):
+        raise typer.BadParameter("give either --table or --ad-group")
     draft = {"name": name, "description": description, "mode": "insert", "batch_size": batch_size,
-             "max_rejects": max_rejects, "to": {"source": to, "table": table},
+             "max_rejects": max_rejects,
+             "to": {"source": to, "table": table} if table else {"source": to, "group": ad_group},
              "from": {"endpoint": from_endpoint} if from_endpoint else {"source": from_source}}
+    if ad_group:
+        draft["mode"], draft["ad"] = mode, {"email_column": email_column}
+        spec = _run(svc.loads.save, draft, force=True)
+        _ok(f"Load '{name}' created ({mode}: {from_endpoint or from_source} -> AD group {ad_group} on {to})")
+        typer.echo(f"Next: portwright load validate {name}  →  portwright load run {name} --dry-run --preview 50")
+        return
     _run(svc.loads.build, draft)
     sug = None
     if auto_map_:
@@ -567,7 +636,7 @@ def load_create(
     except ServiceError as exc:
         _fail(Exception(f"{exc}\nTip: create with the default mode first, map the key columns, "
                         f"then set them with 'portwright load map {name} --mode upsert --key <col>'"))
-    _ok(f"Load '{name}' created ({mode}: {from_endpoint or from_source} -> {to}.{table})")
+    _ok(f"Load '{name}' created ({mode}: {from_endpoint or from_source} -> {to}.{table})")  # table loads
     if sug:
         _print_mapping(spec)
         if sug.unmatched:
@@ -601,6 +670,23 @@ def load_map(
     archive_keep: Optional[int] = typer.Option(None, help="Source versions kept as copies (0 = none)."),
     min_rows: Optional[int] = typer.Option(None, help="Kill & fill: refuse with fewer rows than this."),
     min_percent: Optional[float] = typer.Option(None, help="Kill & fill: refuse below this % of current rows."),
+    ad_group: Optional[str] = typer.Option(None, "--ad-group", help="AD group loads: change the target group."),
+    email_column: Optional[str] = typer.Option(None, "--email-column", help="AD group loads: e-mail column."),
+    max_remove_percent: Optional[float] = typer.Option(None, "--max-remove-percent",
+                                                       help="AD group loads: refuse to remove more than this % "
+                                                            "of the current members (default 20)."),
+    protect: list[str] = typer.Option([], "--protect", help="AD group loads: never remove this member "
+                                                            "(DN, sAMAccountName or e-mail; repeatable)."),
+    unprotect: list[str] = typer.Option([], "--unprotect", help="AD group loads: remove from the protected list."),
+    keep_nested_groups: Optional[bool] = typer.Option(None, "--keep-nested-groups/--remove-nested-groups",
+                                                      help="AD group loads: keep groups that are members."),
+    exception_group: Optional[str] = typer.Option(None, "--exception-group",
+                                                  help="AD group loads: members of this group are never "
+                                                       "removed ('' to clear)."),
+    match: Optional[str] = typer.Option(None, "--match", help="AD group loads: attributes tried in order, "
+                                                              "e.g. mail,userPrincipalName,proxyAddresses"),
+    include_disabled: Optional[bool] = typer.Option(None, "--include-disabled/--reject-disabled",
+                                                    help="AD group loads: add disabled accounts too."),
     config: str = CONFIG_OPT,
 ):
     """Add or change column mappings and settings of a load job."""
@@ -664,9 +750,40 @@ def load_map(
     for k, v in (("min_rows", min_rows), ("min_percent", min_percent)):
         if v is not None:
             sf[k] = v
+    adc = data.setdefault("ad", {})
+    if ad_group:
+        data["to"] = {"source": data["to"]["source"], "group": ad_group}
+    for k, v in (("email_column", email_column), ("max_remove_percent", max_remove_percent),
+                 ("keep_nested_groups", keep_nested_groups)):
+        if v is not None:
+            adc[k] = v
+    if exception_group is not None:
+        adc["exception_group"] = exception_group or None
+    if match:
+        adc["match"] = [m.strip() for m in match.split(",") if m.strip()]
+    if include_disabled is not None:
+        adc["reject_disabled"] = not include_disabled
+    if protect or unprotect:
+        cur = [p for p in adc.get("protected", []) if p.lower() not in {u.lower() for u in unprotect}]
+        adc["protected"] = cur + [p for p in protect if p not in cur]
     new = _run(svc.loads.save, data, original=name, force=True)
     _ok(f"Load '{name}' updated")
-    _print_mapping(new)
+    if new.to.group:
+        _print_group_settings(new)
+    else:
+        _print_mapping(new)
+
+
+def _print_group_settings(spec) -> None:
+    a, sf = spec.ad, spec.safety
+    typer.echo(f"  AD group: {spec.to.group}  (source {spec.to.source})")
+    typer.echo(f"  mode={ {'replace': 'kill & fill', 'sync': 'sync', 'insert': 'add only'}[spec.mode] }  "
+               f"email column={a.email_column}  match={','.join(a.match)}")
+    typer.echo(f"  safety: max_remove_percent={a.max_remove_percent:g}  min_rows={sf.min_rows}  "
+               f"min_percent={sf.min_percent:g}  reject_disabled={a.reject_disabled}")
+    typer.echo(f"  never removed: nested groups={'yes' if a.keep_nested_groups else 'no'}"
+               + (f", members of {a.exception_group}" if a.exception_group else "")
+               + (f", {', '.join(a.protected)}" if a.protected else ""))
 
 
 @load_app.command("show")
@@ -678,6 +795,13 @@ def load_show(name: str, yaml_: bool = typer.Option(False, "--yaml", help="Print
         typer.echo(yaml.safe_dump(spec.model_dump(mode="json", by_alias=True, exclude_none=True), sort_keys=False))
         return
     src = spec.from_.endpoint and f"endpoint {spec.from_.endpoint}" or f"source {spec.from_.source}"
+    if spec.to.group:
+        typer.secho(f"{spec.name}: {src}  ->  AD group on {spec.to.source}", bold=True)
+        _print_group_settings(spec)
+        t = spec.tracking
+        typer.echo(f"  tracking: on_unchanged={t.on_unchanged} archive_keep={t.archive_keep}  max_rejects="
+                   f"{spec.max_rejects}")
+        return
     typer.secho(f"{spec.name}: {src}  ->  {spec.to.source}.{spec.to.table}", bold=True)
     typer.echo(f"  mode={spec.mode} keys={spec.keys or '-'} batch_size={spec.batch_size} "
                f"max_rejects={spec.max_rejects} unmapped_source_columns={spec.unmapped_source_columns}")
@@ -753,8 +877,10 @@ def load_history(name: Optional[str] = typer.Argument(None), last: int = typer.O
         return
     for r in runs:
         written = r["inserted"] + r["updated"] + r["upserted"]
+        what = (f"added={r.get('added', 0):<4} removed={r.get('removed', 0):<4}" if r.get("group")
+                else f"written={written:<6}")
         typer.echo(f"{r['started']}  {r['load']:<22} {r['status']:<8} read={r['read']:<6} "
-                   f"written={written:<6} rejected={r['rejected']:<5} {r['seconds']}s  {r['run_id']}"
+                   f"{what} rejected={r['rejected']:<5} {r['seconds']}s  {r['run_id']}"
                    + (f"  ✗ {r['error'].splitlines()[0]}" if r.get("error") else ""))
 
 
@@ -973,13 +1099,22 @@ def studio(config: str = CONFIG_OPT,
            web: bool = typer.Option(False, "--web", help="Open in the browser (localhost only) instead of a window."),
            port: int = typer.Option(8550, help="Port for --web mode."),
            client_path: Optional[Path] = typer.Option(None, "--client-path",
-                                                      help="Folder containing flet.exe (offline desktop client).")):
-    """Open Portwright Studio – the desktop app for sources, credentials, endpoints and keys."""
+                                                      help="Folder containing flet.exe (offline desktop client)."),
+           no_browser: bool = typer.Option(False, "--no-browser",
+                                           help="--web: only print the link; open it in any browser yourself."),
+           allow_download: bool = typer.Option(False, "--allow-download",
+                                               help="Let Flet download missing GUI parts from the internet "
+                                                    "(off by default: Studio never goes online).")):
+    """Open Portwright Studio – the desktop app for sources, credentials, endpoints and keys.
+
+    Studio makes no internet connections: without a local desktop client it opens in your browser
+    on 127.0.0.1 instead of downloading one."""
     try:
         from .studio.app import launch
     except ImportError as exc:
-        _fail(Exception(f"Studio needs the GUI extra: pip install portwright[gui]  ({exc})"))
-    launch(config_path=config, web=web, port=port, client_path=client_path)
+        _fail(Exception(f"Studio needs the Studio add-on (flet): install-studio-offline.ps1  ({exc})"))
+    launch(config_path=config, web=web, port=port, client_path=client_path, allow_download=allow_download,
+           open_browser=not no_browser)
 
 
 

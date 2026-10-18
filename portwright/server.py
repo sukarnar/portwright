@@ -157,7 +157,7 @@ def create_app(config: ProjectConfig | str | Path = DEFAULT_CONFIG,
     async def list_loads(request: Request):
         authenticator.require(request, ["load:run"], public=False)
         return [{"name": l.name, "from": l.from_.endpoint or l.from_.source,
-                 "to": f"{l.to.source}.{l.to.table}", "mode": l.mode, "columns": len(l.columns)}
+                 "to": f"{l.to.source}.{l.to.target}", "mode": l.mode, "columns": len(l.columns)}
                 for l in config.loads]
 
     @app.post(f"{base}/_loads/{{name}}/run", tags=["loads"])

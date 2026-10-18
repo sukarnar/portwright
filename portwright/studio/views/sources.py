@@ -6,7 +6,8 @@ from ...services import ServiceError
 from ..common import Ctx, dropdown, empty, header, icon_btn, table, tag, text_field, help_btn
 from ..viewmodels import HTTP_CRED_TYPES, SOURCE_TYPES, save_source, source_values
 
-TYPE_ICON = {"sql": ft.Icons.STORAGE, "file": ft.Icons.DESCRIPTION, "rest": ft.Icons.CLOUD, "callable": ft.Icons.CODE}
+TYPE_ICON = {"sql": ft.Icons.STORAGE, "file": ft.Icons.DESCRIPTION, "rest": ft.Icons.CLOUD, "callable": ft.Icons.CODE,
+             "ldap": ft.Icons.GROUPS}
 
 
 class SourcesView:
@@ -24,7 +25,7 @@ class SourcesView:
     def refresh(self, update: bool = True) -> None:
         items = self.ctx.svc.sources.list()
         controls: list[ft.Control] = [header(
-            "Sources", "Where data comes from: databases, files, upstream APIs, Python functions",
+            "Sources", "Where data comes from: databases, files, upstream APIs, Python functions – and Active Directory",
             [help_btn(self.ctx, "sources"), ft.FilledButton("Add source", icon=ft.Icons.ADD, on_click=lambda _: self.edit_dialog())])]
         if not items:
             controls.append(empty("No sources yet.", ft.FilledButton("Add your first source",
@@ -88,6 +89,25 @@ class SourcesView:
         f_allowc = text_field("Credentials the functions may read (comma separated)", v.get("allow_credentials", ""),
                               hint="available: " + (", ".join(all_creds) or "none"))
 
+        # ldap (Active Directory)
+        basic_creds = [c["name"] for c in creds if c["type"] == "basic"]
+        f_ldap_method = dropdown("Connect with", {"ldap": "LDAPS with a service account (ldap3)",
+                                                  "powershell": "PowerShell AD module (Windows identity)"},
+                                 v.get("directory") or "ldap", width=420)
+        f_servers = text_field("Domain controllers (one per line)", v.get("servers", ""), multiline=True,
+                               min_lines=2, hint="ldaps://dc01.corp.local – tried in order")
+        f_base_dn = text_field("Base DN *", v.get("base_dn", ""), hint="where users and groups are searched, "
+                                                                       "e.g. DC=corp,DC=local")
+        f_ldap_cred = dropdown("Service account (credential, type basic)", ["(none)"] + basic_creds,
+                               v.get("credential") or (basic_creds[0] if basic_creds else "(none)"))
+        f_ca = text_field("CA certificate file (optional)", v.get("ca_file", ""),
+                          hint="only if Windows does not trust the DC certificate; PEM file")
+        f_plain = ft.Checkbox(label="Allow unencrypted ldap:// (not recommended)",
+                              value=bool(v.get("allow_plain_ldap")))
+        ldap_hint = ft.Text("Username as svc@corp.local or CORP\\svc. The account needs 'Write Members' on the "
+                            "target groups only. With PowerShell, the account the service runs as is used "
+                            "(the credential is optional).", size=12, color=ft.Colors.ON_SURFACE_VARIANT)
+
         groups = {
             "sql": ft.Column([f_db_cred, sql_hint, f_rw], spacing=10, horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
             "file": ft.Column([ft.Row([f_path, browse]), f_sheet,
@@ -97,6 +117,8 @@ class SourcesView:
                               horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
             "rest": ft.Column([f_url, f_allow, f_http_cred, f_headers], spacing=10, horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
             "callable": ft.Column([f_module, f_allowc], spacing=10, horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
+            "ldap": ft.Column([f_ldap_method, f_servers, f_base_dn, f_ldap_cred, f_ca, f_plain, ldap_hint], spacing=10,
+                              horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
         }
 
         def show_group(_=None):
@@ -132,6 +154,10 @@ class SourcesView:
             elif t == "rest":
                 values.update(base_url=f_url.value, allow_host=f_allow.value, headers=f_headers.value,
                               credential=None if f_http_cred.value == "(none)" else f_http_cred.value)
+            elif t == "ldap":
+                values.update(directory=f_ldap_method.value, servers=f_servers.value, base_dn=f_base_dn.value,
+                              credential=None if f_ldap_cred.value == "(none)" else f_ldap_cred.value,
+                              ca_file=f_ca.value, allow_plain_ldap=f_plain.value)
             else:
                 values.update(module=f_module.value, allow_credentials=f_allowc.value)
             try:
@@ -169,6 +195,20 @@ class SourcesView:
         def test(_):
             self.ctx.close()
             self.test(name)
+        if stype == "ldap":
+            def group_load(_):
+                self.ctx.close()
+                self.ctx.go("loads")
+                view = self.ctx.view("loads")
+                if view is not None:
+                    view.open_editor(None, to_group=name)
+            self.ctx.dialog("Next steps", [ft.Text(
+                f"Source '{name}' is ready. Test it (binds to AD and reads the base DN), then create a load that "
+                f"fills an AD group from a query or file with e-mail addresses.")],
+                [ft.OutlinedButton("Test it", icon=ft.Icons.PLAY_ARROW, on_click=test),
+                 ft.FilledButton("Create group load", icon=ft.Icons.GROUPS, on_click=group_load),
+                 ft.TextButton("Done", on_click=lambda _: self.ctx.close())], width=560, scroll=False)
+            return
         what = {"sql": "endpoints over one of its tables, or a custom query",
                 "file": "an endpoint that returns the file's rows (with filters)",
                 "rest": "an endpoint that forwards to this API", "callable": "an endpoint that calls a function"}[stype]

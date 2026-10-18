@@ -4,6 +4,7 @@ screen: loads
 ---
 A load copies rows from a **file source** or a **GET endpoint** into a **database table**:
 read, map the columns, check every row, write everything in **one transaction**, report.
+A load can also fill an **Active Directory group** from e-mail addresses – see *Active Directory groups*.
 
 **Modes**
 

@@ -111,6 +111,7 @@ SOURCE_TYPES = {
     "file": "File in the data folder (CSV, JSON, Excel)",
     "rest": "Upstream REST API",
     "callable": "Python function in the handlers folder",
+    "ldap": "Active Directory (target for group loads)",
 }
 
 
@@ -125,7 +126,9 @@ def source_values(svc: Services, name: str) -> dict[str, Any]:
             "path": s.path or "", "sheet": s.sheet or "", "base_url": s.base_url or "",
             "headers": "\n".join(f"{k}={v}" for k, v in s.headers.items()), "allow_host": host_allowed,
             "module": s.module or "", "allow_credentials": ", ".join(s.credentials),
-            "description": s.description, "url": s.url or ""}
+            "description": s.description, "url": s.url or "",
+            "servers": "\n".join(s.servers), "base_dn": s.base_dn or "", "directory": s.directory,
+            "ca_file": s.ca_file or "", "allow_plain_ldap": s.allow_plain_ldap}
 
 
 def save_source(svc: Services, v: dict[str, Any], editing: bool = False) -> list[str]:
@@ -146,6 +149,14 @@ def save_source(svc: Services, v: dict[str, Any], editing: bool = False) -> list
     elif t == "rest":
         kw.update(base_url=(v.get("base_url") or "").strip(), allow_host=bool(v.get("allow_host")),
                   credential=v.get("credential") or None, headers=parse_kv_lines(v.get("headers", "")))
+    elif t == "ldap":
+        servers = [x.strip() for x in str(v.get("servers") or "").replace(",", "\n").splitlines() if x.strip()]
+        method = v.get("directory") or "ldap"
+        if method == "ldap" and not v.get("credential"):
+            raise ServiceError("choose the service-account credential (type basic)")
+        kw.update(servers=servers, base_dn=(v.get("base_dn") or "").strip(), directory=method,
+                  credential=v.get("credential") or None, ca_file=(v.get("ca_file") or "").strip() or None,
+                  allow_plain_ldap=bool(v.get("allow_plain_ldap")))
     else:
         allowed = [c.strip() for c in (v.get("allow_credentials") or "").split(",") if c.strip()]
         kw.update(module=(v.get("module") or "").strip() or None, allow_credentials=allowed)
@@ -447,10 +458,39 @@ def load_draft(name: str, description: str, from_kind: str, from_name: str | Non
     }
 
 
+GROUP_MODES = {"replace": "Kill & fill – the group gets exactly the source's users (one AD change)",
+               "sync": "Sync – add the missing users, remove the ones no longer in the source",
+               "insert": "Add only – add the missing users, never remove anybody"}
+MATCH_CHOICES = {"mail,userPrincipalName": "mail, then userPrincipalName",
+                 "mail": "mail only",
+                 "mail,userPrincipalName,proxyAddresses": "mail, UPN, then proxyAddresses (aliases)"}
+
+
+def group_settings(email_column: str, match: str, max_remove: Any, protected: str, keep_nested: bool,
+                   exception_group: str, reject_disabled: bool) -> dict:
+    """AD group load settings from the editor's fields."""
+    try:
+        mr = float(str(max_remove).strip() or "20")
+    except ValueError:
+        raise ServiceError("Max % removed must be a number") from None
+    return {"email_column": (email_column or "").strip() or "email",
+            "match": [m for m in (match or "mail,userPrincipalName").split(",") if m],
+            "max_remove_percent": mr,
+            "protected": [p.strip() for p in str(protected or "").replace(";", "\n").splitlines() if p.strip()],
+            "keep_nested_groups": bool(keep_nested),
+            "exception_group": (exception_group or "").strip() or None,
+            "reject_disabled": bool(reject_disabled)}
+
+
 RUN_STATUS_KIND = {"success": "good", "partial": "warn", "failed": "bad", "dry_run": "info", "skipped": "info"}
 
 
 def report_counts(rep: dict) -> list[tuple[str, int]]:
+    if rep.get("group"):
+        dry = rep.get("status") == "dry_run"
+        return [("read", rep.get("read", 0)), ("users found", rep.get("mapped", 0)), ("rejected", rep.get("rejected", 0)),
+                ("would add" if dry else "added", rep.get("added", 0)),
+                ("would remove" if dry else "removed", rep.get("removed", 0)), ("kept", rep.get("kept", 0))]
     keys = ["read", "mapped", "rejected", "dropped", "skipped", "inserted", "updated", "upserted", "deleted"]
     labels = {"dropped": "duplicates dropped", "skipped": "already in table"}
     return [(labels.get(k, k), rep.get(k, 0)) for k in keys if k in ("read", "mapped", "rejected") or rep.get(k)]

@@ -7,7 +7,7 @@ import flet as ft
 
 from ...services import ServiceError
 from ..common import Ctx, dropdown, empty, header, icon_btn, mono, table, tag, text_field, help_btn
-from ..viewmodels import (CONSTANT, DATE_FORMATS, DUPLICATE_KEYS, EXISTING_KEYS, LOAD_MODES, MAP_TYPES,
+from ..viewmodels import (GROUP_MODES, MATCH_CHOICES, group_settings, CONSTANT, DATE_FORMATS, DUPLICATE_KEYS, EXISTING_KEYS, LOAD_MODES, MAP_TYPES,
                           NOT_MAPPED, ON_HEADER_CHANGE, ON_UNCHANGED, RUN_STATUS_KIND, SIMPLE_TRANSFORMS,
                           TS_FORMATS, MapRow, apply_suggestion, build_transforms, cell, load_draft,
                           mapping_rows, report_counts, source_state, split_transforms, transform_summary,
@@ -55,7 +55,7 @@ class LoadsView:
         svc = self.ctx.svc.loads
         items = svc.list()
         controls: list[ft.Control] = [header(
-            "Loads", "Copy rows from a file or endpoint into a database table, with column mapping",
+            "Loads", "Copy rows from a file or endpoint into a database table, or the e-mail addresses into an AD group",
             [help_btn(self.ctx, "loads"), ft.OutlinedButton("Check sources", icon=ft.Icons.FIND_REPLACE, on_click=lambda _: self.check_all(),
                                tooltip="Read every source and show whether it changed since its last load"),
              ft.FilledButton("New load", icon=ft.Icons.ADD, on_click=lambda _: self.open_editor(None))])]
@@ -76,7 +76,8 @@ class LoadsView:
             rows.append([
                 ft.Text(l["name"], weight=ft.FontWeight.W_600),
                 ft.Text(("endpoint " if l["from_kind"] == "endpoint" else "file ") + l["from"]),
-                ft.Text(f"{l['to_source']}.{l['table']}"),
+                (ft.Row([ft.Icon(ft.Icons.GROUPS, size=16), ft.Text(f"{l['to_source']}: {l['table']}")], spacing=4)
+                 if l.get("target_kind") == "group" else ft.Text(f"{l['to_source']}.{l['table']}")),
                 ft.Text(l["mode"] + (f" ({', '.join(l['keys'])})" if l["keys"] else "")),
                 mapped, self._source_badge(l["name"]), last,
                 ft.Row([icon_btn(ft.Icons.EDIT, "Edit mapping", lambda _, n=l["name"]: self.open_editor(n)),
@@ -139,16 +140,21 @@ class LoadsView:
         return table(["Started (UTC)", "Load", "Status", "Read", "Written", "Rejected", "Source", "Time", ""], rows)
 
     # ----------------------------------------------------------- editor
-    def open_editor(self, name: str | None, from_endpoint: str | None = None) -> None:
+    def open_editor(self, name: str | None, from_endpoint: str | None = None, to_group: str | None = None) -> None:
         opts = self.ctx.svc.loads.options()
-        if name is None and not opts["targets"]:
-            self.ctx.toast("Add a SQL source first (Sources screen) – loads write into a database table.", error=True)
+        if name is None and not opts["targets"] and not opts["directories"]:
+            self.ctx.toast("Add a SQL or Active Directory source first (Sources screen) – loads write into a "
+                           "database table or an AD group.", error=True)
             return
         try:
             self.editor = LoadEditor(self, name)
         except ServiceError as exc:
             self.ctx.fail(exc)
             return
+        if to_group:
+            ed = self.editor
+            ed.target_kind, ed.f_tkind.selected, ed._group_to = "group", ["group"], to_group
+            ed._fill_targets()
         if from_endpoint:
             ed = self.editor
             ed.from_kind = "endpoint"
@@ -167,6 +173,23 @@ class LoadsView:
     # ---------------------------------------------------------- actions
     def run(self, name: str, after=None, force: bool = False) -> None:
         spec = self.ctx.svc.loads.get(name)
+        if spec.to.group:
+            ad = spec.ad
+            text = (f"Update the members of AD group '{spec.to.group}' in {spec.to.source} "
+                    f"({GROUP_MODES[spec.mode].split(' – ')[0]}).")
+            if spec.mode != "insert":
+                text += (f"\n\nUsers no longer in the source are REMOVED from the group. Safety: the run is refused "
+                         f"if more than {ad.max_remove_percent:g}% of the managed members would be removed.")
+            if spec.mode == "replace":
+                text += "\n\nKill & fill sets the whole member list in one AD change."
+            text += ("\n\nNested groups are kept." if ad.keep_nested_groups else "") + \
+                    (f" Protected: {', '.join(ad.protected)}." if ad.protected else "") + \
+                    (f" Members of '{ad.exception_group}' are never removed." if ad.exception_group else "")
+            if force:
+                text += "\n\nRun anyway: the unchanged-source check is skipped."
+            self.ctx.confirm(f"Run load '{name}'?", text, lambda: self._run(name, after, force),
+                             danger=spec.mode != "insert", yes="Run anyway" if force else "Update group")
+            return
         text = f"Load rows into {spec.to.source}.{spec.to.table} ({LOAD_MODES[spec.mode].split(' – ')[0]})."
         if spec.mode == "replace":
             text += ("\n\nKill & fill DELETES every row in the table first, in the same transaction – if the "
@@ -220,6 +243,10 @@ class LoadsView:
             ver = f"v{rep.source_version}" if rep.source_version else "new data"
             body.append(ft.Row([_small("Source"), tag(ver, "info"), tag(text, kind),
                                 _small(f"hash {rep.source_hash[:12]}")], wrap=True, spacing=6))
+        if rep.group:
+            body.append(_small(f"group {rep.group} · members {rep.members_before}"
+                               + (f" → {rep.members_after}" if rep.members_after is not None else "")))
+            body += self.changes_list(rep.changes)
         if rep.keys or rep.table_rows is not None:
             body.append(_small(" · ".join(([f"key: {', '.join(rep.keys)}"] if rep.keys else [])
                                           + ([f"table had {rep.table_rows} rows before kill & fill"]
@@ -254,6 +281,21 @@ class LoadsView:
             actions.append(ft.OutlinedButton("Run anyway", icon=ft.Icons.PLAY_ARROW, on_click=again))
         actions.append(ft.TextButton("Close", on_click=lambda _: self.ctx.close()))
         self.ctx.dialog(title, body, actions, width=620, modal=False, scroll=len(rep.warnings) > 4)
+
+    @staticmethod
+    def changes_list(changes: list[dict], limit: int = 200) -> list[ft.Control]:
+        if not changes:
+            return []
+        rows = [[ft.Icon(ft.Icons.PERSON_ADD if c["action"] == "add" else ft.Icons.PERSON_REMOVE, size=18,
+                         color=ft.Colors.GREEN_700 if c["action"] == "add" else ft.Colors.ERROR),
+                 ft.Text(c["action"]), ft.Text(c["member"]), ft.Text(c.get("account") or "")]
+                for c in changes[:limit]]
+        out: list[ft.Control] = [ft.Text("Member changes", weight=ft.FontWeight.W_600),
+                                 ft.Container(ft.Column([table(["", "Change", "Member", "Account"], rows)],
+                                                        scroll=ft.ScrollMode.AUTO), height=min(320, 48 + 36 * len(rows)))]
+        if len(changes) > limit:
+            out.append(_small(f"… and {len(changes) - limit} more (see the run history / CLI: portwright load history)"))
+        return out
 
     @staticmethod
     def _count(label: str, value: int) -> ft.Control:
@@ -359,21 +401,28 @@ class LoadEditor:
             spec = self.svc.get(name)
             d = spec.model_dump(mode="json", by_alias=True, exclude_none=True)
             self.from_kind = "endpoint" if spec.from_.endpoint else "source"
+            self.target_kind = "group" if spec.to.group else "table"
+            ad = spec.ad.model_dump()
             self.params = dict(spec.from_.params)
             self.rows = mapping_rows([], d.get("columns", []), spec.keys)
             for r in self.rows:
                 r.in_table = True            # unknown until the table is read
             vals = dict(name=spec.name, description=spec.description, from_name=spec.from_.endpoint or spec.from_.source,
-                        to=spec.to.source, table=spec.to.table, mode=spec.mode, batch=str(spec.batch_size),
+                        to=spec.to.source, table=spec.to.table or "", group=spec.to.group or "", mode=spec.mode, batch=str(spec.batch_size),
                         max_rejects=str(spec.max_rejects), unmapped=spec.unmapped_source_columns)
             st = spec.model_dump(include={"duplicate_keys", "existing_keys", "tracking", "safety"})
         else:
             self.from_kind = "source" if self.opts["file_sources"] else "endpoint"
+            self.target_kind = "table" if self.opts["targets"] else "group"
+            from ...config import GroupLoad
+            ad = GroupLoad().model_dump()
             self.params = {}
             self.rows: list[MapRow] = []
             writable = [t for t in self.opts["targets"] if t not in self.opts["read_only_targets"]]
-            vals = dict(name="", description="", from_name=None, to=(writable or self.opts["targets"] or [None])[0],
-                        table="", mode="insert", batch="1000", max_rejects="0", unmapped="ignore")
+            vals = dict(name="", description="", from_name=None,
+                        to=(writable or self.opts["targets"] or [None])[0] if self.target_kind == "table"
+                        else (self.opts["directories"] or [None])[0],
+                        table="", group="", mode="insert" if self.target_kind == "table" else "sync", batch="1000", max_rejects="0", unmapped="ignore")
             from ...config import LoadSafety, SourceTracking
             st = {"duplicate_keys": "reject", "existing_keys": "reject",
                   "tracking": SourceTracking().model_dump(), "safety": LoadSafety().model_dump()}
@@ -392,8 +441,36 @@ class LoadEditor:
                       ft.Segment(value="endpoint", label=ft.Text("Endpoint"), icon=ft.Icon(ft.Icons.API))],
             selected=[self.from_kind], on_change=self._kind_changed)
         self.f_from = dropdown("Read from *", [], vals["from_name"], width=260, on_select=self._source_changed)
+        self.f_tkind = ft.SegmentedButton(
+            segments=[ft.Segment(value="table", label=ft.Text("Database table"), icon=ft.Icon(ft.Icons.TABLE_CHART)),
+                      ft.Segment(value="group", label=ft.Text("AD group"), icon=ft.Icon(ft.Icons.GROUPS))],
+            selected=[self.target_kind], on_change=self._tkind_changed)
         self.f_to = dropdown("Target SQL source *", self.opts["targets"], vals["to"], width=260,
                              on_select=self._target_changed)
+        self._table_to = vals["to"] if self.target_kind == "table" else None
+        self._group_to = vals["to"] if self.target_kind == "group" else None
+        self.f_group = text_field("AD group *", vals["group"], hint="name (sAMAccountName / CN) or full DN",
+                                  width=340, on_blur=self._table_changed, on_submit=self._table_changed)
+        self.f_gmode = dropdown("Mode", GROUP_MODES, vals["mode"] if self.target_kind == "group" else "sync",
+                                width=470, on_select=self._mode_changed)
+        self.f_email = text_field("E-mail column *", ad["email_column"], width=200,
+                                  hint="source column with the addresses", on_change=self._dirty)
+        match_key = ",".join(ad["match"])
+        self.f_match = dropdown("Find the AD user by", {**({match_key: match_key} if match_key not in MATCH_CHOICES
+                                                           else {}), **MATCH_CHOICES}, match_key, width=330,
+                                on_select=self._dirty)
+        self.f_maxrem = text_field("Refuse if more than % removed", f"{ad['max_remove_percent']:g}", width=230,
+                                   hint="of the managed members; 100 = no limit", on_change=self._dirty)
+        self.f_protected = text_field("Never remove (one per line)", "\n".join(ad["protected"]), multiline=True,
+                                      min_lines=2, width=340, hint="sAMAccountName, e-mail, UPN or DN",
+                                      on_change=self._dirty)
+        self.f_exc = text_field("Exception group (members never removed)", ad.get("exception_group") or "",
+                                width=340, hint="optional", on_change=self._dirty)
+        self.f_nested = ft.Checkbox(label="Keep nested groups that are members", value=ad["keep_nested_groups"],
+                                    on_change=self._dirty)
+        self.f_disabled = ft.Checkbox(label="Reject disabled AD accounts", value=ad["reject_disabled"],
+                                      on_change=self._dirty)
+        self.group_line = ft.Row(wrap=True, spacing=8)
         self.f_table = text_field("Target table *", vals["table"], hint="e.g. emp_transfers or hr.emp_transfers",
                                   width=300, on_blur=self._table_changed, on_submit=self._table_changed)
         self.f_mode = dropdown("Mode", LOAD_MODES, vals["mode"], width=390, on_select=self._mode_changed)
@@ -426,6 +503,7 @@ class LoadEditor:
         for f in (self.f_name, self.f_desc):
             f.on_change = self._dirty
         self._fill_from_options()
+        self._fill_targets()
         self.grid = ft.Column(spacing=0)
         self.summary = ft.Row(wrap=True, spacing=8)
         self.results = ft.Column(spacing=10)
@@ -447,6 +525,16 @@ class LoadEditor:
                          "stable_seconds": self.f_stable.value, "max_age_hours": self.f_maxage.value,
                          "archive_keep": self.f_keep.value},
             "safety": {"min_rows": self.f_min_rows.value, "min_percent": self.f_min_pct.value}}
+        if self.target_kind == "group":
+            settings = {"tracking": settings["tracking"], "safety": settings["safety"]}
+            d = load_draft(self.f_name.value, self.f_desc.value, self.from_kind, self.f_from.value, self.f_to.value,
+                           "", self.f_gmode.value, [], self.f_batch.value, self.f_rejects.value, "ignore",
+                           self.params if self.from_kind == "endpoint" else None, settings)
+            d["to"] = {"source": self.f_to.value, "group": (self.f_group.value or "").strip()}
+            d["ad"] = group_settings(self.f_email.value, self.f_match.value, self.f_maxrem.value,
+                                     self.f_protected.value, self.f_nested.value, self.f_exc.value,
+                                     self.f_disabled.value)
+            return d
         return load_draft(self.f_name.value, self.f_desc.value, self.from_kind, self.f_from.value, self.f_to.value,
                           self.f_table.value, self.f_mode.value, self.rows, self.f_batch.value,
                           self.f_rejects.value, self.f_unmapped.value,
@@ -469,6 +557,27 @@ class LoadEditor:
         self.f_from.helper_text = None if names else (
             "no file sources yet – add one on Sources" if self.from_kind == "source" else "no GET endpoints yet")
 
+    def _fill_targets(self) -> None:
+        group = self.target_kind == "group"
+        names = self.opts["directories"] if group else self.opts["targets"]
+        self.f_to.label = "Active Directory source *" if group else "Target SQL source *"
+        self.f_to.options = [ft.DropdownOption(key=n, text=n) for n in names]
+        want = self._group_to if group else self._table_to
+        self.f_to.value = want if want in names else (names[0] if names else None)
+        self.f_to.helper_text = None if names else (
+            "no Active Directory source yet – add one on Sources (type ldap)" if group
+            else "no SQL source yet – add one on Sources")
+
+    def _tkind_changed(self, e) -> None:
+        if self.target_kind == "group":
+            self._group_to = self.f_to.value
+        else:
+            self._table_to = self.f_to.value
+        self.target_kind = (e.control.selected or ["table"])[0]
+        self._fill_targets()
+        self.inspection = None
+        self.view.refresh()
+
     def _kind_changed(self, e) -> None:
         self.from_kind = (e.control.selected or ["source"])[0]
         self._fill_from_options()
@@ -481,8 +590,11 @@ class LoadEditor:
     def _target_changed(self, _=None) -> None:
         self._table_changed()
 
+    def _target_name(self) -> str:
+        return ((self.f_group.value if self.target_kind == "group" else self.f_table.value) or "").strip()
+
     def _table_changed(self, _=None) -> None:
-        where = (self.f_to.value, (self.f_table.value or "").strip())
+        where = (self.f_to.value, self._target_name())
         if where != self._last_target and where[1]:
             self.read_columns(quiet=True)
         else:
@@ -493,11 +605,14 @@ class LoadEditor:
 
     # ---------------------------------------------------------- render
     def render(self) -> ft.Control:
+        if self.target_kind == "group":
+            return self._render_group()
         ro = self.f_to.value in self.opts["read_only_targets"]
         settings = _card("1 · Source and target", [
             ft.Row([self.f_name, self.f_desc], vertical_alignment=ft.CrossAxisAlignment.START),
             ft.Row([ft.Column([_small("Read rows from"), self.f_kind], spacing=4), self.f_from],
                    wrap=True, spacing=16, vertical_alignment=ft.CrossAxisAlignment.END),
+            ft.Row([ft.Column([_small("Write to"), self.f_tkind], spacing=4)]),
             ft.Row([self.f_to, self.f_table,
                     ft.OutlinedButton("Browse tables", icon=ft.Icons.TABLE_CHART, on_click=self.browse_tables)],
                    wrap=True, spacing=16, vertical_alignment=ft.CrossAxisAlignment.START),
@@ -570,6 +685,120 @@ class LoadEditor:
         self.render_grid(update=False)
         self.dirty_tag.visible = self.is_dirty
         return ft.Column([top, self.busy, settings, how, mapping, checks, versions], spacing=16)
+
+    def _top(self) -> ft.Control:
+        return ft.Row([
+            ft.IconButton(ft.Icons.ARROW_BACK, tooltip="Back to loads", on_click=self.back),
+            ft.Text(f"Edit load '{self.original}'" if self.original else "New load", size=24,
+                    weight=ft.FontWeight.W_600),
+            self.dirty_tag, ft.Container(expand=True), help_btn(self.ctx, "ad-groups"),
+            ft.OutlinedButton("CLI", icon=ft.Icons.TERMINAL, on_click=self.show_cli,
+                              tooltip="The same load with the command line / for a scheduler"),
+            ft.OutlinedButton("Run", icon=ft.Icons.PLAY_ARROW, on_click=self.run),
+            ft.FilledButton("Save", icon=ft.Icons.SAVE, on_click=lambda _: self.save()),
+        ])
+
+    def _render_group(self) -> ft.Control:
+        """The editor for an AD group target: no column mapping, one e-mail column."""
+        ins = self.inspection
+        self.group_line.controls = []
+        if ins is not None and ins.group:
+            g = ins.group
+            kinds = ", ".join(f"{v} {k}{'s' if v != 1 else ''}" for k, v in sorted(g["kinds"].items()))
+            self.group_line.controls = [tag("found", "good"), _small(g["dn"]),
+                                        _small(f"{g['members']} members" + (f" ({kinds})" if kinds else ""))]
+        elif ins is not None and ins.target_error:
+            self.group_line.controls = [tag("not found", "bad"), _small(ins.target_error)]
+        if ins is not None and ins.header:
+            col_ok = any(h.lower() == (self.f_email.value or "").strip().lower() for h in ins.header)
+            self.group_line.controls.append(
+                tag(f"e-mail column '{self.f_email.value}' " + ("found" if col_ok else "NOT in the source"),
+                    "good" if col_ok else "bad"))
+            if not col_ok:
+                self.group_line.controls.append(_small("source columns: " + ", ".join(ins.header[:20])))
+        settings = _card("1 · Source and AD group", [
+            ft.Row([self.f_name, self.f_desc], vertical_alignment=ft.CrossAxisAlignment.START),
+            ft.Row([ft.Column([_small("Read rows from"), self.f_kind], spacing=4), self.f_from, self.f_email],
+                   wrap=True, spacing=16, vertical_alignment=ft.CrossAxisAlignment.END),
+            ft.Row([ft.Column([_small("Write to"), self.f_tkind], spacing=4)]),
+            ft.Row([self.f_to, self.f_group,
+                    ft.OutlinedButton("Browse groups", icon=ft.Icons.GROUPS, on_click=self.browse_groups)],
+                   wrap=True, spacing=16, vertical_alignment=ft.CrossAxisAlignment.START),
+            self.group_line,
+            *([_small(f"Endpoint parameters (from {self.ctx.svc.project.path.name}): " +
+                      ", ".join(f"{k}={v}" for k, v in self.params.items()))] if self.params else []),
+        ], [ft.FilledTonalButton("Check group and source", icon=ft.Icons.SYNC, on_click=lambda _: self.read_columns())])
+
+        mode = self.f_gmode.value
+        how = _card("2 · How members are changed", [
+            ft.Row([self.f_gmode, self.f_rejects], wrap=True, spacing=16,
+                   vertical_alignment=ft.CrossAxisAlignment.START),
+            _small({"replace": "Kill & fill: the member list is set to exactly the matched users (plus the kept "
+                               "members below) in ONE AD change – if it fails, the group is unchanged.",
+                    "sync": "Sync: missing users are added and users no longer in the source are removed, in "
+                            "batches of 500. Members already correct are not touched.",
+                    "insert": "Add only: missing users are added; nobody is ever removed."}[mode]),
+            ft.Text("Matching", weight=ft.FontWeight.W_600),
+            _small("Each address is trimmed and compared case-insensitively. Rows with an invalid address, no AD "
+                   "user, more than one user, or (optionally) a disabled account are rejected and listed in the "
+                   "rejects file. A repeated address is dropped."),
+            ft.Row([self.f_match, self.f_disabled], wrap=True, spacing=16,
+                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Text("Members that are never removed", weight=ft.FontWeight.W_600),
+            _small("Only user accounts are managed. Computers, contacts and members from other domains are "
+                   "always kept."),
+            ft.Row([self.f_protected, ft.Column([self.f_exc, self.f_nested], spacing=8)], wrap=True, spacing=16,
+                   vertical_alignment=ft.CrossAxisAlignment.START),
+            *([ft.Text("Safety", weight=ft.FontWeight.W_600),
+               _small("Protects the group from an empty or partial source: the run is refused and the group "
+                      "is not changed."),
+               ft.Row([self.f_maxrem, self.f_min_rows, self.f_min_pct], wrap=True, spacing=16,
+                      vertical_alignment=ft.CrossAxisAlignment.START)] if mode != "insert" else []),
+        ])
+        checks = _card("3 · Check and preview", [
+            _small("Validate checks the source, the e-mail column and the group. Preview (dry run) looks up every "
+                   "address in AD and lists the users that would be added and removed – nothing is changed."),
+            self.results,
+        ], [ft.OutlinedButton("Validate", icon=ft.Icons.FACT_CHECK, on_click=self.validate),
+            ft.OutlinedButton("Preview (dry run)", icon=ft.Icons.PREVIEW, on_click=self.preview)])
+        versions = _card("4 · Source versions and change detection", [
+            _small("The source is fingerprinted on every run; an unchanged source can be skipped (exit code 3)."),
+            ft.Row([self.f_unch, self.f_stable, self.f_maxage, self.f_keep], wrap=True, spacing=16,
+                   vertical_alignment=ft.CrossAxisAlignment.START),
+            self.source_line, *self._versions_body(),
+        ], [ft.OutlinedButton("Check source now", icon=ft.Icons.FIND_REPLACE, on_click=self.check_source)])
+        self.dirty_tag.visible = self.is_dirty
+        return ft.Column([self._top(), self.busy, settings, how, checks, versions], spacing=16)
+
+    def browse_groups(self, _=None) -> None:
+        src = self.f_to.value
+        if not src:
+            self.ctx.toast("Choose the Active Directory source first.", error=True)
+            return
+        flt = text_field("Search groups", self.f_group.value or "", autofocus=True,
+                         hint="part of the name; press Enter")
+        lst = ft.Column(spacing=0, height=380, scroll=ft.ScrollMode.AUTO)
+        bar = ft.ProgressBar(visible=False)
+
+        def pick(g):
+            self.ctx.close()
+            self.f_group.value = g["sam"] or g["name"]
+            self.f_group.error = None
+            self.read_columns()
+
+        def search(_=None):
+            def done(groups):
+                lst.controls = [ft.ListTile(title=ft.Text(g["name"] or g["sam"]), subtitle=ft.Text(g["dn"], size=11),
+                                            dense=True, leading=ft.Icon(ft.Icons.GROUPS, size=18),
+                                            on_click=lambda _, g=g: pick(g)) for g in groups] or \
+                    [_small("No groups found.")]
+                self.ctx.page.update()
+            self.ctx.background(lambda: self.ctx.svc.sources.ad_groups(src, flt.value or "", 100), done, bar)
+        flt.on_submit = search
+        self.ctx.dialog(f"Groups in '{src}'", [ft.Row([ft.Container(flt, expand=True),
+                                                      ft.IconButton(ft.Icons.SEARCH, on_click=search)]), bar, lst],
+                        [ft.TextButton("Cancel", on_click=lambda _: self.ctx.close())], width=520)
+        search()
 
     def _versions_body(self) -> list[ft.Control]:
         if not self.original:
@@ -820,6 +1049,16 @@ class LoadEditor:
         if not d["from"].get(self.from_kind):
             self.ctx.toast("Choose what to read from.", error=True)
             return None
+        if self.target_kind == "group":
+            if not d["to"]["source"]:
+                self.ctx.toast("Choose the Active Directory source.", error=True)
+                return None
+            if not d["to"]["group"]:
+                self.f_group.error = "enter the AD group"
+                self.ctx.page.update()
+                return None
+            self.f_group.error = None
+            return d
         if not d["to"]["table"]:
             self.f_table.error = "enter the target table"
             self.ctx.page.update()
@@ -829,13 +1068,21 @@ class LoadEditor:
 
     def read_columns(self, quiet: bool = False) -> None:
         """Read the source header and the target table, then rebuild the grid (keeping the mapping)."""
-        if quiet and not ((self.f_table.value or "").strip() and self.f_from.value and self.f_to.value):
+        if quiet and not (self._target_name() and self.f_from.value and self.f_to.value):
             self._dirty()
             return
         d = self._draft_or_fail()
         if d is None:
             return
-        self._last_target = (self.f_to.value, (self.f_table.value or "").strip())
+        self._last_target = (self.f_to.value, self._target_name())
+        if self.target_kind == "group":
+            def gdone(ins):
+                self.inspection = ins
+                if ins.source_error:
+                    self.ctx.toast(f"Cannot read the source: {ins.source_error}", error=True)
+                self.view.refresh()
+            self.ctx.background(lambda: self.svc.inspect(d), gdone, self.busy)
+            return
         d["columns"], d["keys"], d["mode"] = [], [], "insert"     # the mapping is not needed to read columns
         current = [r.to_column() for r in self.rows if r.mapped]
         keys = [r.target for r in self.rows if r.key]
@@ -889,6 +1136,11 @@ class LoadEditor:
 
         def done(chk):
             self.check = chk
+            if self.target_kind == "group":
+                self._show_check(chk.problems, chk.warnings,
+                                 f"Valid – the source has {chk.row_count} rows; group '{d['to']['group']}'." if chk.ok
+                                 else None)
+                return
             self._show_check(chk.problems, chk.warnings,
                              f"Mapping is valid – {len(d['columns'])} columns mapped, the source has "
                              f"{chk.row_count} rows." if chk.ok else None)
@@ -921,7 +1173,13 @@ class LoadEditor:
             if rep.rejects_file:
                 extra.append(ft.OutlinedButton(f"View the {rep.rejected} rejected row(s)", icon=ft.Icons.RULE,
                                                on_click=lambda _: self.view.rejects(rep.run_id)))
-            if rep.preview:
+            if rep.group:
+                extra.append(_small(f"group {rep.group} · {rep.members_before} members now, "
+                                    f"{rep.members_after if rep.members_after is not None else '?'} after"))
+                extra += LoadsView.changes_list(rep.changes)
+                if not rep.changes and rep.status == "dry_run":
+                    extra.append(_small("No changes – the group already matches the source."))
+            elif rep.preview:
                 src_cols: list[str] = []
                 for p in rep.preview:
                     src_cols += [k for k in p["source"] if k not in src_cols]
@@ -935,7 +1193,10 @@ class LoadEditor:
                                                             *[ft.Text(cell(p["target"].get(c))) for c in tgt_cols]]
                                                            for p in rep.preview])], scroll=ft.ScrollMode.AUTO)]
             ok = None
-            if rep.status == "dry_run":
+            if rep.status == "dry_run" and rep.group:
+                ok = (f"Dry run OK – {rep.mapped} user(s) matched, would add {rep.added} and remove {rep.removed}"
+                      + (f", {rep.rejected} row(s) rejected" if rep.rejected else "") + ". Nothing was changed.")
+            elif rep.status == "dry_run":
                 ok = (f"Dry run OK – {rep.mapped} of {rep.read} rows would be loaded"
                       + (f", {rep.rejected} rejected (allowed: {d['max_rejects']})" if rep.rejected else "") + ".")
             problems = list(rep.problems) or ([rep.error] if rep.error else [])

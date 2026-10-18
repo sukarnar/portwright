@@ -21,6 +21,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from ..config import ColumnMap, LoadSpec, ProjectConfig
 from ..sources.base import DataSource, ExecutionContext, SourceError
 from .mapping import RowError, RowMapper
+from ..directory import DirectoryError
 from .versions import Fingerprint, VersionStore, file_sha256, header_change, header_of, rows_hash
 from .writers import make_writer
 
@@ -47,6 +48,13 @@ class LoadReport:
     updated: int = 0
     upserted: int = 0
     deleted: int = 0
+    added: int = 0                     # AD group loads: members added / removed / kept (protected)
+    removed: int = 0
+    kept: int = 0
+    group: str | None = None           # AD group distinguished name
+    members_before: int | None = None
+    members_after: int | None = None
+    changes: list[dict] = field(default_factory=list)       # AD group loads: planned / applied changes
     started: str = ""
     finished: str = ""
     seconds: float = 0.0
@@ -245,6 +253,21 @@ class LoadRunner:
 
     async def validate(self, spec: LoadSpec) -> tuple[list[str], list[str], list[dict]]:
         rows = await self.read_rows(spec)
+        if spec.to.group:
+            from . import groups as G
+            problems, warnings = [], []
+            if not rows:
+                warnings.append("source returned no rows")
+            else:
+                try:
+                    G.email_column(spec, rows)
+                except G.GroupLoadError as exc:
+                    problems.append(str(exc))
+            try:
+                await anyio.to_thread.run_sync(lambda: self._directory(spec).resolve_group(spec.to.group))
+            except (DirectoryError, LoadError, SourceError) as exc:
+                problems.append(str(exc))
+            return problems, warnings, rows
         _, _, p1, w1, _ = await anyio.to_thread.run_sync(self.inspect_target, spec)
         p2, w2 = self.check_source_columns(spec, rows)
         return p1 + p2, w1 + w2, rows
@@ -286,7 +309,9 @@ class LoadRunner:
         if self.audit:
             self.audit.record(event="load", load=report.load, run_id=report.run_id, status=report.status,
                               read=report.read, rejected=report.rejected,
-                              written=report.inserted + report.updated + report.upserted)
+                              written=report.inserted + report.updated + report.upserted,
+                              **({"group": report.group, "added": report.added, "removed": report.removed}
+                                 if report.group else {}))
 
     # ------------------------------------------------------------ key checks
     @staticmethod
@@ -450,6 +475,10 @@ class LoadRunner:
                 else:
                     report.warnings.append(f"source unchanged since the last load {where}; loading anyway")
 
+            if spec.to.group:                      # Active Directory group target
+                await self._run_group(spec, rows, report, dry_run, preview)
+                return report
+
             # 3. validate mapping against source header and target table
             table, names, p1, w1, effective = await anyio.to_thread.run_sync(self.inspect_target, spec)
             p2, w2 = self.check_source_columns(spec, rows)
@@ -536,6 +565,50 @@ class LoadRunner:
                 lock.unlink(missing_ok=True)
             if record:
                 self._record(report)
+
+    # ------------------------------------------------------- AD group loads
+    def _directory(self, spec: LoadSpec):
+        src = self.sources.get(spec.to.source)
+        if src is None or src.type_name != "ldap":
+            raise LoadError(f"target '{spec.to.source}' is not an ldap (Active Directory) source")
+        return src.directory()
+
+    async def _run_group(self, spec: LoadSpec, rows: list[dict], report: LoadReport, dry_run: bool,
+                         preview: int) -> None:
+        from . import groups as G
+        rejects: list[tuple[int, str, dict]] = []
+        try:
+            directory = self._directory(spec)
+            emails = G.collect_emails(spec, rows, rejects, report)
+            plan = await anyio.to_thread.run_sync(G.plan, spec, directory, emails, rows, rejects)
+        except (G.GroupLoadError, DirectoryError) as exc:
+            raise LoadError(str(exc)) from None
+        rejects.sort(key=lambda r: r[0])
+        report.group, report.members_before, report.kept = plan.group.dn, len(plan.current), len(plan.kept)
+        report.mapped, report.rejected = len(plan.desired), len(rejects)
+        report.changes = G.changes(plan, max(preview, 500))
+        after = len(plan.current) + len(plan.to_add) - len(plan.to_remove)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self._write_rejects(report, rejects)
+        if report.rejected > spec.max_rejects:
+            raise LoadError(f"{report.rejected} row(s) rejected (max_rejects = {spec.max_rejects}); the group "
+                            f"was not changed. See {report.rejects_file}")
+        try:
+            G.check_safety(spec, plan)
+        except G.GroupLoadError as exc:
+            report.added, report.removed = len(plan.to_add), len(plan.to_remove)
+            raise LoadError(str(exc)) from None
+        if dry_run:
+            report.added, report.removed, report.members_after = len(plan.to_add), len(plan.to_remove), after
+            report.status = "dry_run"
+            return
+        try:
+            await anyio.to_thread.run_sync(G.apply, spec, directory, plan, report)
+        except DirectoryError as exc:
+            done = f" ({report.added} added before the error)" if report.added else ""
+            raise LoadError(f"{exc}{done}") from None
+        report.members_after = after
+        report.status = "partial" if report.rejected else "success"
 
     def _key_targets(self, spec: LoadSpec, table, names: dict[str, str], report: LoadReport) -> list[str]:
         """Mapping target names of the load key: spec.keys, or else the table's primary key if mapped."""

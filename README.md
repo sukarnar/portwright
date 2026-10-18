@@ -253,6 +253,36 @@ Validation blocks a run when a mapped column is missing on either side, a NOT NU
 default is unmapped, an auto-map guess is unconfirmed, or upsert keys are not a primary/unique key.
 Text longer than the column allows becomes a reject instead of a database error.
 
+## Filling an Active Directory group (group loads)
+
+A load can target an **AD group** instead of a table. The source (a query endpoint or a file) gives one
+e-mail address per row; each address is matched to an AD user (`mail`, then `userPrincipalName`) and the
+group's members are made to match.
+
+```powershell
+portwright source add corp_ad -t ldap --server ldaps://dc01.corp.local --base-dn "DC=corp,DC=local" --credential ad_svc
+portwright load create hr-staff-group --from-endpoint hr-staff-emails --to corp_ad --ad-group HR-Staff `
+    --email-column email --mode sync --max-rejects 25
+portwright load run hr-staff-group --dry-run     # lists + adds and - removes
+portwright load run hr-staff-group
+```
+
+| Setting | Values |
+|---|---|
+| `mode` | `replace` kill & fill (one atomic `member` replace) · `sync` add missing + remove extra · `insert` add only |
+| `ad.email_column` | source column with the addresses (default `email`) |
+| `ad.match` | `[mail, userPrincipalName]` (default); `proxyAddresses` can be added |
+| `ad.max_remove_percent` | refuse the run if more of the managed members would be removed (default **20**) |
+| `ad.protected` / `ad.exception_group` | accounts / a group whose members are never removed |
+| `ad.keep_nested_groups` | nested groups stay members (default true); computers, contacts and foreign principals always stay |
+| `ad.reject_disabled` | disabled accounts are rejected (default true) |
+
+The `ldap` source connects with **LDAPS** and a *basic* service-account credential (certificate checked
+against the Windows store or `ca_file`), or with `directory: powershell` through the RSAT ActiveDirectory
+module as the Windows account the process runs as. The account needs **Write Members** on the group only.
+Invalid, unknown, ambiguous or disabled addresses go to the rejects file; source versioning, exit codes and
+history work as for table loads. Full guide: `portwright docs ad-groups`.
+
 ## Custom functions
 ```python
 # handlers/pricing.py

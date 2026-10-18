@@ -10,6 +10,7 @@ A source is where data comes from. Endpoints and loads refer to sources by name.
 | `file` | CSV, JSON, JSON Lines, Excel in the project's `data` folder | always read-only; re-read automatically when the file changes |
 | `rest` | an upstream HTTP API | the host must be allow-listed; credentials are added by Portwright, callers' keys are never forwarded |
 | `callable` | functions in a Python module in `handlers\` | only functions you name are callable |
+| `ldap` | Active Directory (users and groups) | the **target** of AD group loads; LDAPS with a service account, or the PowerShell AD module |
 
 <!-- studio -->
 ## In Studio
@@ -22,7 +23,9 @@ A source is where data comes from. Endpoints and loads refer to sources by name.
 4. **REST**: base URL (e.g. `https://hr-api.corp.local/v2`), tick *Allow Portwright to call this host*,
    choose a credential, add extra headers as `Name=value` lines.
 5. **Callable**: the module, e.g. `handlers.pricing` for `handlers\pricing.py`.
-6. **Test** (play button) connects to the database, or shows the first rows of a file.
+6. **Active Directory (ldap)**: domain controllers (`ldaps://dc01.corp.local`, one per line), the base DN
+   (`DC=corp,DC=local`) and a *basic* credential for the service account. See *Active Directory groups*.
+7. **Test** (play button) connects to the database, or shows the first rows of a file.
 
 To refresh a file source, copy the new file over the old one in `data\` – nothing else is needed.
 
@@ -36,6 +39,8 @@ portwright source add transfers -t file --path transfers.csv
 portwright source add budget -t file --path budget.xlsx --sheet FY27
 portwright source add crm -t rest --base-url https://crm.corp.local/api --allow-host --credential crm_token
 portwright source add pricing -t callable --module handlers.pricing --allow-credential erp
+portwright source add corp_ad -t ldap --server ldaps://dc01.corp.local --server ldaps://dc02.corp.local `
+    --base-dn "DC=corp,DC=local" --credential ad_svc
 
 portwright source list
 portwright source test transfers          # shows the first rows

@@ -39,6 +39,7 @@ class Inspection:
     targets: list[TargetColumn] = field(default_factory=list)
     source_error: str | None = None
     target_error: str | None = None
+    group: dict | None = None        # AD group target: dn, name, member counts
 
 
 @dataclass
@@ -78,7 +79,8 @@ class LoadService:
             out.append({"name": l.name, "description": l.description,
                         "from_kind": "endpoint" if l.from_.endpoint else "source",
                         "from": l.from_.endpoint or l.from_.source, "to_source": l.to.source,
-                        "table": l.to.table, "mode": l.mode, "keys": list(l.keys), "columns": len(l.columns),
+                        "table": l.to.target, "target_kind": "group" if l.to.group else "table",
+                        "mode": l.mode, "keys": list(l.keys), "columns": len(l.columns),
                         "review": sum(1 for c in l.columns if c.review), "last_run": last.get(l.name)})
         return out
 
@@ -98,13 +100,16 @@ class LoadService:
             "file_sources": [n for n, s in self.cfg.sources.items() if s.type == "file"],
             "targets": [n for n, s in self.cfg.sources.items() if s.type == "sql"],
             "read_only_targets": [n for n, s in self.cfg.sources.items() if s.type == "sql" and s.read_only],
+            "directories": [n for n, s in self.cfg.sources.items() if s.type == "ldap"],
         }
 
     # ----------------------------------------------------------------- write
-    def build(self, data: dict | LoadSpec) -> LoadSpec:
+    def build(self, data: "dict | LoadSpec | str") -> LoadSpec:
         """Validate a (possibly unsaved) definition against the project."""
         if isinstance(data, LoadSpec):
             return data
+        if isinstance(data, str):
+            return self.get(data)
         try:
             spec = LoadSpec.model_validate(data)
         except Exception as exc:
@@ -120,7 +125,10 @@ class LoadService:
             if src is None or src.type != "file":
                 raise ServiceError(f"'{spec.from_.source}' is not a file source")
         tgt = self.cfg.sources.get(spec.to.source)
-        if tgt is None or tgt.type != "sql":
+        if spec.to.group:
+            if tgt is None or tgt.type != "ldap":
+                raise ServiceError(f"target '{spec.to.source}' is not an Active Directory (ldap) source")
+        elif tgt is None or tgt.type != "sql":
             raise ServiceError(f"target '{spec.to.source}' is not a SQL source")
         return spec
 
@@ -193,6 +201,20 @@ class LoadService:
                     out.header += [k for k in r if k not in out.header]
             except Exception as exc:     # noqa: BLE001
                 out.source_error = _clean(exc)
+            if spec.to.group:
+                def _group():
+                    d = runner._directory(spec)
+                    g = d.resolve_group(spec.to.group)
+                    members = d.members(g.dn)
+                    kinds: dict[str, int] = {}
+                    for m in members:
+                        kinds[m.kind] = kinds.get(m.kind, 0) + 1
+                    return {"dn": g.dn, "name": g.name, "sam": g.sam, "members": len(members), "kinds": kinds}
+                try:
+                    out.group = await anyio.to_thread.run_sync(_group)
+                except Exception as exc:     # noqa: BLE001
+                    out.target_error = _clean(exc)
+                return out
             try:
                 tbl = await anyio.to_thread.run_sync(runner._target(spec)._table, spec.to.table)
                 pk = {c.name for c in tbl.primary_key.columns}

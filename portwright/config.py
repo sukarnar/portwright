@@ -109,7 +109,7 @@ class ParamSpec(BaseModel):
 # Sources
 # --------------------------------------------------------------------------- #
 class SourceSpec(BaseModel):
-    type: Literal["sql", "file", "rest", "callable"]
+    type: Literal["sql", "file", "rest", "callable", "ldap"]
     description: str = ""
     # managed credential used to connect/authenticate (see `portwright cred`)
     credential: str | None = None
@@ -128,11 +128,28 @@ class SourceSpec(BaseModel):
     timeout_seconds: float = 10.0
     # callable
     module: str | None = None
+    # ldap (Active Directory) – a load target for group membership
+    servers: list[str] = Field(default_factory=list)   # ldaps://dc01.corp.local[:636], tried in order
+    base_dn: str | None = None                         # where users and groups are searched
+    directory: Literal["ldap", "powershell"] = "ldap"   # ldap3 over LDAPS, or the PowerShell AD module
+    ca_file: str | None = None                         # extra CA bundle (PEM); default: system store
+    allow_plain_ldap: bool = False                     # ldap:// without TLS is refused unless set
 
     @model_validator(mode="after")
     def _check(self) -> "SourceSpec":
         if self.type == "sql" and not (self.url or self.credential):
             raise ValueError("source type 'sql' requires 'url' or 'credential'")
+        if self.type == "ldap":
+            if not self.base_dn:
+                raise ValueError("source type 'ldap' requires 'base_dn', e.g. DC=corp,DC=local")
+            if self.directory == "ldap":
+                if not self.servers:
+                    raise ValueError("source type 'ldap' requires 'servers', e.g. ldaps://dc01.corp.local")
+                if not self.credential:
+                    raise ValueError("an ldap source needs a 'credential' (service account, type basic)")
+                plain = [s for s in self.servers if s.lower().startswith("ldap://")]
+                if plain and not self.allow_plain_ldap:
+                    raise ValueError(f"{plain[0]} is not encrypted; use ldaps:// (or set allow_plain_ldap: true)")
         required = {"file": "path", "rest": "base_url"}
         field = required.get(self.type)
         if field and not getattr(self, field):
@@ -321,8 +338,31 @@ class LoadFrom(BaseModel):
 
 
 class LoadTo(BaseModel):
-    source: str                          # a SQL source with read_only: false
-    table: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_$#.]{0,127}$")
+    source: str                          # a SQL source with read_only: false, or an ldap source
+    table: str | None = Field(None, pattern=r"^[A-Za-z_][A-Za-z0-9_$#.]{0,127}$")
+    group: str | None = None             # AD group: distinguished name, or its name / sAMAccountName
+
+    @model_validator(mode="after")
+    def _one(self) -> "LoadTo":
+        if bool(self.table) == bool(self.group):
+            raise ValueError("load 'to' needs exactly one of 'table' or 'group'")
+        return self
+
+    @property
+    def target(self) -> str:
+        return self.table or self.group or ""
+
+
+class GroupLoad(BaseModel):
+    """Settings for loads into an Active Directory group."""
+    email_column: str = "email"                       # source column holding the e-mail address
+    match: list[Literal["mail", "userPrincipalName", "proxyAddresses"]] = Field(
+        default_factory=lambda: ["mail", "userPrincipalName"])        # tried in this order
+    max_remove_percent: float = Field(20, ge=0, le=100)   # refuse to remove more of the current members
+    protected: list[str] = Field(default_factory=list)  # never removed: DNs, sAMAccountNames or e-mails
+    keep_nested_groups: bool = True                     # groups inside the group are never removed
+    exception_group: str | None = None                  # members of this group are never removed
+    reject_disabled: bool = True                        # disabled accounts are rejected, not added
 
 
 class SourceTracking(BaseModel):
@@ -345,12 +385,13 @@ class LoadSpec(BaseModel):
     description: str = ""
     from_: LoadFrom = Field(alias="from")
     to: LoadTo
-    mode: Literal["insert", "replace", "upsert"] = "insert"
+    mode: Literal["insert", "replace", "upsert", "sync"] = "insert"   # group loads: replace | sync | insert (add only)
     keys: list[str] = Field(default_factory=list)          # load key (target columns), any mode
     duplicate_keys: Literal["reject", "first", "last"] = "reject"   # same key twice in the source
     existing_keys: Literal["reject", "skip", "fail"] = "reject"     # insert mode: key already in the table
     tracking: SourceTracking = Field(default_factory=SourceTracking)
     safety: LoadSafety = Field(default_factory=LoadSafety)
+    ad: GroupLoad = Field(default_factory=GroupLoad)
     batch_size: int = Field(1000, ge=1, le=50000)
     max_rejects: int = Field(0, ge=0)
     unmapped_source_columns: Literal["ignore", "error"] = "ignore"
@@ -364,6 +405,13 @@ class LoadSpec(BaseModel):
         dupes = {t for t in targets if targets.count(t) > 1}
         if dupes:
             raise ValueError(f"load '{self.name}': target columns mapped twice: {sorted(dupes)}")
+        if self.to.group:
+            if self.mode == "upsert":
+                raise ValueError(f"load '{self.name}': AD group loads use mode replace (kill & fill), "
+                                 f"sync or insert (add only)")
+            return self
+        if self.mode == "sync":
+            raise ValueError(f"load '{self.name}': mode 'sync' is for AD group loads; use upsert for tables")
         if self.mode == "upsert" and not self.keys:
             raise ValueError(f"load '{self.name}': mode 'upsert' needs 'keys'")
         missing = {k.lower() for k in self.keys} - set(targets)
@@ -403,7 +451,11 @@ class ProjectConfig(BaseModel):
             if ld.from_.source and ld.from_.source not in self.sources:
                 raise ValueError(f"load '{ld.name}' reads unknown source '{ld.from_.source}'")
             tgt = self.sources.get(ld.to.source)
-            if tgt is None or tgt.type != "sql":
+            if ld.to.group:
+                if tgt is None or tgt.type != "ldap":
+                    raise ValueError(f"load '{ld.name}': an AD group target needs an ldap source, "
+                                     f"'{ld.to.source}' is not one")
+            elif tgt is None or tgt.type != "sql":
                 raise ValueError(f"load '{ld.name}': target '{ld.to.source}' must be a SQL source")
         seen_names: set[str] = set()
         seen_routes: set[tuple[str, str]] = set()
