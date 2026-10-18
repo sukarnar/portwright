@@ -52,7 +52,7 @@ portwright serve --port 8080          # docs at http://127.0.0.1:8080/api/docs
 
 ### Calling the API
 ```bash
-curl -H "X-API-Key: rf_xxxxxxxx_..." "http://127.0.0.1:8080/api/employees?dept=ENG&limit=20"
+curl -H "X-API-Key: pw_xxxxxxxx_..." "http://127.0.0.1:8080/api/employees?dept=ENG&limit=20"
 
 TOKEN=$(curl -s -X POST localhost:8080/api/auth/token -H 'content-type: application/json' \
         -d '{"username":"alice","password":"..."}' | jq -r .access_token)

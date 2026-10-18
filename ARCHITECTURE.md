@@ -76,7 +76,7 @@ portwright/
 * CORS off by default; wildcard origins are refused.
 
 **Authentication** – *deny by default*: an endpoint is protected unless explicitly `public: true` (CLI warns).
-* **API keys** `rf_<id>_<secret>` with 256-bit entropy; only the SHA-256 hash is stored, the key is shown once; constant-time comparison; expiry (default 90 days) and revocation.
+* **API keys** `pw_<id>_<secret>` (pre-rename `rf_` keys still accepted) with 256-bit entropy; only the SHA-256 hash is stored, the key is shown once; constant-time comparison; expiry (default 90 days) and revocation.
 * **JWT** for users: short TTL, algorithm pinned (no `none`/alg confusion), `iss`/`aud`/`exp` required, secret ≥ 32 chars from env. Passwords hashed with scrypt; dummy-hash on unknown users prevents username enumeration; login throttled per IP *and* per username.
 
 **Authorization** – scopes per endpoint (`employees:read`, `employees:write`), `*` = admin. `crud` generates separate read/write scopes. Admin-only `/_meta` routes.

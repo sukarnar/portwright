@@ -1,5 +1,5 @@
 """portwright – a declarative, secure REST API builder for SQL, files, upstream APIs and Python callables."""
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 from .config import ProjectConfig  # noqa: E402
 from .sources.base import DataSource, ExecutionContext, SourceError, register  # noqa: E402

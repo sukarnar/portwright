@@ -5,7 +5,7 @@ screen: access
 Endpoints are **protected by default**. A caller needs an API key (or a JWT for a user) whose scopes
 include the endpoint's scope. `*` is the admin scope. An endpoint marked **public** needs no key.
 
-* API keys look like `rf_<id>_<secret>`. Only a hash is stored – the key is shown **once**.
+* API keys look like `pw_<id>_<secret>` (keys made before the rename, `rf_...`, keep working). Only a hash is stored – the key is shown **once**.
 * Keys expire (default 90 days) and can be revoked at any time; revoked keys stop working immediately
   after a server restart.
 * The key goes in the header `X-API-Key` (configurable in `portwright.yaml`, `security.api_key_header`).
@@ -42,5 +42,5 @@ portwright user remove jsmith
 Store a key for scripts in an environment variable instead of in the script:
 
 ```powershell
-[Environment]::SetEnvironmentVariable("PORTWRIGHT_KEY", "rf_xxx_yyy", "User")
+[Environment]::SetEnvironmentVariable("PORTWRIGHT_KEY", "pw_xxx_yyy", "User")
 ```
