@@ -50,7 +50,8 @@ records added / removed counts, and the run report lists every member added and 
 ## In Studio
 
 1. **Sources > Add source**, type **Active Directory (ldap)**: domain controllers, base DN, the service
-   account credential (or *PowerShell*). **Test** binds and reads the base DN.
+   account credential (or *PowerShell*), and optionally a **Test group**. **Test** binds, reads the base DN
+   and, when a test group is set, lists its members (name, account, mail, kind).
 2. **Loads > New load**, **Write to: AD group**. Choose the source rows (endpoint with the e-mail query, or a
    file), the **e-mail column**, the AD source and the group (**Browse groups** searches AD).
    **Check group and source** shows the group's DN and member count and whether the e-mail column exists.
@@ -69,9 +70,11 @@ records added / removed counts, and the run report lists every member added and 
 portwright cred add ad_svc -t basic                    # username svc_portwright@corp.local + password
 portwright source add corp_ad -t ldap --server ldaps://dc01.corp.local --server ldaps://dc02.corp.local `
     --base-dn "DC=corp,DC=local" --credential ad_svc
+portwright source set-test-group corp_ad HR-Staff      # optional: 'source test' then lists its members
 portwright source test corp_ad
 portwright source ad-groups corp_ad -s HR               # find groups
 portwright source ad-group corp_ad HR-Staff             # DN and member counts
+portwright source ad-group corp_ad HR-Staff --members   # ... and every member
 portwright source ad-user corp_ad ann.lee@corp.com      # which AD user an address matches
 
 # or with the PowerShell AD module and the service's own Windows account
@@ -99,6 +102,7 @@ sources:
     servers: [ldaps://dc01.corp.local, ldaps://dc02.corp.local]
     base_dn: DC=corp,DC=local
     credential: ad_svc
+    test_group: HR-Staff            # optional – 'source test' lists its members
 loads:
   - name: hr-staff-group
     from: {endpoint: hr-staff-emails}

@@ -134,6 +134,7 @@ class SourceSpec(BaseModel):
     directory: Literal["ldap", "powershell"] = "ldap"   # ldap3 over LDAPS, or the PowerShell AD module
     ca_file: str | None = None                         # extra CA bundle (PEM); default: system store
     allow_plain_ldap: bool = False                     # ldap:// without TLS is refused unless set
+    test_group: str | None = None                      # 'source test' lists this group's members
 
     @model_validator(mode="after")
     def _check(self) -> "SourceSpec":

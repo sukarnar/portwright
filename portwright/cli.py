@@ -143,6 +143,8 @@ def source_add(
     ca_file: Optional[str] = typer.Option(None, "--ca-file", help="ldap: CA bundle (PEM) if the DC certificate "
                                                                   "is not trusted by Windows."),
     allow_plain_ldap: bool = typer.Option(False, "--allow-plain-ldap", help="ldap: allow unencrypted ldap://."),
+    test_group: Optional[str] = typer.Option(None, "--test-group", help="ldap: group whose members "
+                                                                        "'source test' lists."),
     description: str = "",
     config: str = CONFIG_OPT,
 ):
@@ -152,7 +154,7 @@ def source_add(
                     headers=_kv(header), module=module, read_write=read_write, allow_host=allow_host,
                     credential=credential, allow_credentials=allow_credential, description=description,
                     servers=server, base_dn=base_dn, directory=directory, ca_file=ca_file,
-                    allow_plain_ldap=allow_plain_ldap)
+                    allow_plain_ldap=allow_plain_ldap, test_group=test_group)
     _warn(warnings)
     _ok(f"Source '{name}' ({type}) added")
 
@@ -170,12 +172,31 @@ def source_ad_groups(name: str, search: str = typer.Option("", "--search", "-s",
 
 @source_app.command("ad-group")
 def source_ad_group(name: str, group: str = typer.Argument(..., help="Group DN, name or sAMAccountName."),
+                    members: bool = typer.Option(False, "--members", "-m", help="List the members."),
                     config: str = CONFIG_OPT):
-    """Show one AD group and its member counts."""
-    g = _run(_svc(config).sources.ad_group, name, group)
+    """Show one AD group and its member counts (--members lists them)."""
+    g = _run(_svc(config).sources.ad_group, name, group, members)
     typer.echo(f"{g['name']}  {g['dn']}")
     typer.echo(f"  members: {g['members']}  (" + ", ".join(f"{k}: {v}" for k, v in sorted(g['kinds'].items()))
                + ")")
+    if members:
+        _member_table(g["member_list"])
+
+
+def _member_table(rows: list[dict]) -> None:
+    w = max([len(r["name"]) for r in rows] + [4])
+    a = max([len(r["account"]) for r in rows] + [7])
+    for r in rows:
+        typer.echo(f"  {r['name']:<{w}}  {r['account']:<{a}}  {r['mail']:<36} {r['kind']}"
+                   + (f"  {r['status']}" if r["status"] else ""))
+
+
+@source_app.command("set-test-group")
+def source_set_test_group(name: str, group: Optional[str] = typer.Argument(None, help="Omit to unset."),
+                          config: str = CONFIG_OPT):
+    """Set the AD group whose members 'source test' lists (ldap sources)."""
+    _run(_svc(config).sources.set_test_group, name, group)
+    _ok(f"Test group of '{name}' " + (f"set to {group}" if group else "removed"))
 
 
 @source_app.command("ad-user")
@@ -213,6 +234,9 @@ def source_test(name: str, config: str = CONFIG_OPT):
     if not r.ok:
         _fail(Exception(r.message))
     _ok(r.message)
+    if r.columns == ["name", "account", "mail", "kind", "status"]:
+        _member_table(r.rows)
+        return
     for row in r.rows:
         typer.echo(f"  {row}")
 

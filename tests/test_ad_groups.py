@@ -208,3 +208,25 @@ def test_cli_ad_group_load(svc, ad):
     assert set(members(conn)) == {"HR-Sub", "ann", "bob", "svc_keep"}
     assert "added=1" in r.invoke(app, ["load", "history", "grp", "-c", cfg]).output
     assert "AD group" in r.invoke(app, ["load", "show", "grp", "-c", cfg]).output
+
+
+def test_test_group_lists_members(svc, ad):
+    r = svc.sources.test("corp_ad")
+    assert r.ok and "set a test group" in r.message and not r.rows
+    svc.sources.set_test_group("corp_ad", "HR-Staff")
+    assert svc.project.config.sources["corp_ad"].test_group == "HR-Staff"
+    r = svc.sources.test("corp_ad")
+    assert r.ok and "5 member(s)" in r.message, r.message
+    assert [x["account"] for x in r.rows] == ["ann", "old1", "old2", "svc_keep", "HR-Sub"]
+    assert r.rows[-1]["kind"] == "group" and r.rows[-1]["status"] == "kept"
+    svc.sources.set_test_group("corp_ad", "Nope")
+    assert not svc.sources.test("corp_ad").ok
+    from typer.testing import CliRunner
+    from portwright.cli import app
+    cfg = str(svc.project.path)
+    out = CliRunner().invoke(app, ["source", "set-test-group", "corp_ad", "HR-Staff", "-c", cfg])
+    assert out.exit_code == 0, out.output
+    out = CliRunner().invoke(app, ["source", "test", "corp_ad", "-c", cfg])
+    assert "5 member(s)" in out.output and "old1@corp.com" in out.output, out.output
+    out = CliRunner().invoke(app, ["source", "ad-group", "corp_ad", "HR-Staff", "--members", "-c", cfg])
+    assert "svc_keep" in out.output and "HR-Sub" in out.output, out.output

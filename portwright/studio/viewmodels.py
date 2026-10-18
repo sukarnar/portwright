@@ -128,7 +128,7 @@ def source_values(svc: Services, name: str) -> dict[str, Any]:
             "module": s.module or "", "allow_credentials": ", ".join(s.credentials),
             "description": s.description, "url": s.url or "",
             "servers": "\n".join(s.servers), "base_dn": s.base_dn or "", "directory": s.directory,
-            "ca_file": s.ca_file or "", "allow_plain_ldap": s.allow_plain_ldap}
+            "ca_file": s.ca_file or "", "allow_plain_ldap": s.allow_plain_ldap, "test_group": s.test_group or ""}
 
 
 def save_source(svc: Services, v: dict[str, Any], editing: bool = False) -> list[str]:
@@ -156,7 +156,7 @@ def save_source(svc: Services, v: dict[str, Any], editing: bool = False) -> list
             raise ServiceError("choose the service-account credential (type basic)")
         kw.update(servers=servers, base_dn=(v.get("base_dn") or "").strip(), directory=method,
                   credential=v.get("credential") or None, ca_file=(v.get("ca_file") or "").strip() or None,
-                  allow_plain_ldap=bool(v.get("allow_plain_ldap")))
+                  allow_plain_ldap=bool(v.get("allow_plain_ldap")), test_group=v.get("test_group") or None)
     else:
         allowed = [c.strip() for c in (v.get("allow_credentials") or "").split(",") if c.strip()]
         kw.update(module=(v.get("module") or "").strip() or None, allow_credentials=allowed)

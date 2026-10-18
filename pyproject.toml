@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "portwright"
-version = "0.5.0"
+version = "0.5.2"
 description = "Portwright – secure REST endpoints and data loads over SQL databases, files, upstream APIs and Python callables"
 requires-python = ">=3.11"
 dependencies = [

@@ -21,6 +21,17 @@ class TestResult:
     rows: list[dict[str, Any]] = field(default_factory=list)
 
 
+MEMBER_COLUMNS = ["name", "account", "mail", "kind", "status"]
+
+
+def member_rows(members) -> list[dict[str, Any]]:
+    """Group members as table rows, users first, sorted by name."""
+    rows = [{"name": m.name or m.dn.split(",")[0].split("=", 1)[-1], "account": m.sam or "", "mail": m.mail or m.upn or "",
+             "kind": m.kind, "status": "disabled" if m.disabled else ("" if m.kind == "user" else "kept")}
+            for m in members]
+    return sorted(rows, key=lambda r: (r["kind"] != "user", r["name"].lower()))
+
+
 # ======================================================================== sources
 class SourceService:
     TYPES = ("sql", "file", "rest", "callable", "ldap")
@@ -37,7 +48,8 @@ class SourceService:
         for name, s in self.cfg.sources.items():
             detail = s.url or s.path or s.base_url or s.module or ""
             if s.type == "ldap":
-                detail = (", ".join(s.servers) if s.servers else "PowerShell AD module") + f" · {s.base_dn}"
+                detail = (", ".join(s.servers) if s.servers else "PowerShell AD module") + f" · {s.base_dn}" \
+                    + (f" · test group {s.test_group}" if s.test_group else "")
             if s.type == "sql" and not detail:
                 detail = "database (login from credential)"
             out.append({"name": name, "type": s.type, "detail": detail, "credential": s.credential,
@@ -57,7 +69,7 @@ class SourceService:
             credential: str | None = None, allow_credentials: list[str] | None = None,
             description: str = "", replace: bool = False, servers: list[str] | None = None,
             base_dn: str | None = None, directory: str = "ldap", ca_file: str | None = None,
-            allow_plain_ldap: bool = False) -> list[str]:
+            allow_plain_ldap: bool = False, test_group: str | None = None) -> list[str]:
         """Add (or with replace=True, overwrite) a source. Returns warnings."""
         warnings = []
         if name in self.cfg.sources and not replace:
@@ -78,7 +90,8 @@ class SourceService:
                               credentials=allow_credentials or [], description=description,
                               servers=[x.strip() for x in (servers or []) if x and x.strip()],
                               base_dn=(base_dn or "").strip() or None, directory=directory or "ldap",
-                              ca_file=ca_file or None, allow_plain_ldap=allow_plain_ldap)
+                              ca_file=ca_file or None, allow_plain_ldap=allow_plain_ldap,
+                              test_group=(test_group or "").strip() or None)
         except Exception as exc:
             raise ServiceError(_clean(exc)) from None
         if credential:
@@ -158,10 +171,19 @@ class SourceService:
                 def _t():
                     d = src.directory()
                     try:
-                        return d.test()
+                        msg = d.test()
+                        if not spec.test_group:
+                            return TestResult(True, msg + " (set a test group to list its members)")
+                        g = d.resolve_group(spec.test_group)
+                        members = d.members(g.dn)
+                        rows = member_rows(members)
+                        limit = max(preview_rows, 50)
+                        return TestResult(True, f"{msg}; group {g.name or g.sam} has {len(members)} member(s)"
+                                          + (f", showing {limit}" if len(rows) > limit else ""),
+                                          MEMBER_COLUMNS, rows[:limit])
                     finally:
                         d.close()
-                return TestResult(True, await anyio.to_thread.run_sync(_t))
+                return await anyio.to_thread.run_sync(_t)
             await src.startup()
             try:
                 if spec.type == "sql":
@@ -199,8 +221,16 @@ class SourceService:
         finally:
             d.close()
 
-    def ad_group(self, name: str, group: str) -> dict:
-        """One group with its member counts."""
+    def set_test_group(self, name: str, group: str | None) -> None:
+        """The AD group whose members 'source test' lists (None to unset)."""
+        spec = self.get(name)
+        if spec.type != "ldap":
+            raise ServiceError(f"'{name}' is not an ldap (Active Directory) source")
+        spec.test_group = (group or "").strip() or None
+        self.p.save()
+
+    def ad_group(self, name: str, group: str, with_members: bool = False) -> dict:
+        """One group with its member counts (and, with_members, the member list)."""
         from ..directory import DirectoryError
         d = self._directory(name)
         try:
@@ -209,7 +239,10 @@ class SourceService:
             kinds: dict[str, int] = {}
             for m in members:
                 kinds[m.kind] = kinds.get(m.kind, 0) + 1
-            return {"dn": g.dn, "name": g.name, "sam": g.sam, "members": len(members), "kinds": kinds}
+            out = {"dn": g.dn, "name": g.name, "sam": g.sam, "members": len(members), "kinds": kinds}
+            if with_members:
+                out["member_list"] = member_rows(members)
+            return out
         except DirectoryError as exc:
             raise ServiceError(str(exc)) from None
         finally:

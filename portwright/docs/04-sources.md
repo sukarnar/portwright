@@ -40,7 +40,7 @@ portwright source add budget -t file --path budget.xlsx --sheet FY27
 portwright source add crm -t rest --base-url https://crm.corp.local/api --allow-host --credential crm_token
 portwright source add pricing -t callable --module handlers.pricing --allow-credential erp
 portwright source add corp_ad -t ldap --server ldaps://dc01.corp.local --server ldaps://dc02.corp.local `
-    --base-dn "DC=corp,DC=local" --credential ad_svc
+    --base-dn "DC=corp,DC=local" --credential ad_svc --test-group HR-Staff
 
 portwright source list
 portwright source test transfers          # shows the first rows

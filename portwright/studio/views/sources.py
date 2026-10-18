@@ -102,6 +102,8 @@ class SourcesView:
                                v.get("credential") or (basic_creds[0] if basic_creds else "(none)"))
         f_ca = text_field("CA certificate file (optional)", v.get("ca_file", ""),
                           hint="only if Windows does not trust the DC certificate; PEM file")
+        f_test_group = text_field("Test group (optional)", v.get("test_group", ""),
+                                  hint="Test lists this group's members, e.g. HR-Staff or its DN")
         f_plain = ft.Checkbox(label="Allow unencrypted ldap:// (not recommended)",
                               value=bool(v.get("allow_plain_ldap")))
         ldap_hint = ft.Text("Username as svc@corp.local or CORP\\svc. The account needs 'Write Members' on the "
@@ -117,7 +119,7 @@ class SourcesView:
                               horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
             "rest": ft.Column([f_url, f_allow, f_http_cred, f_headers], spacing=10, horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
             "callable": ft.Column([f_module, f_allowc], spacing=10, horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
-            "ldap": ft.Column([f_ldap_method, f_servers, f_base_dn, f_ldap_cred, f_ca, f_plain, ldap_hint], spacing=10,
+            "ldap": ft.Column([f_ldap_method, f_servers, f_base_dn, f_ldap_cred, f_test_group, f_ca, f_plain, ldap_hint], spacing=10,
                               horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
         }
 
@@ -157,7 +159,8 @@ class SourcesView:
             elif t == "ldap":
                 values.update(directory=f_ldap_method.value, servers=f_servers.value, base_dn=f_base_dn.value,
                               credential=None if f_ldap_cred.value == "(none)" else f_ldap_cred.value,
-                              ca_file=f_ca.value, allow_plain_ldap=f_plain.value)
+                              ca_file=f_ca.value, allow_plain_ldap=f_plain.value,
+                              test_group=f_test_group.value)
             else:
                 values.update(module=f_module.value, allow_credentials=f_allowc.value)
             try:
@@ -230,7 +233,8 @@ class SourcesView:
                 return
             cols = r.columns
             self.ctx.info(f"'{name}': {r.message}", [
-                ft.Text("First rows:", color=ft.Colors.ON_SURFACE_VARIANT),
+                ft.Text("Members:" if cols[:2] == ["name", "account"] else "First rows:",
+                        color=ft.Colors.ON_SURFACE_VARIANT),
                 table(cols, [[ft.Text(str(row.get(c, ""))) for c in cols] for row in r.rows])], width=760)
         self.ctx.background(lambda: self.ctx.svc.sources.test(name), done)
 

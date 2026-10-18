@@ -17,6 +17,7 @@ from .base import Directory, DirectoryError, batches
 
 _SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
 $ProgressPreference = 'SilentlyContinue'
 try {
   Import-Module ActiveDirectory -ErrorAction Stop
@@ -80,8 +81,11 @@ class PowerShellDirectory(Directory):
             env["PW_AD_USER"] = str(self.credential.fields.get("username") or "")
             env["PW_AD_PASS"] = str(self.credential.fields.get("password") or "")
         try:
+            # -EncodedCommand: the whole script parsed at once (stdin with -Command - runs line by line)
+            encoded = base64.b64encode(_SCRIPT.encode("utf-16-le")).decode()
             proc = subprocess.run([self._exe(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                                   "-Command", "-"], input=_SCRIPT, capture_output=True, text=True,
+                                   "-EncodedCommand", encoded], capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
                                   env=env, timeout=600)
         except subprocess.TimeoutExpired:
             raise DirectoryError("PowerShell AD command timed out") from None
