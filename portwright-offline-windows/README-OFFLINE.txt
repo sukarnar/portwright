@@ -3,6 +3,16 @@ Portwright - offline installation bundle (Windows x64, Python 3.12 / 3.13)
 Portwright is the new name of restforge. Commands: portwright, the short alias pw, and the old
 name restforge (kept so existing scripts, Stonebranch tasks and NSSM services keep working).
 
+New in 0.5.0 - Active Directory group loads
+  A load can fill an AD group (kill & fill, sync or add only) from e-mail addresses returned by a
+  query endpoint or a file. Add a source of type ldap (Sources > Add source, or
+  pw source add corp_ad -t ldap --server ldaps://dc01.corp.local --base-dn "DC=corp,DC=local" --credential ad_svc),
+  then a load with "Write to: AD group". Guide: pw docs ad-groups
+  Needs: TCP 636 (LDAPS) from this server to a domain controller, and a service account with
+  "Write Members" on the group - or the RSAT ActiveDirectory PowerShell module (directory: powershell).
+  The new packages (ldap3, pyasn1) are in the wheelhouse; -Upgrade installs them.
+  Always run the first load with --dry-run (or Preview in Studio) and read the remove list.
+
 Contents
   wheelhouse\            portwright + every dependency as .whl files (no internet needed)
   install-offline.ps1    one-command installer (new install or upgrade)
