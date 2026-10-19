@@ -87,9 +87,10 @@ class EndpointsView:
 
     # ------------------------------------------------------------- create
     def new_dialog(self) -> None:
-        sources = self.ctx.svc.sources.list()
+        sources = [s for s in self.ctx.svc.sources.list() if s["type"] != "ldap"]   # AD = load target only
         if not sources:
-            self.ctx.toast("Add a source first (Sources screen).", error=True)
+            self.ctx.toast("Add a source first (Sources screen). Active Directory sources are used by group "
+                           "loads, not endpoints.", error=True)
             self.ctx.go("sources")
             return
         f_src = dropdown("Source", {s["name"]: f"{s['name']}  ({s['type']})" for s in sources}, sources[0]["name"])
@@ -326,11 +327,16 @@ class EndpointEditor:
         self.ctx = view.ctx
         self.svc = view.ctx.svc
         self.original = name
-        self.sources = {s["name"]: s for s in self.svc.sources.list()}
+        self.sources = {s["name"]: s for s in self.svc.sources.list() if s["type"] != "ldap"}
         if name:
             d = self.svc.endpoints.as_dict(name)
             self.kind = _kind(d, self.sources.get(d["source"], {}).get("type", "sql"))
         else:
+            if source and source not in self.sources or not self.sources:
+                from ...services.catalog import _no_ldap
+                if source:
+                    _no_ldap(self.svc.project.config, source)
+                raise ServiceError("add a sql, file, rest or callable source first")
             src = source or next(iter(self.sources))
             stype = self.sources[src]["type"]
             self.kind = kind or _kind({}, stype)

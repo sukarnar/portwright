@@ -230,3 +230,20 @@ def test_test_group_lists_members(svc, ad):
     assert "5 member(s)" in out.output and "old1@corp.com" in out.output, out.output
     out = CliRunner().invoke(app, ["source", "ad-group", "corp_ad", "HR-Staff", "--members", "-c", cfg])
     assert "svc_keep" in out.output and "HR-Sub" in out.output, out.output
+
+
+def test_endpoints_refuse_ldap_sources(svc):
+    with pytest.raises(ServiceError, match="Active Directory source"):
+        svc.endpoints.add("g", "corp_ad", "/g")
+    with pytest.raises(ServiceError, match="Active Directory source"):
+        svc.endpoints.save({"name": "g", "source": "corp_ad", "path": "/g"})
+    from test_studio_ad_editor import FakeCtx
+    from portwright.studio.views.endpoints import EndpointsView
+    ctx = FakeCtx(svc)
+    ctx.go = ctx.view = lambda *a: None
+    v = EndpointsView(ctx)
+    v.refresh = lambda update=True: None
+    v.open_editor(None, source="corp_ad")
+    assert v.editor is None and "Active Directory source" in ctx.errors[-1]
+    v.open_editor(None)                                    # picks the sql source, never the AD one
+    assert v.editor.f_source.value == "hr"

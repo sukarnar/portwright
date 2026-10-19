@@ -310,6 +310,14 @@ class SourceService:
 
 
 # ====================================================================== endpoints
+def _no_ldap(cfg, source: str) -> None:
+    spec = cfg.sources.get(source)
+    if spec is not None and spec.type == "ldap":
+        raise ServiceError(f"'{source}' is an Active Directory source. It is the target of AD group loads "
+                           f"(Loads > New load > Write to: AD group), not a source for endpoints; endpoints "
+                           f"read from sql, file, rest or callable sources")
+
+
 class EndpointService:
     def __init__(self, project: Project):
         self.p = project
@@ -340,6 +348,7 @@ class EndpointService:
             replace: bool = False) -> tuple[EndpointSpec, list[str]]:
         if self.cfg.endpoint(name) and not replace:
             raise ServiceError(f"endpoint '{name}' already exists")
+        _no_ldap(self.cfg, source)
         if public and scopes:
             raise ServiceError("an endpoint is either public or has scopes, not both")
         filters = filters or []
@@ -421,6 +430,7 @@ class EndpointService:
                 raise ServiceError(_clean(exc)) from None
         if ep.source not in self.cfg.sources:
             raise ServiceError(f"no source '{ep.source}'")
+        _no_ldap(self.cfg, ep.source)
         if ep.public and ep.scopes:
             raise ServiceError("an endpoint is either public or has scopes, not both")
         return ep
