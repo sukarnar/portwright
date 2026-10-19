@@ -3,6 +3,11 @@ Portwright - offline installation bundle (Windows x64, Python 3.12 / 3.13)
 Portwright is the new name of restforge. Commands: portwright, the short alias pw, and the old
 name restforge (kept so existing scripts, Stonebranch tasks and NSSM services keep working).
 
+New in 0.6.0 - activity log and migration to another instance
+  Every setup change (Studio, CLI, hand edits of portwright.yaml) is logged with user, time and the
+  equivalent pw command: Studio > Activity, or pw activity. Move a setup to test/prod with a replay
+  script (pw migrate script) or a bundle (pw migrate export / plan / import). Guide: pw docs migration
+
 New in 0.5.x - Active Directory group loads
   A load can fill an AD group (kill & fill, sync or add only) from e-mail addresses returned by a
   query endpoint or a file. Add a source of type ldap (Sources > Add source, or

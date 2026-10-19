@@ -18,6 +18,7 @@ from ..services import Project, ServiceError, Services
 from .common import Ctx, text_field
 from .viewmodels import Recent
 from .views.access import AccessView
+from .views.activity import ActivityView
 from .views.credentials import CredentialsView
 from .views.dashboard import DashboardView
 from .views.endpoints import EndpointsView
@@ -32,6 +33,7 @@ SCREENS = [  # key, label, icon, view class
     ("endpoints", "Endpoints", ft.Icons.API, EndpointsView),
     ("loads", "Loads", ft.Icons.MOVE_DOWN, LoadsView),
     ("access", "API keys", ft.Icons.BADGE, AccessView),
+    ("activity", "Activity", ft.Icons.HISTORY, ActivityView),
     ("help", "Help", ft.Icons.HELP_OUTLINE, HelpView),
 ]
 

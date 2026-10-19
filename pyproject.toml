@@ -4,8 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "portwright"
-version = "0.5.3"
+version = "0.6.0"
 description = "Portwright – secure REST endpoints and data loads over SQL databases, files, upstream APIs and Python callables"
+authors = [{ name = "Sukarna Chinchod" }]
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.110,<0.142",      # 0.142+ adds a hard dependency on opentelemetry-api

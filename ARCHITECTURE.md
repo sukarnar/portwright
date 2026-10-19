@@ -64,6 +64,8 @@ portwright/
     runner.py        LoadRunner: lock, read (all pages), validate vs table, rejects, one transaction, history
     groups.py        AD group loads: e-mail -> user matching, plan (add/remove/keep), safety, apply
   services/          Use cases shared by CLI and Studio (no printing, no prompts)
+    activity.py      Setup activity log (config diff on every save, credential events, replay scripts)
+    migration.py     pw config objects, variables files, migration bundles (export / plan / import)
   studio/            Flet 1.0 desktop/web app: app.py (shell, launcher), viewmodels.py, views/
   security/
     auth.py          Principal, AuthStrategy, ApiKeyStrategy, JwtStrategy, Authenticator

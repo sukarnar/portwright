@@ -1,5 +1,7 @@
 # Portwright
 
+**Author:** Sukarna Chinchod
+
 Declarative, secure REST endpoints for **SQL databases, files (CSV/JSON/Excel), upstream REST APIs and Python functions** – created from a CLI, served by FastAPI, documented automatically with OpenAPI.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design patterns and the security model.
@@ -283,6 +285,26 @@ module as the Windows account the process runs as. The account needs **Write Mem
 Invalid, unknown, ambiguous or disabled addresses go to the rejects file; source versioning, exit codes and
 history work as for table loads. Full guide: `portwright docs ad-groups`.
 
+## Activity log and moving a setup to another instance
+
+Every setup change – from Studio, the CLI, a migration import, or a hand edit of `portwright.yaml` – is
+logged in `logs\setup.jsonl` with the time, Windows user, computer, what changed and the equivalent
+`pw` command (never secrets). Studio shows it on the **Activity** screen; the CLI with `pw activity`.
+
+```powershell
+pw activity --since 2026-10-01 --commands       # who changed what, and the command for it
+pw config get load sccm-group                   # one object as YAML;  pw config put / remove
+pw migrate script -o setup.ps1 [--since DATE | --full]   # replay script for the target
+pw migrate export --include-data                # migration bundle (zip) – no secrets, keys or users
+pw migrate plan  bundle.zip --vars prod.vars.yaml -c C:\apps\hr-api\portwright.yaml
+pw migrate import bundle.zip --vars prod.vars.yaml -c C:\apps\hr-api\portwright.yaml
+```
+
+Values that differ per instance go in a variables file of dotted paths (`sources.hr.credential: hr_prod`,
+`sources.corp_ad.servers: [ldaps://proddc01]`, `server.port: 8443`); `pw migrate vars` prints a template.
+Imports back up `portwright.yaml` to `backups\`, apply in one validated save, keep existing credentials and
+list the missing ones (`--prompt-credentials` asks for them). Full guide: `pw docs migration`.
+
 ## Custom functions
 ```python
 # handlers/pricing.py
@@ -313,3 +335,7 @@ pip install -e .[dev] && pytest
 * Keep `.env` out of Git; rotate API keys (`key revoke` + `key create`).
 * Set `security.expose_docs: false` if the OpenAPI schema should not be public.
 * With multiple workers/instances, plug in a shared (Redis) `RateLimiter`.
+
+## Author
+
+Portwright is written and maintained by **Sukarna Chinchod**.

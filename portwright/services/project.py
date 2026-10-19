@@ -49,6 +49,8 @@ class Project:
         self.actor = actor                     # "cli" or "studio" – recorded in the audit log
         load_dotenv(self.root / ".env")
         self._creds: CredentialManager | None = None
+        from .activity import ActivityLog
+        self.activity = ActivityLog(self.root)
         self.reload()
 
     def audit(self, event: str, **details) -> None:
@@ -96,6 +98,17 @@ class Project:
             raise ServiceError(str(exc)) from None
         self._mtime = self.path.stat().st_mtime
         self._last_good = self.config.model_copy(deep=True)
+        try:                                  # log edits made to the file outside Portwright
+            self.activity.check_external(self.config, ProjectConfig)
+        except Exception:
+            pass
+
+    def log_credential(self, action: str, name: str, **kw) -> None:
+        """Activity entry for a credential change (credentials live in the vault, not in the file)."""
+        try:
+            self.activity.record_credential(action, name, via=self.actor, **kw)
+        except Exception:
+            pass
 
     def _rollback(self) -> None:
         """Discard in-memory changes that could not be saved."""
@@ -109,6 +122,7 @@ class Project:
 
     def save(self, force: bool = False) -> None:
         """Validate the whole document, keep a .bak of the previous version, write atomically."""
+        before = self._last_good
         try:
             self.config = ProjectConfig.model_validate(self.config.model_dump(mode="json", by_alias=True))
         except Exception as exc:
@@ -130,6 +144,10 @@ class Project:
         self._mtime = self.path.stat().st_mtime
         self._last_good = self.config.model_copy(deep=True)
         self.audit("config_saved", file=self.path.name)
+        try:                                  # what changed, who did it, and the pw command for it
+            self.activity.record_diff(before, self.config, via=self.actor)
+        except Exception:
+            pass
 
     # --------------------------------------------------------- credentials
     def credentials(self) -> CredentialManager:

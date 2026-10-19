@@ -94,6 +94,10 @@ class CredentialService:
                                        expires=_expiry(expires_days), secret_fields=secret_fields or []),
                             provider)
             self.p.audit("credential_added", credential=name, type=type, provider=where)
+            cred = Credential(name=name, type=type, fields=clean, secret_fields=secret_fields or [])
+            secret = cred.secrets
+            self.p.log_credential("create", name, ctype=type, secret_names=secret,
+                                  fields={k: v for k, v in clean.items() if k not in secret})
             return where
         except CredentialError as exc:
             raise ServiceError(str(exc)) from None
@@ -108,6 +112,10 @@ class CredentialService:
                 c.expires = _expiry(expires_days)
             mgr.put(c, c.provider if c.provider != "env" else None)
             self.p.audit("credential_rotated", credential=name, fields=sorted(changes))
+            secret = c.secrets
+            self.p.log_credential("update", name, ctype=c.type, secret_names=secret,
+                                  fields={k: v for k, v in c.fields.items() if k not in secret},
+                                  changed=[k for k, v in changes.items() if v not in (None, "")])
         except CredentialError as exc:
             raise ServiceError(str(exc)) from None
 
@@ -119,6 +127,7 @@ class CredentialService:
             if not self.p.credentials().delete(name):
                 raise ServiceError(f"no credential '{name}'")
             self.p.audit("credential_removed", credential=name)
+            self.p.log_credential("delete", name)
         except CredentialError as exc:
             raise ServiceError(str(exc)) from None
 

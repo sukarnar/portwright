@@ -4,6 +4,7 @@ All logic lives in ``portwright.services``; these commands only collect input an
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Optional
@@ -430,6 +431,8 @@ def cred_add(
     expires_days: Optional[int] = typer.Option(None, help="Mark for rotation after N days."),
     provider: Optional[str] = typer.Option(None, help="Writable provider: vault | keyring | hashicorp."),
     description: str = "",
+    vars_file: Optional[Path] = typer.Option(None, "--vars", help="Variables file: credentials.<name>.<field> "
+                                                                  "values override --field (replay scripts)."),
     config: str = CONFIG_OPT,
 ):
     """Store a credential. Secret fields are prompted with hidden input."""
@@ -438,6 +441,10 @@ def cred_add(
     s = _svc(config)
     if any(c["name"] == name for c in _run(s.credentials.list)):
         _fail(Exception(f"credential '{name}' exists – use 'portwright cred rotate'"))
+    if vars_file:
+        from .services.migration import apply_vars
+        over, _ = apply_vars("credential", name, {"fields": _kv(field)}, _run(_load_vars, vars_file))
+        field = [f"{k}={v}" for k, v in over["fields"].items()]
     fields = _collect_fields(type, field, secret_from_env)
     for k in secret:
         fields[k] = typer.prompt(k, hide_input=True, confirmation_prompt=True)
@@ -1163,6 +1170,253 @@ def serve(config: str = CONFIG_OPT,
                 reload=reload, reload_includes=["*.yaml", "*.py"] if reload else None,
                 workers=None if reload else workers, server_header=False, proxy_headers=True,
                 ssl_certfile=cfg.server.ssl_certfile, ssl_keyfile=cfg.server.ssl_keyfile)
+
+
+# ======================================================== activity, config objects, migration
+config_app = typer.Typer(help="Read or write one source, endpoint, load or settings block as YAML "
+                              "(used by replay scripts).", no_args_is_help=True)
+migrate_app = typer.Typer(help="Move a setup to another instance: replay scripts and migration bundles.",
+                          no_args_is_help=True)
+app.add_typer(config_app, name="config")
+app.add_typer(migrate_app, name="migrate")
+VARS_OPT = typer.Option(None, "--vars", help="Variables file (dotted paths) with the values for this instance.")
+
+
+@app.command("activity")
+def activity(since: Optional[str] = typer.Option(None, "--since", help="e.g. 2026-10-01 or 2026-10-19T14:00"),
+             kind: Optional[str] = typer.Option(None, "--kind", help="source | endpoint | load | credential | "
+                                                                     "settings | api_key | user | project"),
+             name: Optional[str] = typer.Option(None, "--name"),
+             search: Optional[str] = typer.Option(None, "--search", "-s", help="Text anywhere in the entry."),
+             last: int = typer.Option(50, "--last", "-n", help="Newest N entries (0 = all)."),
+             commands: bool = typer.Option(False, "--commands", help="Also print the pw command of each entry."),
+             as_json: bool = typer.Option(False, "--json", help="Raw JSON lines."),
+             config: str = CONFIG_OPT):
+    """The setup activity log: every change, who made it (Studio, CLI, migration, file edit) and when."""
+    from .services.activity import render_steps
+    s = _svc(config)
+    rows = s.project.activity.read(since=since, kind=kind, name=name, text=search, last=last or None)
+    if not rows:
+        typer.echo("No activity recorded" + (" for this filter." if (since or kind or name or search) else " yet."))
+        return
+    for e in rows:
+        if as_json:
+            typer.echo(json.dumps(e, ensure_ascii=False))
+            continue
+        color = {"create": "green", "delete": "red"}.get(e["action"], None)
+        typer.echo(f"{e['ts'][:19].replace('T', ' ')}  {e['user']:<12} {e['via']:<9} ", nl=False)
+        typer.secho(e["summary"], fg=color)
+        if commands and e.get("steps"):
+            for line in render_steps(e["steps"]).splitlines():
+                typer.echo("      " + line)
+
+
+@config_app.command("get")
+def config_get(kind: str = typer.Argument(..., help="source | endpoint | load | settings"),
+               name: str = typer.Argument(..., help="Object name (settings: server or security)."),
+               as_json: bool = typer.Option(False, "--json"), config: str = CONFIG_OPT):
+    """Print one object's definition."""
+    spec = _run(_svc(config).objects.get, kind, name)
+    typer.echo(json.dumps(spec, indent=2) if as_json else yaml.safe_dump(spec, sort_keys=False, allow_unicode=True))
+
+
+@config_app.command("put")
+def config_put(kind: str = typer.Argument(..., help="source | endpoint | load | settings"),
+               name: str = typer.Argument(...),
+               file: Optional[Path] = typer.Option(None, "--file", "-f", help="YAML/JSON file; default: standard input."),
+               vars_file: Optional[Path] = VARS_OPT, config: str = CONFIG_OPT):
+    """Create or replace one object from YAML/JSON (validated like any other change, and logged)."""
+    import sys
+    if file:
+        text = file.read_text(encoding="utf-8-sig")
+    else:                                   # bytes: Windows would decode piped input with the ANSI code page
+        raw = sys.stdin.buffer.read() if hasattr(sys.stdin, "buffer") else sys.stdin.read().encode()
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("mbcs" if os.name == "nt" else "latin-1", errors="replace")
+    try:
+        spec = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        _fail(Exception(f"not valid YAML/JSON: {exc}"))
+    s = _svc(config)
+    variables = _run(_load_vars, vars_file)
+    action, used = _run(s.objects.put, kind, name, spec or {}, variables)
+    _ok(f"{kind} '{name}' {action}" + (f" (variables: {', '.join(u.split('.', 2)[-1] for u in used)})"
+                                       if used else ""))
+
+
+@config_app.command("remove")
+def config_remove(kind: str, name: str,
+                  if_exists: bool = typer.Option(False, "--if-exists", help="No error if it does not exist."),
+                  config: str = CONFIG_OPT):
+    """Remove one source, endpoint or load."""
+    if _run(_svc(config).objects.remove, kind, name, if_exists):
+        _ok(f"{kind} '{name}' removed")
+    else:
+        typer.echo(f"{kind} '{name}' does not exist – nothing to remove")
+
+
+def _load_vars(path):
+    from .services import load_vars
+    return load_vars(path)
+
+
+@migrate_app.command("script")
+def migrate_script(out: Optional[Path] = typer.Option(None, "--out", "-o", help="Write to this .ps1 file."),
+                   since: Optional[str] = typer.Option(None, "--since", help="Only changes since, e.g. 2026-10-01."),
+                   kind: Optional[str] = typer.Option(None, "--kind"),
+                   name: Optional[str] = typer.Option(None, "--name"),
+                   full: bool = typer.Option(False, "--full", help="The whole current setup instead of the log."),
+                   config: str = CONFIG_OPT):
+    """A PowerShell script of pw commands that recreates the setup (or the logged changes) on a target."""
+    s = _svc(config)
+    text, n = _run(s.migration.script, since=since, kind=kind, name=name, full=full,
+                   file=out.name if out else "setup.ps1")
+    if out:
+        out.write_text(text.replace("\n", "\r\n"), encoding="utf-8-sig", newline="")
+        _ok(f"{out} written ({n} change(s)). On the target: .\\{out.name} -Config <path>\\portwright.yaml "
+            f"[-Vars prod.vars.yaml]")
+    else:
+        typer.echo(text)
+
+
+@migrate_app.command("export")
+def migrate_export(out: Optional[Path] = typer.Option(None, "--out", "-o",
+                                                      help="Zip file (default migrations\\<project>-<time>.zip)."),
+                   include_data: bool = typer.Option(False, "--include-data", help="Also the files in data\\."),
+                   no_handlers: bool = typer.Option(False, "--no-handlers", help="Leave out handlers\\*.py."),
+                   config: str = CONFIG_OPT):
+    """Export the setup as a migration bundle (no secrets, API keys or users)."""
+    s = _svc(config)
+    path, m = _run(s.migration.export, out, include_data=include_data, include_handlers=not no_handlers)
+    c = m["counts"]
+    _ok(f"{path}")
+    typer.echo(f"  {c['sources']} sources, {c['endpoints']} endpoints, {c['loads']} loads, "
+               f"{c['credentials']} credentials (names only), {c['handlers']} handler files, "
+               f"{c['data_files']} data files")
+    _warn(m["warnings"])
+    typer.echo(f"Next, on the target:\n  pw migrate vars {path.name} > prod.vars.yaml      (edit the values)\n"
+               f"  pw migrate plan {path.name} --vars prod.vars.yaml -c <target>\\portwright.yaml\n"
+               f"  pw migrate import {path.name} --vars prod.vars.yaml -c <target>\\portwright.yaml")
+
+
+@migrate_app.command("vars")
+def migrate_vars(bundle: Optional[Path] = typer.Argument(None, help="A bundle; omit for this project's template."),
+                 config: str = CONFIG_OPT):
+    """Print the variables template (values that usually differ per instance)."""
+    if bundle:
+        import zipfile
+        try:
+            with zipfile.ZipFile(bundle) as z:
+                typer.echo(z.read("vars.template.yaml").decode("utf-8"), nl=False)
+        except (OSError, KeyError, zipfile.BadZipFile) as exc:
+            _fail(Exception(f"cannot read the template from {bundle}: {exc}"))
+        return
+    typer.echo(_run(_svc(config).migration.vars_template), nl=False)
+
+
+def _target(config: str, init: bool, name: Optional[str] = None) -> Services:
+    from .compat import config_in
+    path = Path(config)
+    if not path.exists() and not config_in(path.parent).exists():
+        if not init:
+            _fail(Exception(f"{path} does not exist – create the project with 'pw init <folder>' or add --init"))
+        Project.init(path.parent, name or path.parent.name)
+        _ok(f"Project created in {path.parent}")
+    return _svc(config)
+
+
+def _print_plan(plan) -> None:
+    m = plan.manifest
+    typer.echo(f"Bundle {Path(plan.bundle).name}: '{m.get('project')}' exported {m.get('exported_at', '')[:16]} "
+               f"by {m.get('exported_by')} on {m.get('host')} (Portwright {m.get('portwright')})")
+    marks = {"create": ("+", "green"), "update": ("~", "yellow"), "remove": ("-", "red"),
+             "unchanged": ("=", None), "only-on-target": ("·", None)}
+    for i in plan.items:
+        mark, color = marks[i.action]
+        text = f"  {mark} {i.kind:<9} {i.name:<28} {i.action}"
+        if i.action == "update" and i.fields:
+            text += ": " + ", ".join(i.fields[:8])
+        if i.vars_applied:
+            text += f"   [vars: {', '.join(v.split('.', 2)[-1] for v in i.vars_applied)}]"
+        typer.secho(text, fg=color)
+    for c in plan.credentials:
+        if c["status"] == "missing":
+            typer.secho(f"  ! credential {c['name']:<24} missing on this instance"
+                        + ("" if c.get("used") else " (not used)"), fg="yellow" if c.get("used") else None)
+        else:
+            typer.echo(f"  = credential {c['name']:<24} present (kept – secrets are never imported)")
+    for f in plan.files:
+        if f["status"] != "same":
+            typer.echo(f"  {'+' if f['status'] == 'new' else '~' if f['status'] == 'changed' else '·'} file "
+                       f"{f['path']:<34} {f['status']}" + (" (use --overwrite-data)" if f["status"] == "skipped" else ""))
+    _warn(plan.warnings)
+    n = len(plan.changes)
+    typer.echo(f"{n} change(s) to the setup, {sum(1 for f in plan.files if f['status'] in ('new', 'changed'))} "
+               f"file(s) to write.")
+
+
+@migrate_app.command("plan")
+def migrate_plan(bundle: Path, vars_file: Optional[Path] = VARS_OPT,
+                 prune: bool = typer.Option(False, "--prune", help="Also remove objects not in the bundle."),
+                 skip_settings: bool = typer.Option(False, "--skip-settings", help="Keep this instance's server "
+                                                                                   "and security settings."),
+                 overwrite_data: bool = typer.Option(False, "--overwrite-data"),
+                 as_json: bool = typer.Option(False, "--json"), config: str = CONFIG_OPT):
+    """Show what importing a bundle would change on this instance (changes nothing)."""
+    s = _svc(config)
+    plan = _run(s.migration.plan, bundle, _run(_load_vars, vars_file), prune=prune, skip_settings=skip_settings,
+                overwrite_data=overwrite_data)
+    if as_json:
+        typer.echo(json.dumps(plan.to_dict(), indent=2, default=str))
+    else:
+        _print_plan(plan)
+
+
+@migrate_app.command("import")
+def migrate_import(bundle: Path, vars_file: Optional[Path] = VARS_OPT,
+                   prune: bool = typer.Option(False, "--prune", help="Also remove objects not in the bundle."),
+                   skip_settings: bool = typer.Option(False, "--skip-settings"),
+                   overwrite_data: bool = typer.Option(False, "--overwrite-data"),
+                   init: bool = typer.Option(False, "--init", help="Create the project if it does not exist."),
+                   prompt_credentials: bool = typer.Option(False, "--prompt-credentials",
+                                                           help="Ask for the secrets of missing credentials now."),
+                   yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask for confirmation."),
+                   config: str = CONFIG_OPT):
+    """Import a migration bundle: plan, confirm, back up portwright.yaml, apply, validate."""
+    s = _target(config, init)
+    variables = _run(_load_vars, vars_file)
+    plan = _run(s.migration.plan, bundle, variables, prune=prune, skip_settings=skip_settings,
+                overwrite_data=overwrite_data)
+    _print_plan(plan)
+    writes = [f for f in plan.files if f["status"] in ("new", "changed")]
+    if not plan.changes and not writes:
+        _ok("Nothing to change – this instance already matches the bundle.")
+    elif not yes and not typer.confirm("Apply these changes?"):
+        raise typer.Exit(1)
+    else:
+        res = _run(s.migration.apply, bundle, variables, prune=prune, skip_settings=skip_settings,
+                   overwrite_data=overwrite_data)
+        _ok(f"Imported: {res.applied} change(s), {len(res.files_written)} file(s)"
+            + (f"; previous setup saved as {res.backup}" if res.backup else ""))
+    missing = [c for c in plan.credentials if c["status"] == "missing" and c.get("used", True)]
+    for c in missing:
+        if prompt_credentials and c["type"] in TYPES:
+            typer.echo(f"Credential '{c['name']}' ({c['type']}):")
+            fields = _collect_fields(c["type"], [f"{k}={v}" for k, v in c["fields"].items()], [])
+            _run(s.credentials.add, c["name"], c["type"], fields,
+                 secret_fields=(c.get("secret_fields") or None) if c["type"] == "generic" else None,
+                 description=c.get("description", ""))
+            _ok(f"credential '{c['name']}' stored")
+        else:
+            args = " ".join(f"-f {k}={v}" for k, v in c["fields"].items())
+            typer.secho(f"  add it:  pw cred add {c['name']} -t {c['type']} {args}".rstrip(), fg="yellow")
+    v = s.runtime.validate()
+    if v.ok:
+        _ok(f"{v.message}. Restart the Portwright service to load the new setup.")
+    else:
+        _warn([f"validation: {v.message} – fix it (or add the missing credentials) and run 'pw validate'"])
 
 
 if __name__ == "__main__":
