@@ -49,6 +49,7 @@ portwright/
     files.py         CSV / JSON / JSONL / XLSX, sandboxed to data_root
     rest.py          Upstream HTTP facade with SSRF protection
     callable.py      Allow-listed Python functions (sync or async)
+    folder.py        Folder of files (load-only): listing, patterns, allow-listed absolute/UNC paths
     ldap.py          Active Directory source (target of group loads; not an endpoint source)
   directory/
     base.py          Directory port: search, members, replace/add/remove; user lookup by mail/UPN
@@ -62,6 +63,7 @@ portwright/
     mapping.py       Row mapping: rename, transforms, typed casts, constants, auto-map
     writers.py       Insert / Replace / Upsert strategies (dialect-specific MERGE / ON CONFLICT)
     runner.py        LoadRunner: lock, read (all pages), validate vs table, rejects, one transaction, history
+    folder.py        Folder loads: file ledger (SQLite), plan, per-file transactions, archive/rejected
     groups.py        AD group loads: e-mail -> user matching, plan (add/remove/keep), safety, apply
   services/          Use cases shared by CLI and Studio (no printing, no prompts)
     activity.py      Setup activity log (config diff on every save, credential events, replay scripts)

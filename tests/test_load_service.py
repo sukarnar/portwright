@@ -89,7 +89,7 @@ def test_validate_preview_run_history_rejects(svc):
 
 
 def test_save_rules(svc):
-    with pytest.raises(ServiceError, match="not a file source"):
+    with pytest.raises(ServiceError, match="not a file or folder source"):
         svc.loads.build(_draft(**{"from": {"source": "hr"}}))
     svc.loads.save(_draft())
     with pytest.raises(ServiceError, match="already exists"):

@@ -34,7 +34,7 @@ def member_rows(members) -> list[dict[str, Any]]:
 
 # ======================================================================== sources
 class SourceService:
-    TYPES = ("sql", "file", "rest", "callable", "ldap")
+    TYPES = ("sql", "file", "rest", "callable", "ldap", "folder")
 
     def __init__(self, project: Project):
         self.p = project
@@ -50,6 +50,8 @@ class SourceService:
             if s.type == "ldap":
                 detail = (", ".join(s.servers) if s.servers else "PowerShell AD module") + f" · {s.base_dn}" \
                     + (f" · test group {s.test_group}" if s.test_group else "")
+            if s.type == "folder":
+                detail = f"{s.path} · {', '.join(s.include)}" + (" · with subfolders" if s.recursive else "")
             if s.type == "sql" and not detail:
                 detail = "database (login from credential)"
             out.append({"name": name, "type": s.type, "detail": detail, "credential": s.credential,
@@ -69,7 +71,9 @@ class SourceService:
             credential: str | None = None, allow_credentials: list[str] | None = None,
             description: str = "", replace: bool = False, servers: list[str] | None = None,
             base_dn: str | None = None, directory: str = "ldap", ca_file: str | None = None,
-            allow_plain_ldap: bool = False, test_group: str | None = None) -> list[str]:
+            allow_plain_ldap: bool = False, test_group: str | None = None,
+            include: list[str] | None = None, exclude: list[str] | None = None, recursive: bool = False,
+            max_file_mb: float = 100, allow_folder: bool = False) -> list[str]:
         """Add (or with replace=True, overwrite) a source. Returns warnings."""
         warnings = []
         if name in self.cfg.sources and not replace:
@@ -91,7 +95,10 @@ class SourceService:
                               servers=[x.strip() for x in (servers or []) if x and x.strip()],
                               base_dn=(base_dn or "").strip() or None, directory=directory or "ldap",
                               ca_file=ca_file or None, allow_plain_ldap=allow_plain_ldap,
-                              test_group=(test_group or "").strip() or None)
+                              test_group=(test_group or "").strip() or None,
+                              include=[x.strip() for x in (include or ["*"]) if x and x.strip()] or ["*"],
+                              exclude=[x.strip() for x in (exclude or []) if x and x.strip()],
+                              recursive=recursive, max_file_mb=max_file_mb)
         except Exception as exc:
             raise ServiceError(_clean(exc)) from None
         if credential:
@@ -107,6 +114,16 @@ class SourceService:
             root_mod = module.split(".")[0]
             if root_mod not in sec.allowed_callable_modules:
                 sec.allowed_callable_modules.append(root_mod)
+        if type == "folder" and path:
+            from ..sources.folder import _is_absolute, _norm
+            if _is_absolute(path):
+                known = [_norm(a) for a in sec.allowed_folders]
+                if _norm(path) not in known and not any(_norm(path).startswith(a + "/") for a in known):
+                    if allow_folder:
+                        sec.allowed_folders.append(path.rstrip("\\/"))
+                    else:
+                        warnings.append(f"{path} is not in security.allowed_folders yet – add it with "
+                                        f"--allow-folder (Studio: 'Allow Portwright to read this folder')")
         if type == "rest" and allow_host and base_url:
             host = urlsplit(base_url).hostname
             if host and host not in sec.allowed_upstream_hosts:
@@ -155,6 +172,15 @@ class SourceService:
         except Exception as exc:
             return TestResult(False, _clean(exc))
         try:
+            if spec.type == "folder":
+                files = await anyio.to_thread.run_sync(src.list_files)
+                rows = [{"file": f.rel, "size_kb": round(f.size / 1024, 1),
+                         "modified": f.meta()["modified"].isoformat(sep=" "),
+                         "status": "too big" if f.size > spec.max_file_mb * 1048576 else ""} for f in files]
+                total = sum(f.size for f in files)
+                return TestResult(True, f"{len(files)} matching file(s), {total / 1048576:.1f} MB in "
+                                        f"{src.root()}", ["file", "size_kb", "modified", "status"],
+                                  rows[:max(preview_rows, 100)])
             if spec.type == "file":
                 rows = await anyio.to_thread.run_sync(src._load)
                 cols = list(rows[0].keys()) if rows else []
@@ -220,6 +246,22 @@ class SourceService:
             raise ServiceError(str(exc)) from None
         finally:
             d.close()
+
+    def allow_folder(self, path: str, remove: bool = False) -> list[str]:
+        """Add (or remove) an absolute / UNC folder that folder sources may read."""
+        from ..sources.folder import _is_absolute, _norm
+        path = (path or "").strip().rstrip("\\/")
+        if not _is_absolute(path):
+            raise ServiceError("give an absolute folder, e.g. D:\\inbound or \\\\server\\share\\hr "
+                               "(folders inside the data folder need no permission)")
+        sec = self.cfg.security
+        known = [a for a in sec.allowed_folders if _norm(a) == _norm(path)]
+        if remove:
+            sec.allowed_folders = [a for a in sec.allowed_folders if _norm(a) != _norm(path)]
+        elif not known:
+            sec.allowed_folders.append(path)
+        self.p.save()
+        return list(sec.allowed_folders)
 
     def set_test_group(self, name: str, group: str | None) -> None:
         """The AD group whose members 'source test' lists (None to unset)."""
@@ -312,6 +354,9 @@ class SourceService:
 # ====================================================================== endpoints
 def _no_ldap(cfg, source: str) -> None:
     spec = cfg.sources.get(source)
+    if spec is not None and spec.type == "folder":
+        raise ServiceError(f"'{source}' is a folder source: it is read by loads (Loads > New load), not by "
+                           f"endpoints. For one CSV/Excel file behind an endpoint use a file source")
     if spec is not None and spec.type == "ldap":
         raise ServiceError(f"'{source}' is an Active Directory source. It is the target of AD group loads "
                            f"(Loads > New load > Write to: AD group), not a source for endpoints; endpoints "

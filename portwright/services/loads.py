@@ -97,7 +97,8 @@ class LoadService:
         """Choices for the editor: what a load can read from and write to."""
         return {
             "endpoints": [e.name for e in self.cfg.endpoints if e.method == "GET"],
-            "file_sources": [n for n, s in self.cfg.sources.items() if s.type == "file"],
+            "file_sources": [n for n, s in self.cfg.sources.items() if s.type in ("file", "folder")],
+            "folder_sources": [n for n, s in self.cfg.sources.items() if s.type == "folder"],
             "targets": [n for n, s in self.cfg.sources.items() if s.type == "sql"],
             "read_only_targets": [n for n, s in self.cfg.sources.items() if s.type == "sql" and s.read_only],
             "directories": [n for n, s in self.cfg.sources.items() if s.type == "ldap"],
@@ -122,8 +123,8 @@ class LoadService:
                 raise ServiceError(f"endpoint '{ep.name}' is {ep.method}; loads read GET endpoints only")
         else:
             src = self.cfg.sources.get(spec.from_.source)
-            if src is None or src.type != "file":
-                raise ServiceError(f"'{spec.from_.source}' is not a file source")
+            if src is None or src.type not in ("file", "folder"):
+                raise ServiceError(f"'{spec.from_.source}' is not a file or folder source")
         tgt = self.cfg.sources.get(spec.to.source)
         if spec.to.group:
             if tgt is None or tgt.type != "ldap":
@@ -324,9 +325,54 @@ class LoadService:
             out.append(d)
         return out
 
+    def is_folder(self, spec: LoadSpec) -> bool:
+        s = self.cfg.sources.get(spec.from_.source) if spec.from_.source else None
+        return s is not None and s.type == "folder"
+
+    def folder_files(self, data: dict | LoadSpec | str) -> dict:
+        """Every matching file of a folder load with what a run would do with it (writes nothing)."""
+        spec = self.get(data) if isinstance(data, str) else self.build(data)
+        if not self.is_folder(spec):
+            raise ServiceError(f"load '{spec.name}' does not read a folder source")
+
+        async def _fn(runner):
+            ledger, plan = await anyio.to_thread.run_sync(runner.folder_plan, spec)
+            items = [i.to_dict() for i in plan.items]
+            counts: dict[str, int] = {}
+            for i in items:
+                counts[i["status"]] = counts.get(i["status"], 0) + 1
+            return {"files": items, "counts": counts, "ledger": ledger.counts(),
+                    "root": str(runner._folder_of(spec).root())}
+        return self._runtime(spec, _fn)
+
+    def ledger(self, name: str, last: int = 200, text: str | None = None) -> list[dict]:
+        from ..loads.folder import Ledger
+        spec = self.get(name)
+        if not self.is_folder(spec):
+            raise ServiceError(f"load '{name}' does not read a folder source")
+        return Ledger(self.dir, name).list(last, text)
+
+    def forget(self, name: str, ref: str | None) -> int:
+        """Let a file (path, name or sha256 prefix) – or all with ref None – be loaded again."""
+        from ..loads.folder import Ledger
+        spec = self.get(name)
+        if not self.is_folder(spec):
+            raise ServiceError(f"load '{name}' does not read a folder source")
+        n = Ledger(self.dir, name).forget(ref)
+        self.p.audit("load_files_forgotten", load=name, ref=ref or "*", entries=n)
+        return n
+
     def source_status(self, data: dict | LoadSpec | str) -> dict:
         """Read the source now and say whether it changed since the last successful load (writes nothing)."""
         spec = self.get(data) if isinstance(data, str) else self.build(data)
+        if self.is_folder(spec):
+            st = self.folder_files(spec)
+            c = st["counts"]
+            todo = c.get("new", 0) + c.get("changed", 0)
+            return {"hash": f"{todo} file(s) to load", "rows": len(st["files"]), "file": st["root"],
+                    "modified": "", "size": None, "version": None, "changed": todo > 0 if st["files"] else None,
+                    "last_loaded_version": None, "last_loaded_run": None, "last_loaded_at": None,
+                    "header_change": {}, "files": st["files"], "counts": c}
 
         async def _fn(runner):
             rows = await runner.read_rows(spec)

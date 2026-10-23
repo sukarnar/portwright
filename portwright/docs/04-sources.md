@@ -10,6 +10,7 @@ A source is where data comes from. Endpoints and loads refer to sources by name.
 | `file` | CSV, JSON, JSON Lines, Excel in the project's `data` folder | always read-only; re-read automatically when the file changes |
 | `rest` | an upstream HTTP API | the host must be allow-listed; credentials are added by Portwright, callers' keys are never forwarded |
 | `callable` | functions in a Python module in `handlers\` | only functions you name are callable |
+| `folder` | the files in a directory (data folder, or an allowed absolute / UNC path) | read by loads: each file to a BLOB/CLOB row, or each CSV/Excel file's rows – see *Folders of files* |
 | `ldap` | Active Directory (users and groups) | the **target** of AD group loads; LDAPS with a service account, or the PowerShell AD module |
 
 <!-- studio -->

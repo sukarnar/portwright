@@ -22,6 +22,44 @@ _SUPPORTED = {".csv", ".json", ".jsonl", ".xlsx", ".xlsm"}
 _MAX_FILE_BYTES = 200 * 1024 * 1024
 
 
+def decode_text(data: bytes, encoding: str = "auto") -> str:
+    """Bytes -> text: a BOM wins, then UTF-8, then Windows-1252 (encoding='auto'), or the given codec."""
+    if encoding and encoding != "auto":
+        return data.decode(encoding)
+    for bom, codec in ((b"\xef\xbb\xbf", "utf-8-sig"), (b"\xff\xfe", "utf-16"), (b"\xfe\xff", "utf-16")):
+        if data.startswith(bom):
+            return data.decode(codec)
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("cp1252", errors="replace")
+
+
+def parse_file(path: Path, sheet: str | None = None, encoding: str = "auto") -> list[dict[str, Any]]:
+    """Rows of a CSV, JSON (array or {items: [...]}), JSON Lines or Excel file."""
+    suffix = path.suffix.lower()
+    if suffix not in _SUPPORTED:
+        raise SourceError(f"cannot read rows from a '{suffix}' file (CSV, JSON, JSONL or Excel only)", 500)
+    if suffix in (".xlsx", ".xlsm"):
+        from openpyxl import load_workbook
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            ws = wb[sheet] if sheet else wb.active
+            it = ws.iter_rows(values_only=True)
+            header = [str(h) if h is not None else f"col_{i}" for i, h in enumerate(next(it, []))]
+            return [dict(zip(header, r)) for r in it if any(v is not None for v in r)]
+        finally:
+            wb.close()
+    text = decode_text(path.read_bytes(), encoding)
+    if suffix == ".csv":
+        import io
+        return list(csv.DictReader(io.StringIO(text, newline="")))
+    if suffix == ".jsonl":
+        return [json.loads(line) for line in text.splitlines() if line.strip()]
+    data = json.loads(text)
+    return data if isinstance(data, list) else data.get("items", [])
+
+
 @register("file")
 class FileSource(DataSource):
     def __init__(self, *a, **kw):
@@ -72,24 +110,7 @@ class FileSource(DataSource):
         if self._cache and self._cache[0] == stat.st_mtime:
             return self._cache[1]
 
-        suffix = path.suffix.lower()
-        if suffix == ".csv":
-            with path.open(newline="", encoding="utf-8-sig") as fh:
-                rows = list(csv.DictReader(fh))
-        elif suffix == ".jsonl":
-            with path.open(encoding="utf-8") as fh:
-                rows = [json.loads(line) for line in fh if line.strip()]
-        elif suffix == ".json":
-            data = json.loads(path.read_text(encoding="utf-8"))
-            rows = data if isinstance(data, list) else data.get("items", [])
-        else:
-            from openpyxl import load_workbook
-            wb = load_workbook(path, read_only=True, data_only=True)
-            ws = wb[self.spec.sheet] if self.spec.sheet else wb.active
-            it = ws.iter_rows(values_only=True)
-            header = [str(h) if h is not None else f"col_{i}" for i, h in enumerate(next(it, []))]
-            rows = [dict(zip(header, r)) for r in it if any(v is not None for v in r)]
-            wb.close()
+        rows = parse_file(path, self.spec.sheet)
         self._cache = (stat.st_mtime, rows)
         return rows
 

@@ -109,7 +109,7 @@ class ParamSpec(BaseModel):
 # Sources
 # --------------------------------------------------------------------------- #
 class SourceSpec(BaseModel):
-    type: Literal["sql", "file", "rest", "callable", "ldap"]
+    type: Literal["sql", "file", "rest", "callable", "ldap", "folder"]
     description: str = ""
     # managed credential used to connect/authenticate (see `portwright cred`)
     credential: str | None = None
@@ -119,9 +119,14 @@ class SourceSpec(BaseModel):
     url: str | None = None
     read_only: bool = True
     pool_size: int = 5
-    # file
+    # file (and folder: the folder – a name inside the data folder, or an allowed absolute / UNC path)
     path: str | None = None
     sheet: str | None = None
+    # folder – every matching file is a source row (document) or a set of rows (records)
+    include: list[str] = Field(default_factory=lambda: ["*"])      # glob patterns, e.g. *.pdf
+    exclude: list[str] = Field(default_factory=list)               # e.g. ~*, *.tmp
+    recursive: bool = False
+    max_file_mb: float = Field(100, gt=0, le=2048)                 # bigger files are rejected
     # rest
     base_url: str | None = None
     headers: dict[str, str] = Field(default_factory=dict)
@@ -151,7 +156,7 @@ class SourceSpec(BaseModel):
                 plain = [s for s in self.servers if s.lower().startswith("ldap://")]
                 if plain and not self.allow_plain_ldap:
                     raise ValueError(f"{plain[0]} is not encrypted; use ldaps:// (or set allow_plain_ldap: true)")
-        required = {"file": "path", "rest": "base_url"}
+        required = {"file": "path", "rest": "base_url", "folder": "path"}
         field = required.get(self.type)
         if field and not getattr(self, field):
             raise ValueError(f"source type '{self.type}' requires '{field}'")
@@ -290,6 +295,7 @@ class SecuritySettings(BaseModel):
     allowed_callable_modules: list[str] = Field(default_factory=list)
     allowed_upstream_hosts: list[str] = Field(default_factory=list)
     data_root: str = "data"               # file sources are sandboxed here
+    allowed_folders: list[str] = Field(default_factory=list)   # absolute / UNC folders a folder source may use
     cors_origins: list[str] = Field(default_factory=list)
     max_body_bytes: int = 1_048_576
     expose_docs: bool = True
@@ -300,7 +306,8 @@ class SecuritySettings(BaseModel):
 # --------------------------------------------------------------------------- #
 # Load jobs (CSV/endpoint -> mapped -> database table)
 # --------------------------------------------------------------------------- #
-ColumnType = Literal["string", "integer", "number", "boolean", "date", "timestamp"]
+ColumnType = Literal["string", "integer", "number", "boolean", "date", "timestamp", "binary", "text"]
+# binary: BLOB / VARBINARY(MAX) / BYTEA / LONGBLOB · text: CLOB / NVARCHAR(MAX) / TEXT / LONGTEXT
 
 
 class ColumnMap(BaseModel):
@@ -366,6 +373,23 @@ class GroupLoad(BaseModel):
     reject_disabled: bool = True                        # disabled accounts are rejected, not added
 
 
+class FolderLoad(BaseModel):
+    """Settings for loads that read a folder source."""
+    read: Literal["document", "records"] = "document"   # one row per file, or parse each CSV/Excel/JSON file
+    on_changed: Literal["version", "replace"] = "version"   # same file name, new content: another row, or
+                                                            # replace the rows loaded from that file
+    file_key: str | None = None            # target column identifying the file (mapped from file_path or
+                                           # file_name) – required for on_changed: replace
+    check_target: bool = True              # skip a file whose sha256 is already in the target table
+                                           # (when a column is mapped from sha256)
+    after_load: Literal["move", "leave", "delete"] = "move"
+    archive_folder: str = "processed"      # inside the source folder, or an absolute path
+    dated_folders: bool = True             # processed\2026-10-23\file.pdf
+    rejected_folder: str | None = "rejected"   # failed files go here with a .reason.txt (None = leave them)
+    encoding: str = "auto"                 # content_text / CSV: auto (BOM, UTF-8, then Windows-1252) or a codec
+    max_files: int = Field(0, ge=0)        # per run, oldest first (0 = all)
+
+
 class SourceTracking(BaseModel):
     """Source versioning and change detection for a load."""
     on_unchanged: Literal["skip", "load", "fail"] = "skip"     # same data as the last successful load
@@ -393,6 +417,7 @@ class LoadSpec(BaseModel):
     tracking: SourceTracking = Field(default_factory=SourceTracking)
     safety: LoadSafety = Field(default_factory=LoadSafety)
     ad: GroupLoad = Field(default_factory=GroupLoad)
+    files: FolderLoad = Field(default_factory=FolderLoad)
     batch_size: int = Field(1000, ge=1, le=50000)
     max_rejects: int = Field(0, ge=0)
     unmapped_source_columns: Literal["ignore", "error"] = "ignore"
@@ -413,6 +438,9 @@ class LoadSpec(BaseModel):
             return self
         if self.mode == "sync":
             raise ValueError(f"load '{self.name}': mode 'sync' is for AD group loads; use upsert for tables")
+        if self.files.on_changed == "replace" and self.files.file_key and self.columns and \
+                self.files.file_key.lower() not in targets:
+            raise ValueError(f"load '{self.name}': files.file_key '{self.files.file_key}' is not a mapped column")
         if self.mode == "upsert" and not self.keys:
             raise ValueError(f"load '{self.name}': mode 'upsert' needs 'keys'")
         missing = {k.lower() for k in self.keys} - set(targets)
@@ -451,6 +479,16 @@ class ProjectConfig(BaseModel):
                 raise ValueError(f"load '{ld.name}' reads unknown endpoint '{ld.from_.endpoint}'")
             if ld.from_.source and ld.from_.source not in self.sources:
                 raise ValueError(f"load '{ld.name}' reads unknown source '{ld.from_.source}'")
+            src = self.sources.get(ld.from_.source) if ld.from_.source else None
+            if src is not None and src.type == "folder":
+                if ld.to.group:
+                    raise ValueError(f"load '{ld.name}': a folder source loads into a table, not an AD group")
+                if ld.mode != "insert":
+                    raise ValueError(f"load '{ld.name}': folder loads add files (mode insert); use "
+                                     f"files.on_changed: version or replace for changed files")
+                if ld.files.on_changed == "replace" and not ld.files.file_key:
+                    raise ValueError(f"load '{ld.name}': files.on_changed: replace needs files.file_key (the "
+                                     f"target column mapped from file_path or file_name)")
             tgt = self.sources.get(ld.to.source)
             if ld.to.group:
                 if tgt is None or tgt.type != "ldap":

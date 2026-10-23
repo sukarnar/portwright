@@ -124,9 +124,10 @@ def init(name: str = typer.Option("portwright-project", help="Project name."),
 @source_app.command("add")
 def source_add(
     name: str,
-    type: str = typer.Option(..., "--type", "-t", help="sql | file | rest | callable | ldap"),
+    type: str = typer.Option(..., "--type", "-t", help="sql | file | folder | rest | callable | ldap"),
     url: Optional[str] = typer.Option(None, help="SQLAlchemy URL – use ${ENV:VAR} for credentials."),
-    path: Optional[str] = typer.Option(None, help="File name inside the data folder."),
+    path: Optional[str] = typer.Option(None, help="File name inside the data folder (folder sources: a folder "
+                                                  "there, or an allowed absolute / UNC path)."),
     sheet: Optional[str] = typer.Option(None, help="Excel sheet name."),
     base_url: Optional[str] = typer.Option(None, help="Upstream REST base URL."),
     header: list[str] = typer.Option([], help="Upstream header KEY=VALUE (repeatable)."),
@@ -146,6 +147,13 @@ def source_add(
     allow_plain_ldap: bool = typer.Option(False, "--allow-plain-ldap", help="ldap: allow unencrypted ldap://."),
     test_group: Optional[str] = typer.Option(None, "--test-group", help="ldap: group whose members "
                                                                         "'source test' lists."),
+    include: list[str] = typer.Option([], "--include", help="folder: file pattern, e.g. *.pdf (repeatable; "
+                                                            "default all files)."),
+    exclude: list[str] = typer.Option([], "--exclude", help="folder: pattern to skip, e.g. ~* (repeatable)."),
+    recursive: bool = typer.Option(False, "--recursive", help="folder: include sub-folders."),
+    max_file_mb: float = typer.Option(100, "--max-file-mb", help="folder: bigger files are rejected."),
+    allow_folder: bool = typer.Option(False, "--allow-folder", help="folder: add an absolute / UNC path to "
+                                                                    "security.allowed_folders."),
     description: str = "",
     config: str = CONFIG_OPT,
 ):
@@ -155,7 +163,8 @@ def source_add(
                     headers=_kv(header), module=module, read_write=read_write, allow_host=allow_host,
                     credential=credential, allow_credentials=allow_credential, description=description,
                     servers=server, base_dn=base_dn, directory=directory, ca_file=ca_file,
-                    allow_plain_ldap=allow_plain_ldap, test_group=test_group)
+                    allow_plain_ldap=allow_plain_ldap, test_group=test_group, include=include or None,
+                    exclude=exclude, recursive=recursive, max_file_mb=max_file_mb, allow_folder=allow_folder)
     _warn(warnings)
     _ok(f"Source '{name}' ({type}) added")
 
@@ -190,6 +199,15 @@ def _member_table(rows: list[dict]) -> None:
     for r in rows:
         typer.echo(f"  {r['name']:<{w}}  {r['account']:<{a}}  {r['mail']:<36} {r['kind']}"
                    + (f"  {r['status']}" if r["status"] else ""))
+
+
+@source_app.command("allow-folder")
+def source_allow_folder(path: str = typer.Argument(..., help=r"e.g. D:\inbound or \\server\share\hr"),
+                        remove: bool = typer.Option(False, "--remove", help="Take it off the list."),
+                        config: str = CONFIG_OPT):
+    """Let folder sources read an absolute / UNC folder (security.allowed_folders)."""
+    folders = _run(_svc(config).sources.allow_folder, path, remove)
+    _ok("Allowed folders: " + (", ".join(folders) or "(none – only folders inside the data folder)"))
 
 
 @source_app.command("set-test-group")
@@ -237,6 +255,10 @@ def source_test(name: str, config: str = CONFIG_OPT):
     _ok(r.message)
     if r.columns == ["name", "account", "mail", "kind", "status"]:
         _member_table(r.rows)
+        return
+    if r.columns == ["file", "size_kb", "modified", "status"]:
+        for row in r.rows:
+            typer.echo(f"  {row['file']:<50} {row['size_kb']:>10} KB  {row['modified']}  {row['status']}")
         return
     for row in r.rows:
         typer.echo(f"  {row}")
@@ -592,6 +614,19 @@ def _print_report(rep, as_json: bool) -> None:
                         fg="green" if c["action"] == "add" else "red")
         if len(rep.changes) > 20:
             typer.echo(f"    ... {len(rep.changes) - 20} more (use --json for all)")
+    elif rep.files or rep.files_skipped or rep.files_waiting:
+        loaded = "would load" if rep.status == "dry_run" else "loaded"
+        typer.echo(f"  files: {loaded}={rep.files_loaded} skipped={rep.files_skipped} failed={rep.files_failed}"
+                   f" waiting={rep.files_waiting}   rows: read={rep.read} inserted={rep.inserted}"
+                   f" replaced={rep.deleted} rejected={rep.rejected}")
+        marks = {"loaded": ("+", "green"), "would_load": ("+", "cyan"), "skipped": ("=", None),
+                 "failed": ("✗", "red"), "too_big": ("✗", "red"), "waiting": ("…", "yellow")}
+        for f in rep.files[:40]:
+            mark, col = marks.get(f["status"], ("·", None))
+            typer.secho(f"    {mark} {f['file']:<44} {f['status']:<10} {f['reason']}"
+                        + (f"  -> {f['moved_to']}" if f.get("moved_to") else ""), fg=col)
+        if len(rep.files) > 40:
+            typer.echo(f"    ... {len(rep.files) - 40} more (use --json, or pw load files {rep.load})")
     else:
         typer.echo(f"  read={rep.read} mapped={rep.mapped} rejected={rep.rejected} "
                    f"inserted={rep.inserted} updated={rep.updated} upserted={rep.upserted} deleted={rep.deleted}"
@@ -630,7 +665,7 @@ def load_create(
     ad_group: Optional[str] = typer.Option(None, "--ad-group", help="Target AD group (DN or name) instead of a table."),
     email_column: str = typer.Option("email", "--email-column", help="AD group loads: source column with the e-mail."),
     from_endpoint: Optional[str] = typer.Option(None, "--from-endpoint", help="Read rows from this GET endpoint."),
-    from_source: Optional[str] = typer.Option(None, "--from-source", help="Read rows directly from this file source."),
+    from_source: Optional[str] = typer.Option(None, "--from-source", help="Read rows directly from this file or folder source."),
     mode: str = typer.Option("insert", help="tables: insert | replace | upsert;  AD groups: replace (kill & fill) | "
                                             "sync | insert (add only)"),
     key: list[str] = typer.Option([], "--key", help="Upsert key target column (repeatable)."),
@@ -718,6 +753,21 @@ def load_map(
                                                               "e.g. mail,userPrincipalName,proxyAddresses"),
     include_disabled: Optional[bool] = typer.Option(None, "--include-disabled/--reject-disabled",
                                                     help="AD group loads: add disabled accounts too."),
+    read: Optional[str] = typer.Option(None, "--read", help="Folder loads: document (one row per file) | "
+                                                            "records (parse each CSV/Excel/JSON file)."),
+    on_changed: Optional[str] = typer.Option(None, "--on-changed", help="Folder loads, same file name with new "
+                                                                        "content: version | replace."),
+    file_key: Optional[str] = typer.Option(None, "--file-key", help="Folder loads: target column that "
+                                                                    "identifies the file (for replace)."),
+    after_load: Optional[str] = typer.Option(None, "--after-load", help="Folder loads: move | leave | delete."),
+    archive_folder: Optional[str] = typer.Option(None, "--archive-folder", help="Folder loads: where loaded "
+                                                                                "files go (default processed)."),
+    rejected_folder: Optional[str] = typer.Option(None, "--rejected-folder", help="Folder loads: where failed "
+                                                                                  "files go ('' = leave them)."),
+    encoding: Optional[str] = typer.Option(None, "--encoding", help="Folder loads: auto | utf-8 | cp1252 | ..."),
+    check_target: Optional[bool] = typer.Option(None, "--check-target/--no-check-target",
+                                                help="Folder loads: skip files whose sha256 is in the table."),
+    max_files: Optional[int] = typer.Option(None, "--max-files", help="Folder loads: files per run (0 = all)."),
     config: str = CONFIG_OPT,
 ):
     """Add or change column mappings and settings of a load job."""
@@ -797,6 +847,16 @@ def load_map(
     if protect or unprotect:
         cur = [p for p in adc.get("protected", []) if p.lower() not in {u.lower() for u in unprotect}]
         adc["protected"] = cur + [p for p in protect if p not in cur]
+    fl = data.setdefault("files", {})
+    for k, v in (("read", read), ("on_changed", on_changed), ("after_load", after_load),
+                 ("archive_folder", archive_folder), ("encoding", encoding), ("check_target", check_target),
+                 ("max_files", max_files)):
+        if v is not None:
+            fl[k] = v
+    if file_key is not None:
+        fl["file_key"] = file_key or None
+    if rejected_folder is not None:
+        fl["rejected_folder"] = rejected_folder or None
     new = _run(svc.loads.save, data, original=name, force=True)
     _ok(f"Load '{name}' updated")
     if new.to.group:
@@ -839,10 +899,64 @@ def load_show(name: str, yaml_: bool = typer.Option(False, "--yaml", help="Print
     typer.echo(f"  duplicate_keys={spec.duplicate_keys} existing_keys={spec.existing_keys}"
                + (f" safety: min_rows={spec.safety.min_rows} min_percent={spec.safety.min_percent:g}"
                   if spec.mode == "replace" else ""))
+    fsrc = _svc(config).project.config.sources.get(spec.from_.source or "")
+    if fsrc is not None and fsrc.type == "folder":
+        f = spec.files
+        typer.echo(f"  files: read={f.read} on_changed={f.on_changed} file_key={f.file_key or '-'} "
+                   f"check_target={f.check_target} after_load={f.after_load} archive={f.archive_folder}"
+                   f"{' (dated)' if f.dated_folders else ''} rejected={f.rejected_folder or '-'} "
+                   f"encoding={f.encoding} max_files={f.max_files or 'all'}")
     t = spec.tracking
     typer.echo(f"  tracking: on_unchanged={t.on_unchanged} on_header_change={t.on_header_change} "
                f"stable_seconds={t.stable_seconds} max_age_hours={t.max_age_hours or '-'} archive_keep={t.archive_keep}")
     _print_mapping(spec)
+
+
+@load_app.command("files")
+def load_files(name: str,
+               ledger: bool = typer.Option(False, "--ledger", help="Files already loaded (the ledger) instead "
+                                                                   "of the folder now."),
+               search: Optional[str] = typer.Option(None, "--search", "-s", help="Ledger: part of a path or a "
+                                                                                 "sha256 prefix."),
+               last: int = typer.Option(100, "--last", "-n"), as_json: bool = typer.Option(False, "--json"),
+               config: str = CONFIG_OPT):
+    """Folder loads: what a run would do with each file now – or, with --ledger, what was loaded."""
+    s = _svc(config)
+    if ledger:
+        rows = _run(s.loads.ledger, name, last, search)
+        if as_json:
+            typer.echo(json.dumps(rows, indent=2, default=str))
+            return
+        if not rows:
+            typer.echo("Nothing loaded yet.")
+        for r in rows:
+            typer.echo(f"{r['at'][:16].replace('T', ' ')}  {r['status']:<9} {r['path']:<44} {r['sha256'][:12]}  "
+                       f"{r['rows'] or 0:>5} row(s)  run {r['run_id'] or '-'}"
+                       + (f"  {r['action']}" if r.get("action") else "")
+                       + (f"  -> {r['moved_to']}" if r.get("moved_to") else "")
+                       + (f"  ({r['reason']})" if r.get("reason") else ""))
+        return
+    st = _run(s.loads.folder_files, name)
+    if as_json:
+        typer.echo(json.dumps(st, indent=2, default=str))
+        return
+    typer.echo(f"Folder {st['root']}: " + ", ".join(f"{v} {k}" for k, v in sorted(st["counts"].items()))
+               if st["files"] else f"Folder {st['root']}: no matching files")
+    for f in st["files"][:last]:
+        typer.echo(f"  {f['status']:<8} {f['file']:<48} {f['size'] / 1024:>9.1f} KB  {f['reason']}")
+
+
+@load_app.command("forget")
+def load_forget(name: str, file: Optional[str] = typer.Argument(None, help="Path, file name or sha256 prefix."),
+                all_: bool = typer.Option(False, "--all", help="Forget every file (all can be loaded again)."),
+                config: str = CONFIG_OPT):
+    """Folder loads: let a file be loaded again (removes it from the ledger)."""
+    if not file and not all_:
+        _fail(Exception("give a file (path, name or sha256 prefix), or --all"))
+    if all_ and not typer.confirm(f"Forget every file of load '{name}'? They will all be loaded again."):
+        raise typer.Exit(1)
+    n = _run(_svc(config).loads.forget, name, None if all_ else file)
+    _ok(f"{n} ledger entr{'y' if n == 1 else 'ies'} removed" + ("" if n else " – nothing matched"))
 
 
 @load_app.command("list")

@@ -7,7 +7,7 @@ from ..common import Ctx, dropdown, empty, header, icon_btn, table, tag, text_fi
 from ..viewmodels import HTTP_CRED_TYPES, SOURCE_TYPES, save_source, source_values
 
 TYPE_ICON = {"sql": ft.Icons.STORAGE, "file": ft.Icons.DESCRIPTION, "rest": ft.Icons.CLOUD, "callable": ft.Icons.CODE,
-             "ldap": ft.Icons.GROUPS}
+             "ldap": ft.Icons.GROUPS, "folder": ft.Icons.FOLDER_COPY}
 
 
 class SourcesView:
@@ -89,6 +89,23 @@ class SourcesView:
         f_allowc = text_field("Credentials the functions may read (comma separated)", v.get("allow_credentials", ""),
                               hint="available: " + (", ".join(all_creds) or "none"))
 
+        # folder
+        f_folder = text_field("Folder *", v.get("path", "") if v.get("type") == "folder" else "",
+                              hint=r"a folder in the data folder (e.g. inbound), or D:\inbound, \\server\share\hr",
+                              expand=True)
+        f_inc = text_field("Files to load (patterns, one per line)", v.get("include", "*"), multiline=True,
+                           min_lines=1, hint="e.g. *.pdf  *.xml  HR_*.csv")
+        f_exc = text_field("Skip (patterns, one per line)", v.get("exclude", ""), multiline=True, min_lines=1,
+                           hint="e.g. ~*  *.tmp")
+        f_rec = ft.Checkbox(label="Include sub-folders", value=bool(v.get("recursive")))
+        f_mb = text_field("Max file size (MB)", v.get("max_file_mb", "100"), width=180)
+        f_allow_dir = ft.Checkbox(label="Allow Portwright to read this folder (needed for a path outside the "
+                                        "data folder)", value=True)
+        folder_hint = ft.Text("Each file is a source row with file_name, file_path, size_bytes, modified, sha256, "
+                              "mime_type and the content (bytes for BLOB, text for CLOB). Loads keep a ledger so a "
+                              "file is never loaded twice, and move loaded files to an archive folder.", size=12,
+                              color=ft.Colors.ON_SURFACE_VARIANT)
+
         # ldap (Active Directory)
         basic_creds = [c["name"] for c in creds if c["type"] == "basic"]
         f_ldap_method = dropdown("Connect with", {"ldap": "LDAPS with a service account (ldap3)",
@@ -119,6 +136,9 @@ class SourcesView:
                               horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
             "rest": ft.Column([f_url, f_allow, f_http_cred, f_headers], spacing=10, horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
             "callable": ft.Column([f_module, f_allowc], spacing=10, horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
+            "folder": ft.Column([f_folder, ft.Row([f_inc, f_exc], vertical_alignment=ft.CrossAxisAlignment.START),
+                                 ft.Row([f_rec, f_mb]), f_allow_dir, folder_hint], spacing=10,
+                                horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
             "ldap": ft.Column([f_ldap_method, f_servers, f_base_dn, f_ldap_cred, f_test_group, f_ca, f_plain, ldap_hint], spacing=10,
                               horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
         }
@@ -156,6 +176,9 @@ class SourcesView:
             elif t == "rest":
                 values.update(base_url=f_url.value, allow_host=f_allow.value, headers=f_headers.value,
                               credential=None if f_http_cred.value == "(none)" else f_http_cred.value)
+            elif t == "folder":
+                values.update(path=f_folder.value, include=f_inc.value, exclude=f_exc.value, recursive=f_rec.value,
+                              max_file_mb=f_mb.value, allow_folder=f_allow_dir.value)
             elif t == "ldap":
                 values.update(directory=f_ldap_method.value, servers=f_servers.value, base_dn=f_base_dn.value,
                               credential=None if f_ldap_cred.value == "(none)" else f_ldap_cred.value,
@@ -198,6 +221,20 @@ class SourcesView:
         def test(_):
             self.ctx.close()
             self.test(name)
+        if stype == "folder":
+            def folder_load(_):
+                self.ctx.close()
+                self.ctx.go("loads")
+                view = self.ctx.view("loads")
+                if view is not None:
+                    view.open_editor(None, from_source=name)
+            self.ctx.dialog("Next steps", [ft.Text(
+                f"Source '{name}' is ready. Test it (lists the matching files), then create a load that puts each "
+                f"file – or each file's rows – into a table.")],
+                [ft.OutlinedButton("Test it", icon=ft.Icons.PLAY_ARROW, on_click=test),
+                 ft.FilledButton("Create load", icon=ft.Icons.MOVE_DOWN, on_click=folder_load),
+                 ft.TextButton("Done", on_click=lambda _: self.ctx.close())], width=560, scroll=False)
+            return
         if stype == "ldap":
             def group_load(_):
                 self.ctx.close()

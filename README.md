@@ -285,6 +285,27 @@ module as the Windows account the process runs as. The account needs **Write Mem
 Invalid, unknown, ambiguous or disabled addresses go to the rejects file; source versioning, exit codes and
 history work as for table loads. Full guide: `portwright docs ad-groups`.
 
+## Loading folders of files (BLOB / CLOB)
+
+A `folder` source makes every matching file a source row: `file_name`, `file_path`, `size_bytes`,
+`modified`, `sha256`, `mime_type`, and the content as bytes (`content` → **binary**: Oracle BLOB, SQL Server
+VARBINARY(MAX), PostgreSQL BYTEA, MySQL LONGBLOB) or text (`content_text` → **text**: CLOB / NVARCHAR(MAX) /
+TEXT / LONGTEXT). With `files.read: records`, each CSV/Excel/JSON file is parsed and its rows are loaded instead.
+
+```powershell
+pw source add hr_docs -t folder --path inbound --include "*.pdf" --recursive
+pw load create docs --from-source hr_docs --to hr_rw --table HR.EMP_DOCS --auto-map
+pw load map docs --set "content=DOC_BLOB:binary" --on-changed replace --file-key FILE_PATH
+pw load run docs --dry-run && pw load run docs
+pw load files docs --ledger
+```
+
+A ledger per load (path, size, time, SHA-256) means a file is never loaded twice, even if it is renamed or
+copied back. There is an optional check against a sha256 column in the target table. A changed file is
+loaded as a new version, or replaces its earlier rows (`on_changed`). Each file is committed on its own;
+failed files go to `rejected\` with a reason, and loaded files are moved to `processed\<date>\` (or left,
+or deleted). Exit codes: 0 ok, 2 some files failed, 1 nothing loaded, 3 nothing new. Guide: `pw docs folders`.
+
 ## Activity log and moving a setup to another instance
 
 Every setup change – from Studio, the CLI, a migration import, or a hand edit of `portwright.yaml` – is

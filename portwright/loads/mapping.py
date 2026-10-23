@@ -73,7 +73,19 @@ def cast(value: Any, col: ColumnMap) -> Any:
         return None
     t = col.type
     try:
+        if t == "binary":                      # BLOB / VARBINARY(MAX) / BYTEA
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                return bytes(value)
+            return str(value).encode("utf-8")
+        if t == "text":                        # CLOB / NVARCHAR(MAX) / TEXT – no length limit
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                from ..sources.files import decode_text
+                return decode_text(bytes(value))
+            return str(value)
         if t == "string":
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                raise RowError(f"{col.target}: binary content cannot go into a text column – map it with "
+                               f"type binary (BLOB) or use content_text")
             return str(value)
         if t == "integer":
             if isinstance(value, bool):

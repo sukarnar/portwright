@@ -263,10 +263,14 @@ class MigrationService:
                 add(f"server.{k}", getattr(cfg.server, k))
         if cfg.security.allowed_upstream_hosts:
             add("security.allowed_upstream_hosts", list(cfg.security.allowed_upstream_hosts))
+        if cfg.security.allowed_folders:
+            add("security.allowed_folders", list(cfg.security.allowed_folders))
         if cfg.security.cors_origins:
             add("security.cors_origins", list(cfg.security.cors_origins))
         for name, s in cfg.sources.items():
             lines.append(f"\n# source {name} ({s.type})")
+            if s.type == "folder":
+                add(f"sources.{name}.path", s.path)
             for k in _TEMPLATE_SOURCE_KEYS:
                 v = getattr(s, k, None)
                 if v not in (None, "", []):

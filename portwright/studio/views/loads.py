@@ -7,7 +7,7 @@ import flet as ft
 
 from ...services import ServiceError
 from ..common import Ctx, dropdown, empty, header, icon_btn, mono, table, tag, text_field, help_btn
-from ..viewmodels import (GROUP_MODES, MATCH_CHOICES, group_settings, CONSTANT, DATE_FORMATS, DUPLICATE_KEYS, EXISTING_KEYS, LOAD_MODES, MAP_TYPES,
+from ..viewmodels import (AFTER_LOAD, FOLDER_READ, ON_CHANGED, GROUP_MODES, MATCH_CHOICES, group_settings, CONSTANT, DATE_FORMATS, DUPLICATE_KEYS, EXISTING_KEYS, LOAD_MODES, MAP_TYPES,
                           NOT_MAPPED, ON_HEADER_CHANGE, ON_UNCHANGED, RUN_STATUS_KIND, SIMPLE_TRANSFORMS,
                           TS_FORMATS, MapRow, apply_suggestion, build_transforms, cell, load_draft,
                           mapping_rows, report_counts, source_state, split_transforms, transform_summary,
@@ -140,7 +140,8 @@ class LoadsView:
         return table(["Started (UTC)", "Load", "Status", "Read", "Written", "Rejected", "Source", "Time", ""], rows)
 
     # ----------------------------------------------------------- editor
-    def open_editor(self, name: str | None, from_endpoint: str | None = None, to_group: str | None = None) -> None:
+    def open_editor(self, name: str | None, from_endpoint: str | None = None, to_group: str | None = None,
+                    from_source: str | None = None) -> None:
         opts = self.ctx.svc.loads.options()
         if name is None and not opts["targets"] and not opts["directories"]:
             self.ctx.toast("Add a SQL or Active Directory source first (Sources screen) – loads write into a "
@@ -151,6 +152,12 @@ class LoadsView:
         except ServiceError as exc:
             self.ctx.fail(exc)
             return
+        if from_source:
+            ed = self.editor
+            ed.from_kind, ed.f_kind.selected = "source", ["source"]
+            ed._fill_from_options()
+            ed.f_from.value = from_source
+            ed.f_name.value = f"{from_source}-to-db"
         if to_group:
             ed = self.editor
             ed.target_kind, ed.f_tkind.selected, ed._group_to = "group", ["group"], to_group
@@ -173,6 +180,22 @@ class LoadsView:
     # ---------------------------------------------------------- actions
     def run(self, name: str, after=None, force: bool = False) -> None:
         spec = self.ctx.svc.loads.get(name)
+        src = self.ctx.svc.project.config.sources.get(spec.from_.source or "")
+        if src is not None and src.type == "folder":
+            f = spec.files
+            text = (f"Load the new and changed files of '{spec.from_.source}' ({src.path}) into "
+                    f"{spec.to.source}.{spec.to.table} – "
+                    + ("one row per file." if f.read == "document" else "the rows of each file.")
+                    + "\n\nEach file is committed on its own; files already loaded are skipped. Changed files are "
+                    + ("loaded as a new version." if f.on_changed == "version"
+                       else f"replacing the rows with the same {f.file_key}.")
+                    + {"move": f"\n\nLoaded files are moved to {f.archive_folder}.", "leave": "",
+                       "delete": "\n\nLoaded files are DELETED from the folder after the commit."}[f.after_load])
+            if force:
+                text += "\n\nRun anyway: files already loaded are loaded again."
+            self.ctx.confirm(f"Run load '{name}'?", text, lambda: self._run(name, after, force),
+                             danger=f.after_load == "delete", yes="Run anyway" if force else "Run load")
+            return
         if spec.to.group:
             ad = spec.ad
             text = (f"Update the members of AD group '{spec.to.group}' in {spec.to.source} "
@@ -243,6 +266,8 @@ class LoadsView:
             ver = f"v{rep.source_version}" if rep.source_version else "new data"
             body.append(ft.Row([_small("Source"), tag(ver, "info"), tag(text, kind),
                                 _small(f"hash {rep.source_hash[:12]}")], wrap=True, spacing=6))
+        if rep.files:
+            body += files_controls(rep.files)
         if rep.group:
             body.append(_small(f"group {rep.group} · members {rep.members_before}"
                                + (f" → {rep.members_after}" if rep.members_after is not None else "")))
@@ -388,6 +413,33 @@ class LoadsView:
 
 
 # ======================================================================= editor
+FILE_STATUS_KIND = {"new": "info", "changed": "warn", "loaded": "good", "would_load": "info", "skipped": "neutral",
+                    "waiting": "warn", "too_big": "bad", "failed": "bad"}
+
+
+def files_controls(files: list[dict], counts: dict | None = None, root: str | None = None,
+                   limit: int = 200) -> list[ft.Control]:
+    """A table of files with their status (check, preview and run report)."""
+    if not files:
+        return [_small(f"No matching files{' in ' + root if root else ''}.")]
+    if counts is None:
+        counts = {}
+        for f in files:
+            counts[f["status"]] = counts.get(f["status"], 0) + 1
+    head = ft.Row([_small(root or "Files:"), *[tag(f"{v} {k.replace('_', ' ')}", FILE_STATUS_KIND.get(k, "neutral"))
+                                               for k, v in sorted(counts.items())]], wrap=True, spacing=6)
+    rows = [[ft.Text(f["file"], size=13), tag(f["status"].replace("_", " "), FILE_STATUS_KIND.get(f["status"], "neutral")),
+             ft.Text(f"{f['size'] / 1024:,.1f} KB", size=12), ft.Text(str(f.get("rows") or ""), size=12),
+             ft.Text(f.get("reason") or "", size=12),
+             ft.Text(f.get("moved_to") or "", size=12)] for f in files[:limit]]
+    out: list[ft.Control] = [head, ft.Container(ft.Column([table(["File", "Status", "Size", "Rows", "Detail",
+                                                                  "Moved to"], rows)], scroll=ft.ScrollMode.AUTO),
+                                               height=min(360, 52 + 38 * len(rows)))]
+    if len(files) > limit:
+        out.append(_small(f"… and {len(files) - limit} more (CLI: pw load files <load>)"))
+    return out
+
+
 class LoadEditor:
     """Edit one load: settings, the mapping grid, checks, preview, save and run."""
 
@@ -411,6 +463,7 @@ class LoadEditor:
                         to=spec.to.source, table=spec.to.table or "", group=spec.to.group or "", mode=spec.mode, batch=str(spec.batch_size),
                         max_rejects=str(spec.max_rejects), unmapped=spec.unmapped_source_columns)
             st = spec.model_dump(include={"duplicate_keys", "existing_keys", "tracking", "safety"})
+            fl = spec.files.model_dump()
         else:
             self.from_kind = "source" if self.opts["file_sources"] else "endpoint"
             self.target_kind = "table" if self.opts["targets"] else "group"
@@ -423,10 +476,32 @@ class LoadEditor:
                         to=(writable or self.opts["targets"] or [None])[0] if self.target_kind == "table"
                         else (self.opts["directories"] or [None])[0],
                         table="", group="", mode="insert" if self.target_kind == "table" else "sync", batch="1000", max_rejects="0", unmapped="ignore")
-            from ...config import LoadSafety, SourceTracking
+            from ...config import FolderLoad, LoadSafety, SourceTracking
+            fl = FolderLoad().model_dump()
             st = {"duplicate_keys": "reject", "existing_keys": "reject",
                   "tracking": SourceTracking().model_dump(), "safety": LoadSafety().model_dump()}
         tr, sf = st["tracking"], st["safety"]
+        # folder loads
+        self.f_read = dropdown("Each file becomes", FOLDER_READ, fl["read"], width=420, on_select=self._read_changed)
+        self.f_onchg = dropdown("Same file name, new content", ON_CHANGED, fl["on_changed"], width=360,
+                                on_select=self._mode_changed)
+        self.f_filekey = text_field("File key column (for replace)", fl.get("file_key") or "", width=260,
+                                    hint="target column mapped from file_path or file_name", on_change=self._dirty)
+        self.f_after = dropdown("After a file is loaded", AFTER_LOAD, fl["after_load"], width=300,
+                                on_select=self._mode_changed)
+        self.f_archive = text_field("Archive folder", fl["archive_folder"], width=240,
+                                    hint="inside the source folder, or an absolute path", on_change=self._dirty)
+        self.f_dated = ft.Checkbox(label="Dated sub-folders (processed\\2026-10-23)", value=fl["dated_folders"],
+                                   on_change=self._dirty)
+        self.f_rejdir = text_field("Folder for failed files", fl.get("rejected_folder") or "", width=240,
+                                   hint="empty = leave failed files in place", on_change=self._dirty)
+        self.f_enc = text_field("Text encoding", fl["encoding"], width=160, hint="auto, utf-8, cp1252 …",
+                                on_change=self._dirty)
+        self.f_chk = ft.Checkbox(label="Skip files whose sha256 is already in the table (column mapped from sha256)",
+                                 value=fl["check_target"], on_change=self._dirty)
+        self.f_maxf = text_field("Max files per run", str(fl["max_files"]), width=160, hint="0 = all",
+                                 on_change=self._dirty)
+        self.folder_line = ft.Column(spacing=8)
         self.inspection = None
         self.check = None
         self.dry = None
@@ -437,7 +512,7 @@ class LoadEditor:
         self.f_name = text_field("Load name *", vals["name"], hint="letters, digits, - and _", width=260)
         self.f_desc = text_field("Description", vals["description"], expand=True)
         self.f_kind = ft.SegmentedButton(
-            segments=[ft.Segment(value="source", label=ft.Text("File source"), icon=ft.Icon(ft.Icons.DESCRIPTION)),
+            segments=[ft.Segment(value="source", label=ft.Text("File or folder"), icon=ft.Icon(ft.Icons.DESCRIPTION)),
                       ft.Segment(value="endpoint", label=ft.Text("Endpoint"), icon=ft.Icon(ft.Icons.API))],
             selected=[self.from_kind], on_change=self._kind_changed)
         self.f_from = dropdown("Read from *", [], vals["from_name"], width=260, on_select=self._source_changed)
@@ -525,6 +600,23 @@ class LoadEditor:
                          "stable_seconds": self.f_stable.value, "max_age_hours": self.f_maxage.value,
                          "archive_keep": self.f_keep.value},
             "safety": {"min_rows": self.f_min_rows.value, "min_percent": self.f_min_pct.value}}
+        if self.is_folder:
+            try:
+                maxf = int(str(self.f_maxf.value or "0").strip() or 0)
+            except ValueError:
+                raise ServiceError("Max files per run must be a whole number") from None
+            settings = {"tracking": settings["tracking"]}
+            d = load_draft(self.f_name.value, self.f_desc.value, self.from_kind, self.f_from.value, self.f_to.value,
+                           self.f_table.value, "insert", self.rows, self.f_batch.value, self.f_rejects.value,
+                           self.f_unmapped.value, None, settings)
+            d["files"] = {"read": self.f_read.value, "on_changed": self.f_onchg.value,
+                          "file_key": (self.f_filekey.value or "").strip() or None,
+                          "check_target": bool(self.f_chk.value), "after_load": self.f_after.value,
+                          "archive_folder": (self.f_archive.value or "").strip() or "processed",
+                          "dated_folders": bool(self.f_dated.value),
+                          "rejected_folder": (self.f_rejdir.value or "").strip() or None,
+                          "encoding": (self.f_enc.value or "").strip() or "auto", "max_files": maxf}
+            return d
         if self.target_kind == "group":
             settings = {"tracking": settings["tracking"], "safety": settings["safety"]}
             d = load_draft(self.f_name.value, self.f_desc.value, self.from_kind, self.f_from.value, self.f_to.value,
@@ -549,9 +641,20 @@ class LoadEditor:
         self.ctx.page.update()
 
     # --------------------------------------------------------- handlers
+    @property
+    def is_folder(self) -> bool:
+        return self.from_kind == "source" and self.f_from.value in self.opts.get("folder_sources", [])
+
+    def _read_changed(self, _=None) -> None:
+        self.inspection = None
+        self.read_columns(quiet=True)
+        self.view.refresh()
+
     def _fill_from_options(self) -> None:
         names = self.opts["file_sources"] if self.from_kind == "source" else self.opts["endpoints"]
-        self.f_from.options = [ft.DropdownOption(key=n, text=n) for n in names]
+        folders = set(self.opts.get("folder_sources", []))
+        self.f_from.options = [ft.DropdownOption(key=n, text=f"{n}  (folder)" if n in folders else n)
+                               for n in names]
         if self.f_from.value not in names:
             self.f_from.value = names[0] if names else None
         self.f_from.helper_text = None if names else (
@@ -585,7 +688,11 @@ class LoadEditor:
 
     def _source_changed(self, _=None) -> None:
         self.params = {} if self.from_kind == "source" else self.params
+        was = getattr(self, "_was_folder", None)
+        self._was_folder = self.is_folder
         self.read_columns(quiet=True)
+        if was is not None and was != self.is_folder:
+            self.view.refresh()                 # a folder source shows the Files settings instead
 
     def _target_changed(self, _=None) -> None:
         self._table_changed()
@@ -623,8 +730,10 @@ class LoadEditor:
                       ", ".join(f"{k}={v}" for k, v in self.params.items()))] if self.params else []),
         ], [ft.FilledTonalButton("Read columns", icon=ft.Icons.SYNC, on_click=lambda _: self.read_columns())])
 
+        if self.is_folder:
+            how = self._files_card()
         mode = self.f_mode.value
-        how = _card("2 · How rows are written", [
+        how = how if self.is_folder else _card("2 · How rows are written", [
             ft.Row([self.f_mode, self.f_batch, self.f_rejects, self.f_unmapped], wrap=True, spacing=16,
                    vertical_alignment=ft.CrossAxisAlignment.START),
             _small({"insert": "Append adds the rows. With a load key, rows whose key is already in the table are "
@@ -645,7 +754,7 @@ class LoadEditor:
                       vertical_alignment=ft.CrossAxisAlignment.START)] if mode == "replace" else []),
         ])
 
-        versions = _card("5 · Source versions and change detection", [
+        versions = self._folder_status_card() if self.is_folder else _card("5 · Source versions and change detection", [
             _small("Every run fingerprints the source (row hash, size, modified time, columns) and keeps each "
                    "distinct content as a numbered version, so you can see whether the file changed before loading."),
             ft.Row([self.f_unch, self.f_hdr], wrap=True, spacing=16, vertical_alignment=ft.CrossAxisAlignment.START),
@@ -685,6 +794,71 @@ class LoadEditor:
         self.render_grid(update=False)
         self.dirty_tag.visible = self.is_dirty
         return ft.Column([top, self.busy, settings, how, mapping, checks, versions], spacing=16)
+
+    def _files_card(self) -> ft.Control:
+        read = self.f_read.value
+        return _card("2 · Files", [
+            ft.Row([self.f_read, self.f_rejects, self.f_batch], wrap=True, spacing=16,
+                   vertical_alignment=ft.CrossAxisAlignment.START),
+            _small({"document": "Map content (bytes) to a BLOB / VARBINARY(MAX) / BYTEA column with type binary, or "
+                                "content_text to a CLOB / NVARCHAR(MAX) / TEXT column with type text. Also available: "
+                                "file_name, file_path, folder, extension, size_bytes, modified, created, sha256, "
+                                "mime_type.",
+                    "records": "Every CSV / Excel / JSON file is read like a file source; each row also has the "
+                               "file_name, file_path, modified and sha256 columns – map one of them to record which "
+                               "file a row came from."}[read]),
+            ft.Text("Never the same file twice", weight=ft.FontWeight.W_600),
+            _small("Portwright keeps a ledger of every file loaded (path, size, time, SHA-256): a file with content "
+                   "that was already loaded is skipped, even renamed or copied back. Each file is committed on its "
+                   "own – a bad file goes to the failed-files folder and the others still load."),
+            ft.Row([self.f_onchg, self.f_filekey], wrap=True, spacing=16,
+                   vertical_alignment=ft.CrossAxisAlignment.START),
+            self.f_chk,
+            ft.Text("After loading", weight=ft.FontWeight.W_600),
+            ft.Row([self.f_after, *([self.f_archive, self.f_dated] if self.f_after.value == "move" else [])],
+                   wrap=True, spacing=16, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Row([self.f_rejdir, self.f_enc, self.f_maxf, self.f_stable], wrap=True, spacing=16,
+                   vertical_alignment=ft.CrossAxisAlignment.START),
+        ])
+
+    def _folder_status_card(self) -> ft.Control:
+        return _card("5 · Files in the folder", [
+            _small("What a run would do with each file now: new, changed, already loaded, waiting (still being "
+                   "copied or over max files) or too big. Nothing is written."),
+            self.folder_line,
+        ], [ft.OutlinedButton("Check folder now", icon=ft.Icons.FIND_REPLACE, on_click=self.check_source),
+            ft.OutlinedButton("Loaded files", icon=ft.Icons.HISTORY, on_click=self.show_ledger,
+                              tooltip="The ledger: every file this load has loaded")])
+
+    def show_ledger(self, _=None) -> None:
+        if not self.original:
+            self.ctx.toast("Save and run the load first – the ledger is per saved load.", error=True)
+            return
+        try:
+            rows = self.svc.ledger(self.original, 300)
+        except ServiceError as exc:
+            self.ctx.fail(exc)
+            return
+
+        def forget(path):
+            def go():
+                n = self.svc.forget(self.original, path)
+                self.ctx.toast(f"{path}: {n} ledger entr{'y' if n == 1 else 'ies'} removed – it will be loaded "
+                               f"again if it is in the folder")
+            self.ctx.confirm("Load this file again?", f"Remove {path} from the ledger? The next run loads it "
+                             f"again if it is still in the folder (or put back from the archive).", go,
+                             danger=False, yes="Forget it")
+        body = [_small(f"{len(rows)} most recent entries."),
+                ft.Row([table(["When", "File", "Status", "Rows", "Action", "Moved to", ""],
+                              [[ft.Text(r["at"][:16].replace("T", " ")), ft.Text(r["path"]),
+                                tag(r["status"], "good" if r["status"] == "loaded" else
+                                    "bad" if r["status"] == "failed" else "neutral"),
+                                ft.Text(str(r["rows"] or 0)), ft.Text(r.get("action") or r.get("reason") or ""),
+                                ft.Text(r.get("moved_to") or ""),
+                                ft.IconButton(ft.Icons.REPLAY, tooltip="Let it be loaded again",
+                                              on_click=lambda _, p=r["path"]: forget(p))] for r in rows])],
+                       scroll=ft.ScrollMode.AUTO)] if rows else [_small("No files loaded yet.")]
+        self.ctx.info(f"Files loaded by '{self.original}'", body, width=980)
 
     def _top(self) -> ft.Control:
         return ft.Row([
@@ -820,6 +994,9 @@ class LoadEditor:
 
         def done(st):
             self.view.status[d["name"]] = st
+            if "files" in st:
+                self.folder_line.controls = files_controls(st["files"], st.get("counts"), st.get("file"))
+                return
             kind, text = source_state(st)
             ver = f"v{st['version']}" if st["version"] else "new content (not loaded yet)"
             items: list[ft.Control] = [_small("Source now:"), tag(ver, "info"), tag(text, kind),
@@ -1173,6 +1350,8 @@ class LoadEditor:
             if rep.rejects_file:
                 extra.append(ft.OutlinedButton(f"View the {rep.rejected} rejected row(s)", icon=ft.Icons.RULE,
                                                on_click=lambda _: self.view.rejects(rep.run_id)))
+            if rep.files:
+                extra += files_controls(rep.files)
             if rep.group:
                 extra.append(_small(f"group {rep.group} · {rep.members_before} members now, "
                                     f"{rep.members_after if rep.members_after is not None else '?'} after"))
@@ -1193,7 +1372,11 @@ class LoadEditor:
                                                             *[ft.Text(cell(p["target"].get(c))) for c in tgt_cols]]
                                                            for p in rep.preview])], scroll=ft.ScrollMode.AUTO)]
             ok = None
-            if rep.status == "dry_run" and rep.group:
+            if rep.status == "dry_run" and rep.files:
+                ok = (f"Dry run OK – {rep.files_loaded} file(s) would be loaded ({rep.mapped} row(s))"
+                      + (f", {rep.files_skipped} already loaded" if rep.files_skipped else "")
+                      + (f", {rep.files_failed} would fail" if rep.files_failed else "") + ". Nothing was changed.")
+            elif rep.status == "dry_run" and rep.group:
                 ok = (f"Dry run OK – {rep.mapped} user(s) matched, would add {rep.added} and remove {rep.removed}"
                       + (f", {rep.rejected} row(s) rejected" if rep.rejected else "") + ". Nothing was changed.")
             elif rep.status == "dry_run":

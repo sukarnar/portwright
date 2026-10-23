@@ -14,8 +14,9 @@ from pathlib import Path
 from typing import Any
 
 import anyio
-from sqlalchemy import (Boolean, Date, DateTime, Float, Integer, Numeric, String, and_, func, or_, select,
-                        inspect as sa_inspect)
+from sqlalchemy import (Boolean, Date, DateTime, Float, Integer, Numeric, String, and_, delete, func,
+                        or_, select, inspect as sa_inspect)
+from sqlalchemy.types import _Binary
 from sqlalchemy.exc import SQLAlchemyError
 
 from ..config import ColumnMap, LoadSpec, ProjectConfig
@@ -70,6 +71,11 @@ class LoadReport:
     problems: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     preview: list[dict] = field(default_factory=list)
+    files: list[dict] = field(default_factory=list)          # folder loads: one entry per file
+    files_loaded: int = 0
+    files_skipped: int = 0                                   # already loaded / already in the table
+    files_failed: int = 0
+    files_waiting: int = 0                                   # still being copied, too many, ...
 
     @property
     def exit_code(self) -> int:
@@ -78,7 +84,7 @@ class LoadReport:
             return 1
         if self.status == "skipped":
             return 3
-        return 2 if self.rejected else 0
+        return 2 if (self.rejected or self.files_failed) else 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -87,6 +93,10 @@ class LoadReport:
 def column_type_name(col) -> str:
     """portwright mapping type that fits a reflected SQLAlchemy column."""
     t = col.type
+    if isinstance(t, _Binary):                    # BLOB, RAW, VARBINARY, BYTEA, LONGBLOB
+        return "binary"
+    if isinstance(t, String) and type(t).__name__.upper() in ("CLOB", "NCLOB", "NTEXT", "LONGTEXT", "MEDIUMTEXT"):
+        return "text"                             # large text; a plain TEXT column stays "string"
     if isinstance(t, Boolean):
         return "boolean"
     if isinstance(t, Integer):
@@ -111,8 +121,16 @@ class LoadRunner:
         self.dir = self.root / "logs" / "loads"
 
     # ---------------------------------------------------------------- extract
+    def _folder_of(self, spec: LoadSpec):
+        src = self.sources.get(spec.from_.source) if spec.from_.source else None
+        return src if src is not None and src.type_name == "folder" else None
+
     async def read_rows(self, spec: LoadSpec) -> list[dict[str, Any]]:
         f = spec.from_
+        folder = self._folder_of(spec)
+        if folder is not None:                 # header and a sample – contents are read when loading
+            from .folder import sample_rows
+            return await anyio.to_thread.run_sync(sample_rows, spec, folder, 20)
         if f.source:
             src = self.sources[f.source]
             if src.type_name != "file":
@@ -186,6 +204,11 @@ class LoadRunner:
             want = column_type_name(col)
             if cm.value is None and cm.type == "string" and want in ("integer", "number", "date", "timestamp"):
                 warnings.append(f"'{cm.target}' is {col.type} but mapped as string; set type: {want}")
+            if cm.value is None and want == "binary" and cm.type != "binary":
+                warnings.append(f"'{cm.target}' is {col.type}; map file contents to it with type binary")
+            if cm.type == "binary" and want not in ("binary",):
+                problems.append(f"'{cm.target}' is {col.type}, not a binary column (BLOB / VARBINARY / BYTEA); "
+                                f"use type text for a CLOB / text column")
             if cm.type == "number" and want == "integer":
                 warnings.append(f"'{cm.target}' is an integer column; decimals would be rejected by the DB")
             # length: enforce the column's limit so overflows become clean rejects
@@ -432,6 +455,9 @@ class LoadRunner:
         try:
             if not dry_run:
                 lock = self._lock(spec.name)
+            if self._folder_of(spec) is not None:   # a folder of files: per-file ledger, one commit per file
+                await self._run_folder(spec, report, dry_run, preview, force)
+                return report
             # 1. extract (a file must be complete and recent enough)
             await self._check_file(spec, report, wait=not dry_run)
             rows = await self.read_rows(spec)
@@ -565,6 +591,179 @@ class LoadRunner:
                 lock.unlink(missing_ok=True)
             if record:
                 self._record(report)
+
+    # ---------------------------------------------------------- folder loads
+    def folder_plan(self, spec: LoadSpec, force: bool = False):
+        from .folder import Ledger, plan_files
+        src = self._folder_of(spec)
+        ledger = Ledger(self.dir, spec.name)
+        in_target = None
+        hash_cols = [c.target for c in spec.columns if c.source == "sha256"]
+        if spec.files.check_target and hash_cols:
+            target = self._target(spec)
+            table = target._table(spec.to.table)
+            real = {c.name.lower(): c.name for c in table.columns}
+            col = real.get(hash_cols[0].lower())
+            if col:
+                def in_target(shas):
+                    return {v[0] for v in self._existing_keys(target, table, [col], [(x,) for x in shas])}
+        return ledger, plan_files(spec, src, ledger, force=force, in_target=in_target)
+
+    async def _run_folder(self, spec: LoadSpec, report: LoadReport, dry_run: bool, preview: int,
+                          force: bool) -> None:
+        from .folder import file_rows, move_file, safe_row
+        src = self._folder_of(spec)
+        root = await anyio.to_thread.run_sync(src.root)
+        ledger, plan = await anyio.to_thread.run_sync(self.folder_plan, spec, force)
+
+        def sync_counts():
+            report.files = [i.to_dict() for i in plan.items]
+            report.files_loaded = plan.count("loaded", "would_load")
+            report.files_skipped = plan.count("skipped")
+            report.files_failed = plan.count("failed", "too_big")
+            report.files_waiting = plan.count("waiting")
+        for i in plan.items:
+            if i.status == "waiting":
+                report.warnings.append(f"{i.info.rel}: {i.reason}")
+            elif i.status == "skipped" and not dry_run and spec.files.after_load != "leave":
+                try:                       # a copy of a file already loaded: tidy it away like a loaded one
+                    i.moved_to = await anyio.to_thread.run_sync(move_file, spec, root, i, "done")
+                except OSError as exc:
+                    report.warnings.append(f"{i.info.rel} (already loaded) could not be moved: {exc}")
+        todo = plan.to_load
+        if not todo:
+            sync_counts()
+            bad = [i for i in plan.items if i.status in ("too_big", "failed")]
+            for i in bad:
+                if not dry_run and i.status == "too_big":
+                    try:
+                        i.moved_to = await anyio.to_thread.run_sync(move_file, spec, root, i, "rejected")
+                    except OSError:
+                        pass
+            sync_counts()
+            if bad and not dry_run:
+                report.status, report.error = "failed", f"{len(bad)} file(s) could not be loaded: " + "; ".join(
+                    f"{i.info.rel}: {i.reason}" for i in bad[:5])
+                return
+            report.status = "dry_run" if dry_run else "skipped"
+            if not dry_run:
+                report.error = (f"no files to load in {root}" if not plan.items else
+                                f"no new or changed files in {root} ({report.files_skipped} already loaded"
+                                + (f", {report.files_waiting} waiting" if report.files_waiting else "") + ")")
+            return
+
+        # mapping vs the table, once
+        table, names, p1, w1, effective = await anyio.to_thread.run_sync(self.inspect_target, spec)
+        sample = await self.read_rows(spec)
+        p2, w2 = self.check_source_columns(spec, sample)
+        report.problems, report.warnings = p1 + p2, report.warnings + w1 + w2
+        if spec.files.on_changed == "replace":
+            fk = spec.files.file_key
+            if not fk or fk.lower() not in {k.lower() for k in names}:
+                report.problems.append(f"files.on_changed: replace needs files.file_key, a mapped target column "
+                                       f"(from file_path or file_name); got {fk!r}")
+        if report.problems:
+            raise LoadError("mapping is not valid:\n  - " + "\n  - ".join(report.problems))
+        mapper = RowMapper(spec.model_copy(update={"columns": effective}), report.run_id)
+        target = self._target(spec)
+        fk_target = next((k for k in names if spec.files.file_key and k.lower() == spec.files.file_key.lower()),
+                         None)
+        rejects: list[tuple[int, str, dict]] = []
+        rec = 0
+
+        def load_one(item) -> None:
+            nonlocal rec
+            try:
+                rows = file_rows(spec, item)
+            except Exception as exc:  # noqa: BLE001 – a bad file must not stop the others
+                item.status, item.reason = "failed", f"cannot read: {str(exc).splitlines()[0][:200]}"
+                return
+            good, bad = [], 0
+            for row in rows:
+                rec += 1
+                try:
+                    m = mapper.map_row(row)
+                    good.append((row, m))
+                except RowError as exc:
+                    bad += 1
+                    rejects.append((rec, f"{item.info.rel}: {exc}", {"file": item.info.rel, **safe_row(row)}))
+            item.rows, item.rejected = len(good), bad
+            report.read += len(rows)
+            report.rejected += bad
+            if bad > spec.max_rejects:
+                item.status = "failed"
+                item.reason = f"{bad} row(s) rejected (max_rejects = {spec.max_rejects}); file not loaded"
+                return
+            if not good:
+                item.status, item.reason = "failed", "no rows in the file"
+                return
+            for row, m in good:
+                if len(report.preview) < preview:
+                    report.preview.append({"record": item.info.rel, "source": safe_row(row), "target": safe_row(m)})
+            if dry_run:
+                item.status = "would_load"
+                report.mapped += len(good)
+                return
+            data = [{names[k]: v for k, v in m.items()} for _, m in good]
+            try:
+                target._refresh_if_rotated()
+                with target.engine.begin() as conn:
+                    if item.status == "changed" and spec.files.on_changed == "replace" and fk_target:
+                        col = table.c[names[fk_target]]
+                        keyv = {m.get(fk_target) for _, m in good}
+                        res = conn.execute(delete(table).where(col.in_(list(keyv))))
+                        item.deleted = max(res.rowcount or 0, 0)
+                    writer = make_writer("insert", conn, table, [])
+                    for b in range(0, len(data), spec.batch_size):
+                        writer.write(data[b:b + spec.batch_size])
+            except SQLAlchemyError as exc:
+                orig = getattr(exc, "orig", None) or exc
+                first = str(orig).strip().splitlines()[0][:300] if str(orig).strip() else type(orig).__name__
+                log.error("load %s file %s failed: %s", spec.name, item.info.rel, first)
+                item.status, item.reason = "failed", f"database error, file rolled back: {first}"
+                return
+            action = "replaced" if item.deleted or (item.status == "changed" and spec.files.on_changed == "replace")                 else ("new version" if item.status == "changed" else "new")
+            ledger.add(item.info, item.sha256, "loaded", action=action, rows=len(data), run_id=report.run_id)
+            report.mapped += len(data)
+            report.inserted += len(data)
+            report.deleted += item.deleted
+            item.status, item.reason = "loaded", action
+            try:
+                item.moved_to = move_file(spec, root, item, "done")
+                if item.moved_to:
+                    ledger.set_moved(item.sha256, report.run_id, item.moved_to)
+            except OSError as exc:
+                report.warnings.append(f"{item.info.rel} loaded but could not be moved: {exc} (the ledger still "
+                                       f"prevents loading it again)")
+
+        for item in todo:
+            await anyio.to_thread.run_sync(load_one, item)
+            if item.status == "failed" and not dry_run:
+                ledger.add(item.info, item.sha256 or "", "failed", run_id=report.run_id, reason=item.reason)
+                try:
+                    item.moved_to = await anyio.to_thread.run_sync(move_file, spec, root, item, "rejected")
+                except OSError as exc:
+                    report.warnings.append(f"{item.info.rel} could not be moved to the rejected folder: {exc}")
+        for i in plan.items:
+            if i.status == "too_big" and not dry_run:
+                try:
+                    i.moved_to = await anyio.to_thread.run_sync(move_file, spec, root, i, "rejected")
+                except OSError:
+                    pass
+        rejects.sort(key=lambda r: r[0])
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self._write_rejects(report, rejects)
+        sync_counts()
+        if dry_run:
+            report.status = "dry_run"
+        elif report.files_loaded == 0:
+            report.status = "failed"
+            report.error = "no file was loaded: " + "; ".join(f"{i.info.rel}: {i.reason}" for i in plan.items
+                                                              if i.status in ("failed", "too_big"))[:600]
+        elif report.files_failed or report.rejected:
+            report.status = "partial"
+        else:
+            report.status = "success"
 
     # ------------------------------------------------------- AD group loads
     def _directory(self, spec: LoadSpec):

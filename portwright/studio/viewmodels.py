@@ -109,6 +109,7 @@ def parse_kv_lines(text: str) -> dict[str, str]:
 SOURCE_TYPES = {
     "sql": "SQL database (Oracle, PostgreSQL, SQL Server, MySQL, SQLite)",
     "file": "File in the data folder (CSV, JSON, Excel)",
+    "folder": "Folder of files (documents to BLOB/CLOB, or many CSV/Excel files)",
     "rest": "Upstream REST API",
     "callable": "Python function in the handlers folder",
     "ldap": "Active Directory (target for group loads)",
@@ -128,7 +129,9 @@ def source_values(svc: Services, name: str) -> dict[str, Any]:
             "module": s.module or "", "allow_credentials": ", ".join(s.credentials),
             "description": s.description, "url": s.url or "",
             "servers": "\n".join(s.servers), "base_dn": s.base_dn or "", "directory": s.directory,
-            "ca_file": s.ca_file or "", "allow_plain_ldap": s.allow_plain_ldap, "test_group": s.test_group or ""}
+            "ca_file": s.ca_file or "", "allow_plain_ldap": s.allow_plain_ldap, "test_group": s.test_group or "",
+            "include": "\n".join(s.include), "exclude": "\n".join(s.exclude), "recursive": s.recursive,
+            "max_file_mb": f"{s.max_file_mb:g}"}
 
 
 def save_source(svc: Services, v: dict[str, Any], editing: bool = False) -> list[str]:
@@ -146,6 +149,16 @@ def save_source(svc: Services, v: dict[str, Any], editing: bool = False) -> list
                   read_write=bool(v.get("read_write")))
     elif t == "file":
         kw.update(path=(v.get("path") or "").strip(), sheet=v.get("sheet") or None)
+    elif t == "folder":
+        def lines(x):
+            return [p.strip() for p in str(x or "").replace(";", "\n").replace(",", "\n").splitlines() if p.strip()]
+        try:
+            mb = float(str(v.get("max_file_mb") or "100").strip())
+        except ValueError:
+            raise ServiceError("Max file size must be a number (MB)") from None
+        kw.update(path=(v.get("path") or "").strip().strip('"'), include=lines(v.get("include")) or ["*"],
+                  exclude=lines(v.get("exclude")), recursive=bool(v.get("recursive")), max_file_mb=mb,
+                  allow_folder=bool(v.get("allow_folder")))
     elif t == "rest":
         kw.update(base_url=(v.get("base_url") or "").strip(), allow_host=bool(v.get("allow_host")),
                   credential=v.get("credential") or None, headers=parse_kv_lines(v.get("headers", "")))
@@ -227,7 +240,13 @@ EXPIRY_CHOICES = {"30 days": 30, "90 days": 90, "180 days": 180, "1 year": 365, 
 
 
 # ================================================================ load mapping
-MAP_TYPES = ["string", "integer", "number", "boolean", "date", "timestamp"]
+MAP_TYPES = ["string", "integer", "number", "boolean", "date", "timestamp", "binary", "text"]
+FOLDER_READ = {"document": "One row per file – content to a BLOB / CLOB column",
+               "records": "Rows of each file – CSV, Excel or JSON files"}
+ON_CHANGED = {"version": "Load it as a new version (another row)",
+              "replace": "Replace the rows loaded from that file"}
+AFTER_LOAD = {"move": "Move it to the archive folder", "leave": "Leave it in the folder",
+              "delete": "Delete it (after the commit)"}
 LOAD_MODES = {"insert": "Append – insert new rows",
               "replace": "Kill & fill – delete all rows, then insert",
               "upsert": "Upsert – update matching keys, insert the rest"}
