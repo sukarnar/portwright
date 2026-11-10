@@ -38,9 +38,19 @@ class CredentialService:
         return TYPES
 
     def vault_status(self) -> dict:
-        env_name = self.p.config.security.credentials.master_key_env
-        return {"key_env": env_name, "key_present": bool(getenv(env_name)),
-                "providers": list(self.p.config.security.credentials.providers)}
+        cfg = self.p.config.security.credentials
+        env_name = cfg.master_key_env
+        global_env = getattr(cfg, "global_master_key_env", "") or env_name
+        return {
+            "key_env": env_name,
+            "key_present": bool(getenv(env_name)),
+            "providers": list(cfg.providers),
+            "global_vault_enabled": getattr(cfg, "use_global_vault", True),
+            "global_vault_path": str(__import__("pathlib").Path(
+                getattr(cfg, "global_vault_path", "~/.portwright/credentials.vault")).expanduser()),
+            "global_key_env": global_env,
+            "global_key_present": bool(getenv(global_env)),
+        }
 
     def usage(self) -> dict[str, list[str]]:
         cfg = self.p.config
@@ -130,6 +140,72 @@ class CredentialService:
             self.p.log_credential("delete", name)
         except CredentialError as exc:
             raise ServiceError(str(exc)) from None
+
+    # ----------------------------------------------------------------- global vault helpers
+    def _global_mgr(self):
+        from ..credentials import CredentialManager
+        cfg = self.p.config.security.credentials
+        return CredentialManager.global_vault(cfg)
+
+    def list_global(self) -> list[dict]:
+        """List credentials stored in the global (cross-project) vault."""
+        try:
+            creds = self._global_mgr().list()
+        except Exception as exc:
+            raise ServiceError(str(exc)) from None
+        out = []
+        for c in creds:
+            state, days = expiry_state(c.expires)
+            out.append({"name": c.name, "type": c.type, "provider": "global-vault",
+                        "fields": sorted(c.fields), "expires": c.expires,
+                        "expiry_state": state, "days_left": days,
+                        "description": c.description})
+        return out
+
+    def add_global(self, name: str, type: str, fields: dict, *,
+                   secret_fields: list[str] | None = None,
+                   expires_days: int | None = None, description: str = "") -> str:
+        """Store a credential in the global vault."""
+        if type not in TYPES:
+            raise ServiceError(f"type must be one of {', '.join(TYPES)}")
+        if not _NAME.match(name):
+            raise ServiceError("name: letters, digits, '_' or '-' (max 64), starting with a letter")
+        mgr = self._global_mgr()
+        try:
+            if any(c.name == name for c in mgr.list()):
+                raise ServiceError(f"global credential '{name}' exists – rotate it instead")
+            clean = {k: v for k, v in fields.items() if v not in (None, "")}
+            mgr.put(Credential(name=name, type=type, fields=clean, description=description,
+                               expires=_expiry(expires_days), secret_fields=secret_fields or []))
+            self.p.audit("global_credential_added", credential=name, type=type)
+            return "global-vault"
+        except CredentialError as exc:
+            raise ServiceError(str(exc)) from None
+
+    def remove_global(self, name: str) -> None:
+        """Delete a credential from the global vault."""
+        try:
+            if not self._global_mgr().delete(name):
+                raise ServiceError(f"no global credential '{name}'")
+            self.p.audit("global_credential_removed", credential=name)
+        except CredentialError as exc:
+            raise ServiceError(str(exc)) from None
+
+    def promote_to_global(self, name: str) -> None:
+        """Copy a project credential to the global vault, then remove it from the project vault."""
+        mgr = self.p.credentials()
+        try:
+            cred = mgr.get(name)
+        except CredentialError as exc:
+            raise ServiceError(str(exc)) from None
+        self.add_global(name, cred.type, cred.fields,
+                        secret_fields=cred.secret_fields, description=cred.description)
+        # Remove from project vault only (not env/keyring)
+        try:
+            mgr.delete(name, provider="vault")
+        except Exception:
+            pass
+        self.p.audit("credential_promoted_to_global", credential=name)
 
     def test(self, name: str, url: str | None = None) -> tuple[bool, str]:
         import httpx

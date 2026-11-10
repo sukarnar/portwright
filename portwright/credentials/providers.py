@@ -79,10 +79,13 @@ class EncryptedFileVault(CredentialProvider):
     name = "vault"
     writable = True
 
-    def __init__(self, path: str | Path, master_key_env: str = "PORTWRIGHT_MASTER_KEY"):
+    def __init__(self, path: str | Path, master_key_env: str = "PORTWRIGHT_MASTER_KEY",
+                 provider_name: str | None = None):
         self.path = Path(path)
         self.master_key_env = master_key_env
         self._aes = None
+        if provider_name:
+            self.name = provider_name
 
     # ------------------------------------------------------------- crypto
     def _load_file(self) -> dict[str, Any]:

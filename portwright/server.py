@@ -32,8 +32,24 @@ class TokenRequest(BaseModel):
     password: str = Field(max_length=256)
 
 
-def _referenced_credentials(config: ProjectConfig) -> set[str]:
+class AgentRunRequest(BaseModel):
+    task: str = Field(min_length=1, max_length=20_000)
+
+
+class WorkflowRunRequest(BaseModel):
+    input: dict = Field(default_factory=dict)
+
+
+def _referenced_credentials(config: ProjectConfig, project_root: str | Path | None = None) -> set[str]:
     names: set[str] = set(credential_refs(config.security.jwt.secret))
+    models = dict(config.llm_models)
+    if project_root is not None and config.llm_models_include:
+        from .agents.models import load_models
+        models = load_models(config, project_root)
+    for m in models.values():
+        if m.credential:
+            names.add(m.credential)
+        names |= credential_refs(m.headers)
     for spec in config.sources.values():
         if spec.credential:
             names.add(spec.credential)
@@ -57,7 +73,7 @@ def create_app(config: ProjectConfig | str | Path = DEFAULT_CONFIG,
     credentials = credentials or CredentialManager.from_settings(sec.credentials, project_root)
     install_redaction(credentials)
     cred_problems = []
-    for name in sorted(_referenced_credentials(config)):
+    for name in sorted(_referenced_credentials(config, project_root)):
         try:
             credentials.get(name, consumer="startup-check")
         except CredentialError as exc:
@@ -174,6 +190,36 @@ def create_app(config: ProjectConfig | str | Path = DEFAULT_CONFIG,
         if body.get("rejects_file"):
             body["rejects_file"] = Path(body["rejects_file"]).name     # don't reveal server paths
         return JSONResponse(body, status_code=422 if rep.status == "failed" else 200)
+
+    # ------------------------------------------------- agents and workflows
+    if config.agents or config.workflows:
+        from .agents.loop import run_agent
+        from .agents.workflow import run_workflow
+
+        @app.post(f"{base}/_agents/{{name}}/run", tags=["agents"])
+        async def run_agent_route(name: str, body: AgentRunRequest, request: Request):
+            """Run an agent. 200 = answered; 422 = stopped early (max_steps, budget, timeout, error)."""
+            principal = authenticator.require(request, ["agent:run"], public=False)
+            if name not in config.agents:
+                raise HTTPException(404, f"No agent '{name}'")
+            audit.record(event="agent_api_run", agent=name, principal=principal.subject)
+            res = await run_agent(config, project_root, credentials, name, body.task)
+            out = res.to_dict()
+            out["steps"] = [{"n": s["n"], "tokens": s["tokens"],
+                             "tools": [c["name"] for c in s["tool_calls"]]} for s in out["steps"]]   # no tool data
+            return JSONResponse(out, status_code=200 if res.ok else 422)
+
+        @app.post(f"{base}/_workflows/{{name}}/run", tags=["agents"])
+        async def run_workflow_route(name: str, body: WorkflowRunRequest, request: Request):
+            """Run a workflow. 200 = ok; 422 = a step failed (see 'error')."""
+            principal = authenticator.require(request, ["workflow:run"], public=False)
+            if name not in config.workflows:
+                raise HTTPException(404, f"No workflow '{name}'")
+            audit.record(event="workflow_api_run", workflow=name, principal=principal.subject)
+            res = await run_workflow(config, project_root, credentials, name, body.input)
+            out = res.to_dict()
+            out["steps"] = [{"id": s["id"], "type": s["type"], "ok": s["ok"]} for s in out["steps"]]
+            return JSONResponse(out, status_code=200 if res.ok else 422)
 
     if "jwt" in sec.auth_methods:
         @app.post(f"{base}/auth/token", tags=["auth"])

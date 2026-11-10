@@ -34,7 +34,7 @@ class LoadsView:
 
     def __init__(self, ctx: Ctx):
         self.ctx = ctx
-        self.root = ft.Column(expand=True, scroll=ft.ScrollMode.AUTO, spacing=16)
+        self.root = ft.Column(expand=True, scroll=ft.ScrollMode.ALWAYS, spacing=16)
         self.editor: LoadEditor | None = None
         self.status: dict[str, dict | str] = {}     # load -> source_status() result, or an error text
 
@@ -507,6 +507,7 @@ class LoadEditor:
         self.dry = None
         self.busy = ft.ProgressBar(visible=False)
         self.only_problems = False
+        self._lines: dict[int, ft.Container] = {}      # id(MapRow) -> its grid line, for in-place refresh
 
         # settings controls (created once so typed values survive re-renders)
         self.f_name = text_field("Load name *", vals["name"], hint="letters, digits, - and _", width=260)
@@ -638,7 +639,7 @@ class LoadEditor:
 
     def _dirty(self, _=None) -> None:
         self.dirty_tag.visible = self.is_dirty
-        self.ctx.page.update()
+        self.dirty_tag.update()
 
     # --------------------------------------------------------- handlers
     @property
@@ -1014,18 +1015,21 @@ class LoadEditor:
         ins = self.inspection
         header_cols = ins.header if ins else None
         upsert = True                      # the key column is shown in every mode
-        widths = [26, 190, 200, 120, 160, 44, 140, 96]
+        widths = self.GRID_WIDTHS
         heads = ["", "Target column", "Source", "Type", "Format / value", "Key", "Options", ""]
         lines: list[ft.Control] = [self._line([_small(h, weight=ft.FontWeight.W_600) for h in heads], widths,
                                               head=True)]
         shown = 0
+        self._lines = {}
         for r in self.rows:
             kind, msg = r.status(header_cols)
             if self.only_problems and kind in ("good", "neutral"):
                 continue
             shown += 1
             ctl = self._row_controls(r, kind, msg, header_cols or [], upsert)
-            lines.append(self._line(ctl, widths))
+            line = self._line(ctl, widths)
+            self._lines[id(r)] = line
+            lines.append(line)
         if not self.rows:
             lines.append(ft.Container(padding=20, content=ft.Text(
                 "Press 'Read columns' to list the columns of the target table." if not ins else
@@ -1041,14 +1045,38 @@ class LoadEditor:
             self.dirty_tag.visible = self.is_dirty
             self.ctx.page.update()
 
+    GRID_WIDTHS = [26, 190, 200, 120, 160, 44, 140, 96]
+
     @staticmethod
-    def _line(controls: list[ft.Control], widths: list[int], head: bool = False) -> ft.Control:
+    def _line_row(controls: list[ft.Control], widths: list[int]) -> ft.Row:
+        return ft.Row([ft.Container(c, width=w) for c, w in zip(controls, widths)], spacing=8,
+                      vertical_alignment=ft.CrossAxisAlignment.CENTER)
+
+    @staticmethod
+    def _line(controls: list[ft.Control], widths: list[int], head: bool = False) -> ft.Container:
         return ft.Container(
             padding=ft.Padding.symmetric(horizontal=12, vertical=6),
             bgcolor=ft.Colors.SURFACE_CONTAINER_LOW if head else None,
             border=ft.Border.only(bottom=ft.BorderSide(1, ft.Colors.OUTLINE_VARIANT)),
-            content=ft.Row([ft.Container(c, width=w) for c, w in zip(controls, widths)], spacing=8,
-                           vertical_alignment=ft.CrossAxisAlignment.CENTER))
+            content=LoadEditor._line_row(controls, widths))
+
+    def _refresh_row(self, r: MapRow) -> None:
+        """Rebuild one grid row in place and send only it (plus the summary) to the UI.
+        A full render_grid() rebuilds every row's dropdowns and re-sends the whole page, which is
+        what made edits slow on tables with many columns."""
+        line = self._lines.get(id(r))
+        if line is None or self.only_problems:      # filtered view: the row may need to appear/disappear
+            self.render_grid()
+            return
+        ins = self.inspection
+        header_cols = ins.header if ins else None
+        kind, msg = r.status(header_cols)
+        line.content = self._line_row(self._row_controls(r, kind, msg, header_cols or [], True), self.GRID_WIDTHS)
+        self._render_summary()
+        self.dirty_tag.visible = self.is_dirty
+        line.update()
+        self.summary.update()
+        self.dirty_tag.update()
 
     def _row_controls(self, r: MapRow, kind: str, msg: str, header_cols: list[str], upsert: bool) -> list:
         icon, color = STATUS_ICON[kind]
@@ -1072,7 +1100,7 @@ class LoadEditor:
         if r.is_constant:
             third = text_field(None, str(r.value if r.value is not None else ""), hint="${now} ${today} ${run_id}",
                                on_change=lambda e, r=r: self._set(r, value=e.control.value, render=False),
-                               on_blur=lambda e: self.render_grid())
+                               on_blur=lambda e, r=r: self._refresh_row(r))
         elif r.type in ("date", "timestamp") and r.source is not None:
             fmts = DATE_FORMATS if r.type == "date" else TS_FORMATS
             third = dropdown(None, {"": "ISO (auto)", **{f: f for f in fmts},
@@ -1140,10 +1168,10 @@ class LoadEditor:
                 continue
             setattr(r, k, v)
         if render:
-            self.render_grid()
+            self._refresh_row(r)
         else:
             self.dirty_tag.visible = self.is_dirty
-            self.ctx.page.update()
+            self.dirty_tag.update()
 
     def _set_source(self, r: MapRow, value: str) -> None:
         if value == NOT_MAPPED:
@@ -1154,7 +1182,7 @@ class LoadEditor:
         else:
             r.source, r.is_constant, r.value = value, False, None
         r.review = False
-        self.render_grid()
+        self._refresh_row(r)
 
     def clear(self, _=None) -> None:
         for r in self.rows:
@@ -1198,7 +1226,7 @@ class LoadEditor:
             r.format = (fmt.value or "").strip() or None
             r.max_length = int(ml) if ml else None
             self.ctx.close()
-            self.render_grid()
+            self._refresh_row(r)
 
         self.ctx.dialog(f"Options for '{r.target}'", [
             _small(f"{r.db_type or 'column'} · source: " + ("constant" if r.is_constant else (r.source or "not mapped"))),

@@ -15,7 +15,7 @@ class CredentialsView:
 
     def __init__(self, ctx: Ctx):
         self.ctx = ctx
-        self.root = ft.Column(expand=True, scroll=ft.ScrollMode.AUTO, spacing=16)
+        self.root = ft.Column(expand=True, scroll=ft.ScrollMode.ALWAYS, spacing=16)
 
     def build(self) -> ft.Control:
         self.refresh(update=False)
@@ -26,7 +26,12 @@ class CredentialsView:
         vault = svc.vault_status()
         controls: list[ft.Control] = [header(
             "Credentials", "Logins and tokens portwright uses to reach your databases and APIs – stored encrypted",
-            [help_btn(self.ctx, "credentials"), ft.FilledButton("Add credential", icon=ft.Icons.ADD, on_click=lambda _: self.add_dialog(),
+            [help_btn(self.ctx, "credentials"),
+             ft.OutlinedButton("Add global credential", icon=ft.Icons.PUBLIC,
+                               on_click=lambda _: self.add_dialog(global_vault=True),
+                               tooltip="Store in ~/.portwright/credentials.vault — shared across all projects"),
+             ft.FilledButton("Add credential", icon=ft.Icons.ADD,
+                             on_click=lambda _: self.add_dialog(),
                              disabled=not vault["key_present"])])]
         if not vault["key_present"]:
             controls.append(ft.Container(
@@ -35,11 +40,15 @@ class CredentialsView:
                                 ft.Text(f"The vault is locked: {vault['key_env']} is not in this project's .env.",
                                         expand=True, color=ft.Colors.ON_ERROR_CONTAINER),
                                 ft.FilledButton("Create master key", on_click=self._init_vault)])))
+
+        # ---- project credentials ----
         try:
             creds = svc.list()
         except ServiceError as exc:
             controls.append(ft.Text(str(exc), color=ft.Colors.ERROR))
             creds = []
+        controls.append(ft.Text("Project credentials", size=13, weight=ft.FontWeight.W_600,
+                                 color=ft.Colors.ON_SURFACE_VARIANT))
         if not creds:
             controls.append(empty("No credentials yet.", ft.FilledButton(
                 "Add your first credential", on_click=lambda _: self.add_dialog(), disabled=not vault["key_present"])))
@@ -55,16 +64,66 @@ class CredentialsView:
                     ft.Text(", ".join(c["used_by"]) or "–", color=ft.Colors.ON_SURFACE_VARIANT),
                     ft.Row([icon_btn(ft.Icons.PLAY_ARROW, "Test", lambda _, n=c["name"]: self.test(n)),
                             icon_btn(ft.Icons.SYNC, "Rotate / edit", lambda _, n=c["name"]: self.rotate_dialog(n)),
+                            icon_btn(ft.Icons.PUBLIC, "Promote to global vault",
+                                     lambda _, n=c["name"]: self.promote(n)),
                             icon_btn(ft.Icons.DELETE, "Delete", lambda _, n=c["name"]: self.delete(n),
                                      ft.Colors.ERROR)], spacing=0),
                 ])
             controls.append(table(["Name", "Type", "Stored in", "Expiry", "Used by", ""], rows))
+
+        # ---- global credentials ----
+        controls.append(ft.Divider())
+        global_enabled = vault.get("global_vault_enabled", True)
+        global_key_ok = vault.get("global_key_present", False)
+        global_path = vault.get("global_vault_path", "~/.portwright/credentials.vault")
+        controls.append(ft.Row([
+            ft.Icon(ft.Icons.PUBLIC, size=18, color=ft.Colors.SECONDARY),
+            ft.Text("Global credentials", size=13, weight=ft.FontWeight.W_600),
+            ft.Container(expand=True),
+            ft.Text(global_path, size=11, color=ft.Colors.ON_SURFACE_VARIANT, italic=True),
+        ]))
+        controls.append(ft.Text(
+            "Shared across all projects on this machine. The project credential always wins if names clash.",
+            size=11, color=ft.Colors.ON_SURFACE_VARIANT))
+        if not global_key_ok:
+            controls.append(ft.Container(
+                padding=12, border_radius=8, bgcolor=ft.Colors.SURFACE_CONTAINER_HIGH,
+                content=ft.Text(
+                    f"Global vault key not found. Set {vault.get('global_key_env', 'PORTWRIGHT_GLOBAL_KEY')} "
+                    f"(or {vault.get('key_env', 'PORTWRIGHT_MASTER_KEY')}) in your user environment to use it.",
+                    size=11, color=ft.Colors.ON_SURFACE_VARIANT)))
+        if global_enabled:
+            try:
+                gcreds = svc.list_global()
+            except ServiceError:
+                gcreds = []
+            if not gcreds:
+                controls.append(ft.Text("No global credentials yet.",
+                                        size=12, color=ft.Colors.ON_SURFACE_VARIANT, italic=True))
+            else:
+                grows = []
+                for c in gcreds:
+                    exp = {"never": tag("no expiry"), "ok": tag(f"{c['days_left']} days", "good"),
+                           "soon": tag(f"{c['days_left']} days", "warn"),
+                           "expired": tag("EXPIRED", "bad")}[c["expiry_state"]]
+                    grows.append([
+                        ft.Text(c["name"], weight=ft.FontWeight.W_600),
+                        ft.Text(TYPE_LABELS.get(c["type"], c["type"])),
+                        tag("global", "info"), exp,
+                        ft.Text(c.get("description") or "–", color=ft.Colors.ON_SURFACE_VARIANT),
+                        ft.Row([
+                            icon_btn(ft.Icons.DELETE, "Delete from global vault",
+                                     lambda _, n=c["name"]: self.delete_global(n), ft.Colors.ERROR),
+                        ], spacing=0),
+                    ])
+                controls.append(table(["Name", "Type", "Vault", "Expiry", "Description", ""], grows))
+
         self.root.controls = controls
         if update:
             self.ctx.page.update()
 
     # ----------------------------------------------------------------- add
-    def add_dialog(self) -> None:
+    def add_dialog(self, global_vault: bool = False) -> None:
         name = text_field("Name", hint="e.g. hr_oracle – sources refer to it by this name")
         ctype = dropdown("Type", TYPE_LABELS, "database")
         expires = dropdown("Rotate after", list(EXPIRY_CHOICES), "Never")
@@ -122,17 +181,28 @@ class CredentialsView:
 
             def done(where):
                 self.ctx.close()
-                self.ctx.toast(f"Credential '{name.value}' saved in the {where}")
+                dest = "global vault" if global_vault else where
+                self.ctx.toast(f"Credential '{name.value}' saved in the {dest}")
                 self.refresh()
             days = EXPIRY_CHOICES[expires.value] or None
-            self.ctx.background(lambda: self.ctx.svc.credentials.add(
-                (name.value or "").strip(), ctype.value, values, expires_days=days, description=desc.value or "",
-                secret_fields=list(values) if ctype.value == "generic" else None), done)
+            if global_vault:
+                self.ctx.background(lambda: self.ctx.svc.credentials.add_global(
+                    (name.value or "").strip(), ctype.value, values, expires_days=days,
+                    description=desc.value or "",
+                    secret_fields=list(values) if ctype.value == "generic" else None), done)
+            else:
+                self.ctx.background(lambda: self.ctx.svc.credentials.add(
+                    (name.value or "").strip(), ctype.value, values, expires_days=days,
+                    description=desc.value or "",
+                    secret_fields=list(values) if ctype.value == "generic" else None), done)
 
-        self.ctx.dialog("Add credential", [
-            name, ctype, fields_box, generic_box, ft.Row([expires], wrap=True), desc,
-            ft.Text("Secrets are encrypted in this project's vault and never shown again.",
-                    size=12, color=ft.Colors.ON_SURFACE_VARIANT)],
+        title = "Add global credential" if global_vault else "Add credential"
+        subtitle = ft.Text("Stored in ~/.portwright/credentials.vault — shared across all projects.",
+                           size=12, color=ft.Colors.SECONDARY) if global_vault else ft.Text(
+            "Secrets are encrypted in this project's vault and never shown again.",
+            size=12, color=ft.Colors.ON_SURFACE_VARIANT)
+        self.ctx.dialog(title, [
+            name, ctype, fields_box, generic_box, ft.Row([expires], wrap=True), desc, subtitle],
             [ft.TextButton("Cancel", on_click=lambda _: self.ctx.close()),
              ft.FilledButton("Save", on_click=save)])
         if render_fields_initial:
@@ -194,6 +264,24 @@ class CredentialsView:
             self.ctx.toast(f"Credential '{name}' deleted")
             self.refresh()
         self.ctx.confirm("Delete credential?", f"'{name}' will be removed from the vault. This cannot be undone.", go)
+
+    def promote(self, name: str) -> None:
+        def go():
+            self.ctx.svc.credentials.promote_to_global(name)
+            self.ctx.toast(f"'{name}' moved to global vault — available in all projects")
+            self.refresh()
+        self.ctx.confirm(
+            "Promote to global?",
+            f"'{name}' will be moved to ~/.portwright/credentials.vault and removed from this project's vault.",
+            go)
+
+    def delete_global(self, name: str) -> None:
+        def go():
+            self.ctx.svc.credentials.remove_global(name)
+            self.ctx.toast(f"Global credential '{name}' deleted")
+            self.refresh()
+        self.ctx.confirm("Delete global credential?",
+                         f"'{name}' will be removed from the global vault. Projects that use it will break.", go)
 
     def _init_vault(self, _=None) -> None:
         def go():

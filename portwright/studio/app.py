@@ -18,6 +18,7 @@ from ..services import Project, ServiceError, Services
 from .common import Ctx, text_field
 from .viewmodels import Recent
 from .views.access import AccessView
+from .views.agents import AgentsView
 from .views.activity import ActivityView
 from .views.credentials import CredentialsView
 from .views.dashboard import DashboardView
@@ -25,6 +26,7 @@ from .views.endpoints import EndpointsView
 from .views.help import HelpView
 from .views.loads import LoadsView
 from .views.sources import SourcesView
+from .views.reports import ReportsView
 
 SCREENS = [  # key, label, icon, view class
     ("dashboard", "Dashboard", ft.Icons.DASHBOARD, DashboardView),
@@ -32,6 +34,8 @@ SCREENS = [  # key, label, icon, view class
     ("credentials", "Credentials", ft.Icons.LOCK, CredentialsView),
     ("endpoints", "Endpoints", ft.Icons.API, EndpointsView),
     ("loads", "Loads", ft.Icons.MOVE_DOWN, LoadsView),
+    ("reports", "Reports", ft.Icons.DESCRIPTION, ReportsView),
+    ("agents", "Agents", ft.Icons.SMART_TOY, AgentsView),
     ("access", "API keys", ft.Icons.BADGE, AccessView),
     ("activity", "Activity", ft.Icons.HISTORY, ActivityView),
     ("help", "Help", ft.Icons.HELP_OUTLINE, HelpView),
@@ -121,7 +125,7 @@ class Studio:
             ft.Row([new_dir] + ([ft.OutlinedButton("Browse…", icon=ft.Icons.FOLDER_OPEN, on_click=browse_dir)]
                                 if desktop else []), width=900),
             ft.Row([new_name, ft.FilledButton("Create", icon=ft.Icons.CREATE_NEW_FOLDER, on_click=do_create)]),
-        ], spacing=14, scroll=ft.ScrollMode.AUTO)))
+        ], spacing=14, scroll=ft.ScrollMode.ALWAYS)))
         self.page.update()
 
     # ------------------------------------------------------------ shell

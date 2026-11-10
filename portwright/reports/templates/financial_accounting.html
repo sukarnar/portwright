@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>{{ report_name }}</title>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; font-size: 11px; color: #222; margin: 14mm 18mm; }
+
+  /* ---- header ---- */
+  .report-header { border-bottom: 3px double #1a4e8a; padding-bottom: 8px; margin-bottom: 16px; }
+  .company-name  { font-size: 18px; font-weight: bold; color: #1a4e8a; }
+  .report-title  { font-size: 14px; color: #333; margin-top: 2px; }
+  .report-meta   { font-size: 10px; color: #777; margin-top: 4px; }
+
+  /* ---- summary cards ---- */
+  .kpi-row { display: flex; gap: 12px; margin-bottom: 18px; flex-wrap: wrap; }
+  .kpi {
+    flex: 1; min-width: 120px;
+    border: 1px solid #dce4f0;
+    border-top: 3px solid #1a4e8a;
+    border-radius: 4px;
+    padding: 8px 14px;
+  }
+  .kpi.credit-card { border-top-color: #1e7a45; }
+  .kpi.balance-card { border-top-color: #8b1a1a; }
+  .kpi .kpi-label { font-size: 9px; text-transform: uppercase; letter-spacing: .5px; color: #666; }
+  .kpi .kpi-value { font-size: 16px; font-weight: bold; color: #1a4e8a; margin-top: 3px; }
+  .kpi.credit-card .kpi-value  { color: #1e7a45; }
+  .kpi.balance-card .kpi-value { color: #8b1a1a; }
+
+  /* ---- section headings ---- */
+  h2 {
+    font-size: 12px; font-weight: bold; text-transform: uppercase;
+    letter-spacing: .6px; color: #fff;
+    background: #1a4e8a; padding: 4px 10px;
+    margin: 18px 0 0;
+  }
+
+  /* ---- table ---- */
+  table { width: 100%; border-spacing: 0; margin-bottom: 4px; }
+  thead th {
+    background: #eef2fa; font-size: 10px; text-align: left;
+    padding: 4px 8px; border-bottom: 2px solid #c0cfe8;
+    color: #333;
+  }
+  thead th.num { text-align: right; }
+  td { padding: 3px 8px; border-bottom: 1px solid #eef0f4; vertical-align: top; }
+  td.num { text-align: right; font-family: "Courier New", monospace; font-size: 11px; }
+  tr:nth-child(even) td { background: #f7f9fc; }
+  tr:hover td { background: #eef4ff; }
+
+  /* ---- debit / credit colours ---- */
+  .debit  { color: #1a4e8a; }
+  .credit { color: #1e7a45; }
+  .negative { color: #8b1a1a; }
+
+  /* ---- sub-total / grand-total rows ---- */
+  tr.section-total td {
+    font-weight: bold;
+    background: #dce6f7 !important;
+    border-top: 1px solid #a0b8d8;
+    border-bottom: 1px solid #a0b8d8;
+  }
+  tr.grand-total td {
+    font-weight: bold; font-size: 12px;
+    background: #1a4e8a !important;
+    color: #fff;
+    border-top: 2px solid #0f3060;
+  }
+  tr.grand-total td.num { color: #ffd700; }
+
+  /* ---- account code ---- */
+  .acct-code { color: #888; font-family: "Courier New", monospace; font-size: 10px; }
+
+  /* ---- footer ---- */
+  .footer {
+    margin-top: 18px; font-size: 9px; color: #aaa;
+    border-top: 1px solid #e0e0e0; padding-top: 4px;
+    display: flex; justify-content: space-between;
+  }
+  .note { font-size: 10px; color: #555; margin-top: 10px; font-style: italic; }
+</style>
+</head>
+<body>
+
+<!-- ================================================================ header -->
+<div class="report-header">
+  <div class="company-name">{{ vars.company_name | default_if_none('Your Company') }}</div>
+  <div class="report-title">{{ report_name }}</div>
+  <div class="report-meta">
+    Period: {{ vars.period_start | default_if_none('') }}{% if vars.period_end %} to {{ vars.period_end }}{% endif %}
+    &nbsp;&bull;&nbsp;
+    Currency: {{ vars.currency | default_if_none('USD') }}
+    &nbsp;&bull;&nbsp;
+    Generated: {{ generated_at | datetime }}
+  </div>
+</div>
+
+{% if data %}
+
+{# ============================================================= compute totals #}
+{% set total_debit  = rows | sum_col('debit') %}
+{% set total_credit = rows | sum_col('credit') %}
+{% set net_balance  = total_debit - total_credit %}
+
+<!-- ================================================================ KPI row -->
+<div class="kpi-row">
+  <div class="kpi">
+    <div class="kpi-label">Total Transactions</div>
+    <div class="kpi-value">{{ row_count }}</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Total Debits</div>
+    <div class="kpi-value">{{ total_debit | currency }}</div>
+  </div>
+  <div class="kpi credit-card">
+    <div class="kpi-label">Total Credits</div>
+    <div class="kpi-value">{{ total_credit | currency }}</div>
+  </div>
+  <div class="kpi balance-card">
+    <div class="kpi-label">Net Balance</div>
+    <div class="kpi-value">{{ net_balance | currency }}</div>
+  </div>
+</div>
+
+<!-- ================================================================ detail by category -->
+{% set cat_col = 'category' if data[0].keys() | list | select('equalto','category') | list else data[0].keys() | list | first %}
+
+{% for category, cat_rows in rows | groupby_col(cat_col) %}
+<h2>{{ category | default_if_none('Uncategorised') | replace('_',' ') | title }}</h2>
+
+<table>
+  <thead>
+    <tr>
+      {% if 'account_code' in data[0].keys() %}<th style="width:80px">Code</th>{% endif %}
+      {% if 'account_name' in data[0].keys() %}<th>Account</th>{% endif %}
+      {% if 'description' in data[0].keys() %}<th>Description</th>{% endif %}
+      {% if 'date' in data[0].keys() or 'transaction_date' in data[0].keys() %}<th style="width:80px">Date</th>{% endif %}
+      {% if 'reference' in data[0].keys() %}<th style="width:90px">Reference</th>{% endif %}
+      {% if 'debit' in data[0].keys() %}<th class="num" style="width:100px">Debit</th>{% endif %}
+      {% if 'credit' in data[0].keys() %}<th class="num" style="width:100px">Credit</th>{% endif %}
+      {% if 'balance' in data[0].keys() %}<th class="num" style="width:100px">Balance</th>{% endif %}
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in cat_rows %}
+    <tr>
+      {% if 'account_code' in row %}<td class="acct-code">{{ row.account_code | default_if_none('') }}</td>{% endif %}
+      {% if 'account_name' in row %}<td>{{ row.account_name | default_if_none('-') }}</td>{% endif %}
+      {% if 'description'  in row %}<td>{{ row.description  | default_if_none('-') | truncate_col(50) }}</td>{% endif %}
+      {% if 'date' in row %}
+        <td>{{ row.date | date }}</td>
+      {% elif 'transaction_date' in row %}
+        <td>{{ row.transaction_date | date }}</td>
+      {% endif %}
+      {% if 'reference' in row %}<td>{{ row.reference | default_if_none('') }}</td>{% endif %}
+      {% if 'debit' in row %}
+        <td class="num debit">
+          {% if row.debit and row.debit != 0 %}{{ row.debit | currency }}{% endif %}
+        </td>
+      {% endif %}
+      {% if 'credit' in row %}
+        <td class="num credit">
+          {% if row.credit and row.credit != 0 %}{{ row.credit | currency }}{% endif %}
+        </td>
+      {% endif %}
+      {% if 'balance' in row %}
+        {% set bal = row.balance | default_if_none(0) | float %}
+        <td class="num {% if bal < 0 %}negative{% endif %}">{{ bal | currency }}</td>
+      {% endif %}
+    </tr>
+    {% endfor %}
+
+    {# sub-total row #}
+    <tr class="section-total">
+      {% set col_count = data[0].keys() | list | length %}
+      <td colspan="{{ col_count - (2 if 'debit' in data[0] and 'credit' in data[0] else 1) - (1 if 'balance' in data[0] else 0) }}">
+        {{ category | default_if_none('Total') | replace('_',' ') | title }} — Subtotal
+      </td>
+      {% if 'debit'  in data[0] %}<td class="num debit">{{ cat_rows | sum_col('debit')  | currency }}</td>{% endif %}
+      {% if 'credit' in data[0] %}<td class="num credit">{{ cat_rows | sum_col('credit') | currency }}</td>{% endif %}
+      {% if 'balance' in data[0] %}
+        {% set cat_bal = cat_rows | sum_col('balance') | float %}
+        <td class="num {% if cat_bal < 0 %}negative{% endif %}">{{ cat_bal | currency }}</td>
+      {% endif %}
+    </tr>
+  </tbody>
+</table>
+{% endfor %}
+
+<!-- ================================================================ grand total -->
+<table style="margin-top:12px">
+  <tbody>
+    <tr class="grand-total">
+      {% set col_count = data[0].keys() | list | length %}
+      <td colspan="{{ col_count - (2 if 'debit' in data[0] and 'credit' in data[0] else 1) - (1 if 'balance' in data[0] else 0) }}">
+        Grand Total
+      </td>
+      {% if 'debit'  in data[0] %}<td class="num">{{ total_debit  | currency }}</td>{% endif %}
+      {% if 'credit' in data[0] %}<td class="num">{{ total_credit | currency }}</td>{% endif %}
+      {% if 'balance' in data[0] %}
+        <td class="num">{{ rows | sum_col('balance') | currency }}</td>
+      {% endif %}
+    </tr>
+  </tbody>
+</table>
+
+{% if vars.notes %}
+<p class="note">Note: {{ vars.notes }}</p>
+{% endif %}
+
+{% else %}
+<p style="color:#888; font-style:italic; margin-top:24px">No transactions found for this period.</p>
+{% endif %}
+
+<!-- ================================================================ footer -->
+<div class="footer">
+  <span>{{ vars.company_name | default_if_none('') }} &bull; {{ report_name }}</span>
+  <span>{{ generated_at | strftime('%Y-%m-%d %H:%M UTC') }}</span>
+</div>
+
+</body>
+</html>
+

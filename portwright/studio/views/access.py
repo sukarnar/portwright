@@ -17,7 +17,7 @@ class AccessView:
     def __init__(self, ctx: Ctx):
         self.ctx = ctx
         self.mode = "keys"
-        self.root = ft.Column(expand=True, scroll=ft.ScrollMode.AUTO, spacing=16)
+        self.root = ft.Column(expand=True, scroll=ft.ScrollMode.ALWAYS, spacing=16)
 
     def build(self) -> ft.Control:
         self.refresh(update=False)

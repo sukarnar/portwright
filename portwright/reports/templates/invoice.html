@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Invoice</title>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; font-size: 12px; color: #222; margin: 16mm 20mm; }
+  .header { display: flex; justify-content: space-between; margin-bottom: 28px; }
+  .company { font-size: 22px; font-weight: bold; color: #1a4e8a; }
+  .invoice-title { font-size: 28px; color: #ccc; text-align: right; }
+  .invoice-meta { text-align: right; font-size: 11px; color: #555; margin-top: 4px; }
+  .section-label { font-size: 10px; text-transform: uppercase; color: #888; letter-spacing: .5px; margin-bottom: 2px; }
+  .bill-to { margin-bottom: 24px; }
+  table { border-spacing: 0; width: 100%; margin-top: 12px; }
+  th { background: #1a4e8a; color: #fff; padding: 7px 10px; text-align: left; font-size: 11px; }
+  th.right, td.right { text-align: right; }
+  td { padding: 6px 10px; border-bottom: 1px solid #e8e8e8; }
+  tr:nth-child(even) td { background: #f7f9fc; }
+  .totals { width: 260px; margin-left: auto; margin-top: 12px; }
+  .totals td { border: none; padding: 4px 10px; }
+  .totals .grand td { font-weight: bold; font-size: 14px; color: #1a4e8a;
+                      border-top: 2px solid #1a4e8a; padding-top: 6px; }
+  .notes { margin-top: 24px; font-size: 11px; color: #555; border-top: 1px solid #e0e0e0; padding-top: 10px; }
+  .footer { margin-top: 28px; font-size: 9px; color: #aaa; text-align: center; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <div class="company">{{ vars.company_name | default_if_none('Your Company') }}</div>
+    <div style="font-size:11px; color:#555; margin-top:4px;">
+      {{ vars.company_address | default_if_none('') }}<br>
+      {{ vars.company_email | default_if_none('') }}
+    </div>
+  </div>
+  <div>
+    <div class="invoice-title">INVOICE</div>
+    <div class="invoice-meta">
+      Date: {{ generated_at | date }}<br>
+      Invoice #: {{ vars.invoice_number | default_if_none('INV-001') }}
+    </div>
+  </div>
+</div>
+
+<div class="bill-to">
+  <div class="section-label">Bill To</div>
+  <strong>{{ vars.client_name | default_if_none('Client Name') }}</strong><br>
+  {{ vars.client_address | default_if_none('') }}<br>
+  {{ vars.client_email | default_if_none('') }}
+</div>
+
+{% if data %}
+<table>
+  <thead>
+    <tr>
+      <th>Description</th>
+      <th class="right">Qty</th>
+      <th class="right">Unit Price</th>
+      <th class="right">Amount</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in data %}
+    <tr>
+      <td>{{ row.description | default_if_none(row.name | default_if_none('-')) }}</td>
+      <td class="right">{{ row.qty | default_if_none(row.quantity | default_if_none(1)) | number }}</td>
+      <td class="right">{{ row.unit_price | default_if_none(row.price | default_if_none(0)) | currency }}</td>
+      <td class="right">{{ row.amount | default_if_none(row.total | default_if_none(0)) | currency }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<table class="totals">
+  <tr><td>Subtotal</td><td class="right">{{ rows | sum_col('amount') | currency }}</td></tr>
+  {% if vars.tax_rate %}
+  <tr><td>Tax ({{ vars.tax_rate }}%)</td>
+      <td class="right">{{ (rows | sum_col('amount') * vars.tax_rate / 100) | currency }}</td></tr>
+  {% endif %}
+  <tr class="grand"><td>Total Due</td>
+      <td class="right">
+        {% if vars.tax_rate %}
+          {{ (rows | sum_col('amount') * (1 + vars.tax_rate / 100)) | currency }}
+        {% else %}
+          {{ rows | sum_col('amount') | currency }}
+        {% endif %}
+      </td>
+  </tr>
+</table>
+{% endif %}
+
+{% if vars.payment_terms %}
+<div class="notes"><strong>Payment Terms:</strong> {{ vars.payment_terms }}</div>
+{% endif %}
+{% if vars.notes %}
+<div class="notes"><strong>Notes:</strong> {{ vars.notes }}</div>
+{% endif %}
+
+<div class="footer">Thank you for your business.</div>
+</body>
+</html>
+
+

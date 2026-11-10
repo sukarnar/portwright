@@ -47,7 +47,25 @@ class CredentialManager:
                 h = settings.hashicorp
                 providers.append(HashiCorpVaultProvider(resolve_secrets(h.url), resolve_secrets(h.token),
                                                         h.mount, h.path_prefix, h.namespace, h.verify_tls))
+
+        # Append global vault at the end so project credentials take priority
+        if getattr(settings, "use_global_vault", True):
+            global_path = Path(getattr(settings, "global_vault_path", "~/.portwright/credentials.vault")).expanduser()
+            global_key_env = getattr(settings, "global_master_key_env", "") or settings.master_key_env
+            global_vault = EncryptedFileVault(global_path, global_key_env, provider_name="global-vault")
+            # Only add if not already in the chain (avoids duplicates on reload)
+            if not any(getattr(p, "path", None) == global_path for p in providers):
+                providers.append(global_vault)
+
         return cls(providers, settings.cache_ttl_seconds)
+
+    @classmethod
+    def global_vault(cls, settings) -> "CredentialManager":
+        """Return a CredentialManager backed only by the global vault (for --global CLI ops)."""
+        global_path = Path(getattr(settings, "global_vault_path", "~/.portwright/credentials.vault")).expanduser()
+        global_key_env = getattr(settings, "global_master_key_env", "") or settings.master_key_env
+        provider = EncryptedFileVault(global_path, global_key_env, provider_name="global-vault")
+        return cls([provider], settings.cache_ttl_seconds)
 
     # -------------------------------------------------------------- reads
     def get(self, name: str, consumer: str | None = None) -> Credential:

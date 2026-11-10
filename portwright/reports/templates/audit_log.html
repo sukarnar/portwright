@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Audit Log – {{ report_name }}</title>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; font-size: 11px; color: #222; margin: 14mm 18mm; }
+  h1   { font-size: 16px; color: #333; border-bottom: 2px solid #c0392b; padding-bottom: 5px; }
+  .meta { color: #888; font-size: 10px; margin-bottom: 14px; }
+  table { border-spacing: 0; width: 100%; }
+  th { background: #c0392b; color: #fff; text-align: left; padding: 6px 8px; font-size: 10px; }
+  td { padding: 4px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
+  tr:nth-child(even) td { background: #fdf5f5; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 10px; font-weight: bold; }
+  .badge-create  { background: #d4edda; color: #155724; }
+  .badge-update  { background: #fff3cd; color: #856404; }
+  .badge-delete  { background: #f8d7da; color: #721c24; }
+  .badge-login   { background: #cce5ff; color: #004085; }
+  .badge-default { background: #e2e3e5; color: #383d41; }
+  .footer { margin-top: 16px; font-size: 9px; color: #aaa; text-align: right; border-top: 1px solid #eee; padding-top: 4px; }
+</style>
+</head>
+<body>
+
+<h1>Audit Log: {{ report_name | replace('-',' ') | replace('_',' ') | title }}</h1>
+<p class="meta">Generated: {{ generated_at | datetime }} &nbsp;|&nbsp; {{ row_count }} entries</p>
+
+{% if data %}
+<table>
+  <thead>
+    <tr>
+      <th>#</th>
+      {% for col in data[0].keys() %}
+      <th>{{ col | replace('_', ' ') | title }}</th>
+      {% endfor %}
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in data %}
+    <tr>
+      <td style="color:#aaa">{{ loop.index }}</td>
+      {% for col, value in row.items() %}
+      <td>
+        {% if col | lower in ('action', 'event', 'operation', 'type') %}
+          {% set v = value | lower | default_if_none('') %}
+          {% if 'create' in v or 'insert' in v or 'add' in v %}
+            <span class="badge badge-create">{{ value }}</span>
+          {% elif 'update' in v or 'edit' in v or 'modify' in v %}
+            <span class="badge badge-update">{{ value }}</span>
+          {% elif 'delete' in v or 'remove' in v %}
+            <span class="badge badge-delete">{{ value }}</span>
+          {% elif 'login' in v or 'auth' in v %}
+            <span class="badge badge-login">{{ value }}</span>
+          {% else %}
+            <span class="badge badge-default">{{ value }}</span>
+          {% endif %}
+        {% elif col | lower in ('timestamp', 'created_at', 'updated_at', 'date', 'time') %}
+          {{ value | datetime }}
+        {% else %}
+          {{ value | default_if_none('-') | truncate_col(60) }}
+        {% endif %}
+      </td>
+      {% endfor %}
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No audit entries found.</p>
+{% endif %}
+
+<p class="footer">{{ report_name }} &bull; {{ generated_at | strftime('%Y-%m-%d %H:%M UTC') }}</p>
+</body>
+</html>
+
+

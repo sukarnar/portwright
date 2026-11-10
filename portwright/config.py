@@ -14,6 +14,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .agents.spec import (AgentSpec, LlmModelSpec, McpServerSpec, SkillSpec, ToolSpec, WorkflowSpec)
+
 DEFAULT_CONFIG = "portwright.yaml"      # an existing restforge.yaml is used when this is missing
 _ENV_REF = re.compile(r"\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}")
 _CRED_REF = re.compile(r"\$\{CRED:([a-zA-Z][a-zA-Z0-9_\-]{0,63})\.([a-zA-Z_][a-zA-Z0-9_]{0,63})\}")
@@ -282,6 +284,10 @@ class CredentialSettings(BaseModel):
     cache_ttl_seconds: int = 300
     keyring_service: str = "restforge"     # kept: existing keyring entries live under this service
     hashicorp: HashiCorpVaultSettings = Field(default_factory=HashiCorpVaultSettings)
+    # Global (cross-project) vault — consulted after the project vault so project creds win
+    use_global_vault: bool = True
+    global_vault_path: str = "~/.portwright/credentials.vault"
+    global_master_key_env: str = "PORTWRIGHT_GLOBAL_KEY"  # falls back to master_key_env when unset
 
 
 class SecuritySettings(BaseModel):
@@ -294,6 +300,7 @@ class SecuritySettings(BaseModel):
     users: list[UserRecord] = Field(default_factory=list)
     allowed_callable_modules: list[str] = Field(default_factory=list)
     allowed_upstream_hosts: list[str] = Field(default_factory=list)
+    allowed_llm_hosts: list[str] = Field(default_factory=list)   # hosts LLM models may call
     data_root: str = "data"               # file sources are sandboxed here
     allowed_folders: list[str] = Field(default_factory=list)   # absolute / UNC folders a folder source may use
     cors_origins: list[str] = Field(default_factory=list)
@@ -459,6 +466,39 @@ class ServerSettings(BaseModel):
     ssl_keyfile: str | None = None
 
 
+# --------------------------------------------------------------------------- #
+# Reports  (Jinja2-templated PDF / HTML generation)
+# --------------------------------------------------------------------------- #
+
+class ReportFrom(BaseModel):
+    """Where the report pulls its data from."""
+    endpoint: str | None = None   # a GET endpoint name (all pages fetched automatically)
+    source: str | None = None     # a file or SQL source (direct read, no HTTP round-trip)
+    params: dict[str, Any] = Field(default_factory=dict)   # endpoint query/path params
+
+    @model_validator(mode="after")
+    def _one(self) -> "ReportFrom":
+        if bool(self.endpoint) == bool(self.source):
+            raise ValueError("report 'from' needs exactly one of 'endpoint' or 'source'")
+        return self
+
+
+class ReportSpec(BaseModel):
+    """Declaration of one PDF/HTML report."""
+    name: str = Field(pattern=_NAME)
+    description: str = ""
+    # Jinja2 template file path (relative to the project root, or absolute)
+    template: str
+    from_: ReportFrom = Field(alias="from")
+    # Output path; may contain Jinja2 expressions, e.g.
+    #   reports/output/{{ now | strftime('%Y-%m') }}-{{ report_name }}.pdf
+    output: str | None = None
+    # Extra variables injected into every template render
+    vars: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"populate_by_name": True}
+
+
 class ProjectConfig(BaseModel):
     project: str = "portwright-project"
     version: str = "1.0.0"
@@ -467,6 +507,14 @@ class ProjectConfig(BaseModel):
     sources: dict[str, SourceSpec] = Field(default_factory=dict)
     endpoints: list[EndpointSpec] = Field(default_factory=list)
     loads: list[LoadSpec] = Field(default_factory=list)
+    reports: list[ReportSpec] = Field(default_factory=list)
+    llm_models_include: list[str] = Field(default_factory=list)   # files/globs with more llm_models
+    llm_models: dict[str, LlmModelSpec] = Field(default_factory=dict)
+    tools: dict[str, ToolSpec] = Field(default_factory=dict)
+    skills: dict[str, SkillSpec] = Field(default_factory=dict)
+    agents: dict[str, AgentSpec] = Field(default_factory=dict)
+    workflows: dict[str, WorkflowSpec] = Field(default_factory=dict)
+    mcp_servers: dict[str, McpServerSpec] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _integrity(self) -> "ProjectConfig":
@@ -508,7 +556,83 @@ class ProjectConfig(BaseModel):
                 raise ValueError(f"duplicate route {ep.method} {ep.path}")
             seen_names.add(ep.name)
             seen_routes.add(route)
+        report_names: set[str] = set()
+        ep_names = {e.name for e in self.endpoints}
+        for rpt in self.reports:
+            if rpt.name in report_names:
+                raise ValueError(f"duplicate report name '{rpt.name}'")
+            report_names.add(rpt.name)
+            if rpt.from_.endpoint and rpt.from_.endpoint not in ep_names:
+                raise ValueError(
+                    f"report '{rpt.name}' reads unknown endpoint '{rpt.from_.endpoint}'"
+                )
+            if rpt.from_.source and rpt.from_.source not in self.sources:
+                raise ValueError(
+                    f"report '{rpt.name}' reads unknown source '{rpt.from_.source}'"
+                )
+        self._check_agents()
         return self
+
+    def _check_agents(self) -> None:
+        """References between tools, skills, agents, workflows and MCP servers.
+        Model names are checked at build time (they may live in included files)."""
+        for section in (self.llm_models, self.tools, self.skills, self.agents, self.workflows, self.mcp_servers):
+            for n in section:
+                if not re.match(_NAME, n):
+                    raise ValueError(f"invalid name '{n}' (letters, digits, - and _; start with a letter)")
+        eps = {e.name for e in self.endpoints}
+        for n, t in self.tools.items():
+            if t.type == "endpoint" and t.endpoint not in eps:
+                raise ValueError(f"tool '{n}' uses unknown endpoint '{t.endpoint}'")
+            if t.type == "source":
+                src = self.sources.get(t.source)
+                if src is None or src.type != "sql":
+                    raise ValueError(f"tool '{n}': '{t.source}' must be a SQL source")
+                if not t.read_only and src.read_only:
+                    raise ValueError(f"tool '{n}': source '{t.source}' is read-only; allow writes there first")
+            if t.type == "mcp" and t.server not in self.mcp_servers:
+                raise ValueError(f"tool '{n}' uses unknown MCP server '{t.server}'")
+        for n, a in self.agents.items():
+            for t in a.tools:
+                if t not in self.tools:
+                    raise ValueError(f"agent '{n}' uses unknown tool '{t}'")
+            for k in a.skills:
+                if k not in self.skills:
+                    raise ValueError(f"agent '{n}' uses unknown skill '{k}'")
+        for n, w in self.workflows.items():
+            ids = [st.id for st in w.steps]
+            if len(set(ids)) != len(ids):
+                raise ValueError(f"workflow '{n}': duplicate step ids")
+            for st in w.steps:
+                if st.type == "tool" and st.tool not in self.tools:
+                    raise ValueError(f"workflow '{n}' step '{st.id}': unknown tool '{st.tool}'")
+                if st.type == "agent" and st.agent not in self.agents:
+                    raise ValueError(f"workflow '{n}' step '{st.id}': unknown agent '{st.agent}'")
+                if st.type == "load" and st.load not in {x.name for x in self.loads}:
+                    raise ValueError(f"workflow '{n}' step '{st.id}': unknown load '{st.load}'")
+                if st.type == "foreach":
+                    if st.do == "tool" and st.tool not in self.tools:
+                        raise ValueError(f"workflow '{n}' step '{st.id}': unknown tool '{st.tool}'")
+                    if st.do == "agent" and st.agent not in self.agents:
+                        raise ValueError(f"workflow '{n}' step '{st.id}': unknown agent '{st.agent}'")
+                    if st.do == "load" and st.load not in {x.name for x in self.loads}:
+                        raise ValueError(f"workflow '{n}' step '{st.id}': unknown load '{st.load}'")
+                for tgt in (st.then, st.else_, st.next, st.default, *(st.cases or {}).values()):
+                    if tgt and tgt != "end" and tgt not in ids:
+                        raise ValueError(f"workflow '{n}' step '{st.id}': unknown target step '{tgt}'")
+        for n, m in self.mcp_servers.items():
+            for e in m.expose.endpoints:
+                if e not in eps:
+                    raise ValueError(f"MCP server '{n}' exposes unknown endpoint '{e}'")
+            for s in m.expose.sources:
+                src = self.sources.get(s.name)
+                if src is None or src.type != "sql":
+                    raise ValueError(f"MCP server '{n}': source '{s.name}' must be a SQL source")
+                if not s.read_only and src.read_only:
+                    raise ValueError(f"MCP server '{n}': source '{s.name}' is read-only")
+            for l in m.expose.loads:
+                if l not in {x.name for x in self.loads}:
+                    raise ValueError(f"MCP server '{n}' exposes unknown load '{l}'")
 
     # ------------------------------------------------------------------ io --
     @classmethod
@@ -533,3 +657,6 @@ class ProjectConfig(BaseModel):
 
     def endpoint(self, name: str) -> EndpointSpec | None:
         return next((e for e in self.endpoints if e.name == name), None)
+
+    def report(self, name: str) -> "ReportSpec | None":
+        return next((r for r in self.reports if r.name == name), None)

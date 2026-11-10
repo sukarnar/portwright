@@ -45,8 +45,8 @@ class HelpView:
         self.query = ""
         self.search = ft.TextField(hint_text="Search the guide", dense=True, prefix_icon=ft.Icons.SEARCH,
                                    on_change=self._search, on_submit=self._search)
-        self.nav = ft.Column(spacing=0, scroll=ft.ScrollMode.AUTO, expand=True)
-        self.page = ft.Column(spacing=12, scroll=ft.ScrollMode.AUTO, expand=True)
+        self.nav = ft.Column(spacing=0, scroll=ft.ScrollMode.ALWAYS, expand=True)
+        self.page = ft.Column(spacing=12, scroll=ft.ScrollMode.ALWAYS, expand=True)
         self.root = ft.Row([
             ft.Container(width=270, content=ft.Column([
                 ft.Text("Help", size=24, weight=ft.FontWeight.W_600),

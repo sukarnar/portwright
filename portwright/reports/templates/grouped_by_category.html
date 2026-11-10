@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>{{ report_name }}</title>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; font-size: 12px; color: #222; margin: 16mm 20mm; }
+  h1   { font-size: 18px; color: #1a4e8a; border-bottom: 2px solid #1a4e8a; padding-bottom: 5px; }
+  .meta { color: #888; font-size: 10px; margin-bottom: 18px; }
+  h2 { font-size: 13px; color: #1a4e8a; background: #eef2fa; padding: 5px 10px;
+       border-left: 4px solid #1a4e8a; margin: 20px 0 6px; }
+  table { border-spacing: 0; width: 100%; margin-bottom: 8px; }
+  th { background: #4a6ea8; color: #fff; text-align: left; padding: 5px 8px; font-size: 11px; }
+  td { padding: 4px 8px; border-bottom: 1px solid #e0e0e0; }
+  tr:nth-child(even) td { background: #f5f8fc; }
+  .subtotal td { font-weight: bold; background: #e8eef8 !important; font-size: 11px; }
+  .grand-total { margin-top: 16px; padding: 8px 12px; background: #1a4e8a; color: #fff;
+                 border-radius: 4px; font-weight: bold; font-size: 13px; }
+  .footer { margin-top: 18px; font-size: 9px; color: #aaa; text-align: right; border-top: 1px solid #e0e0e0; padding-top: 4px; }
+</style>
+</head>
+<body>
+
+<h1>{{ report_name | replace('-', ' ') | replace('_', ' ') | title }}</h1>
+<p class="meta">Generated: {{ generated_at | datetime }} &nbsp;|&nbsp; {{ row_count }} records</p>
+
+{% if data %}
+{# Group by the first column #}
+{% set group_col = data[0].keys() | list | first %}
+{% set detail_cols = data[0].keys() | list %}
+
+{% for group_key, group_rows in rows | groupby_col(group_col) %}
+<h2>{{ group_col | replace('_',' ') | title }}: {{ group_key | default_if_none('(none)') }}</h2>
+<table>
+  <thead>
+    <tr>
+      {% for col in detail_cols %}
+      <th>{{ col | replace('_', ' ') | title }}</th>
+      {% endfor %}
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in group_rows %}
+    <tr>
+      {% for value in row.values() %}
+      <td>{{ value | default_if_none('-') }}</td>
+      {% endfor %}
+    </tr>
+    {% endfor %}
+    <tr class="subtotal">
+      {% for col in detail_cols %}
+      <td>
+        {% if loop.first %}Subtotal ({{ group_rows | length }})
+        {% else %}{{ group_rows | sum_col(col) | number(2) if group_rows | sum_col(col) != 0.0 else '' }}
+        {% endif %}
+      </td>
+      {% endfor %}
+    </tr>
+  </tbody>
+</table>
+{% endfor %}
+
+{% else %}
+<p>No records found.</p>
+{% endif %}
+
+<p class="footer">{{ report_name }} &bull; {{ generated_at | strftime('%Y-%m-%d %H:%M UTC') }}</p>
+</body>
+</html>
+
+

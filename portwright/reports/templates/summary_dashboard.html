@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>{{ report_name }}</title>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; font-size: 12px; color: #222; margin: 16mm 20mm; }
+  h1   { font-size: 20px; color: #1a4e8a; border-bottom: 2px solid #1a4e8a; padding-bottom: 5px; }
+  .meta { color: #888; font-size: 10px; margin-bottom: 18px; }
+  .kpi-row { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
+  .kpi { background: #f0f4fb; border-left: 4px solid #1a4e8a; border-radius: 6px;
+         padding: 12px 20px; min-width: 140px; }
+  .kpi .label { font-size: 10px; color: #666; text-transform: uppercase; letter-spacing: .5px; }
+  .kpi .value { font-size: 22px; font-weight: bold; color: #1a4e8a; margin-top: 4px; }
+  h2 { font-size: 14px; color: #333; margin: 20px 0 8px; }
+  table { border-spacing: 0; width: 100%; }
+  th { background: #1a4e8a; color: #fff; text-align: left; padding: 6px 8px; font-size: 11px; }
+  td { padding: 5px 8px; border-bottom: 1px solid #e0e0e0; }
+  tr:nth-child(even) td { background: #f5f8fc; }
+  .total td { font-weight: bold; background: #e8eef8 !important; border-top: 2px solid #1a4e8a; }
+  .footer { margin-top: 18px; font-size: 9px; color: #aaa; text-align: right; border-top: 1px solid #e0e0e0; padding-top: 4px; }
+</style>
+</head>
+<body>
+
+<h1>{{ report_name | replace('-', ' ') | replace('_', ' ') | title }}</h1>
+<p class="meta">Generated: {{ generated_at | datetime }} &nbsp;|&nbsp; {{ row_count }} records</p>
+
+{% if data %}
+{# ---- KPI summary cards ---- #}
+{% set numeric_cols = [] %}
+{% for col in data[0].keys() %}
+  {% set sample = data[0][col] %}
+  {% if sample is number %}{% set _ = numeric_cols.append(col) %}{% endif %}
+{% endfor %}
+
+<div class="kpi-row">
+  <div class="kpi">
+    <div class="label">Total Records</div>
+    <div class="value">{{ row_count }}</div>
+  </div>
+  {% for col in numeric_cols[:3] %}
+  <div class="kpi">
+    <div class="label">{{ col | replace('_', ' ') | title }}</div>
+    <div class="value">{{ rows | sum_col(col) | number(2) }}</div>
+  </div>
+  {% endfor %}
+</div>
+
+{# ---- Detail table ---- #}
+<h2>Detail</h2>
+<table>
+  <thead>
+    <tr>
+      {% for col in data[0].keys() %}
+      <th>{{ col | replace('_', ' ') | title }}</th>
+      {% endfor %}
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in data %}
+    <tr>
+      {% for value in row.values() %}
+      <td>{{ value | default_if_none('-') }}</td>
+      {% endfor %}
+    </tr>
+    {% endfor %}
+    <tr class="total">
+      {% for col in data[0].keys() %}
+      <td>
+        {% if col in numeric_cols %}{{ rows | sum_col(col) | number(2) }}{% elif loop.first %}Total{% else %}&nbsp;{% endif %}
+      </td>
+      {% endfor %}
+    </tr>
+  </tbody>
+</table>
+{% else %}
+<p>No records found.</p>
+{% endif %}
+
+<p class="footer">{{ report_name }} &bull; {{ generated_at | strftime('%Y-%m-%d %H:%M UTC') }}</p>
+</body>
+</html>
+
+

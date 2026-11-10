@@ -455,14 +455,13 @@ def cred_add(
     description: str = "",
     vars_file: Optional[Path] = typer.Option(None, "--vars", help="Variables file: credentials.<name>.<field> "
                                                                   "values override --field (replay scripts)."),
+    global_vault: bool = typer.Option(False, "--global", help="Store in the global vault (~/.portwright/credentials.vault) shared across all projects."),
     config: str = CONFIG_OPT,
 ):
     """Store a credential. Secret fields are prompted with hidden input."""
     if type not in TYPES:
         raise typer.BadParameter(f"type must be one of {', '.join(TYPES)}")
     s = _svc(config)
-    if any(c["name"] == name for c in _run(s.credentials.list)):
-        _fail(Exception(f"credential '{name}' exists – use 'portwright cred rotate'"))
     if vars_file:
         from .services.migration import apply_vars
         over, _ = apply_vars("credential", name, {"fields": _kv(field)}, _run(_load_vars, vars_file))
@@ -470,23 +469,42 @@ def cred_add(
     fields = _collect_fields(type, field, secret_from_env)
     for k in secret:
         fields[k] = typer.prompt(k, hide_input=True, confirmation_prompt=True)
-    where = _run(s.credentials.add, name, type, fields, secret_fields=secret, expires_days=expires_days,
-                 provider=provider, description=description)
-    _ok(f"Credential '{name}' ({type}) stored in {where}")
+    if global_vault:
+        where = _run(s.credentials.add_global, name, type, fields, secret_fields=secret,
+                     expires_days=expires_days, description=description)
+        _ok(f"Credential '{name}' ({type}) stored in global vault")
+    else:
+        if any(c["name"] == name for c in _run(s.credentials.list)):
+            _fail(Exception(f"credential '{name}' exists – use 'portwright cred rotate'"))
+        where = _run(s.credentials.add, name, type, fields, secret_fields=secret, expires_days=expires_days,
+                     provider=provider, description=description)
+        _ok(f"Credential '{name}' ({type}) stored in {where}")
     typer.echo(f"Use it:  portwright source add <name> --type ... --credential {name}   "
                f"or  ${{CRED:{name}.<field>}}")
 
 
 @cred_app.command("list")
-def cred_list(config: str = CONFIG_OPT):
+def cred_list(
+    global_vault: bool = typer.Option(False, "--global", help="List global vault credentials instead."),
+    config: str = CONFIG_OPT,
+):
     """List credentials (metadata only – never secrets)."""
-    creds = _run(_svc(config).credentials.list)
-    if not creds:
-        typer.echo("No credentials yet. Add one with 'portwright cred add'.")
-    for c in creds:
-        state = {"expired": "EXPIRED", "never": ""}.get(c["expiry_state"], f"expires in {c['days_left']}d")
-        typer.echo(f"{c['name']:<20} {c['type']:<9} {c['provider']:<9} {state:<16} "
-                   f"fields={','.join(c['fields'])}  used-by={','.join(c['used_by']) or '-'}")
+    s = _svc(config)
+    if global_vault:
+        creds = _run(s.credentials.list_global)
+        if not creds:
+            typer.echo("No global credentials yet. Add one with 'portwright cred add --global'.")
+        for c in creds:
+            state = {"expired": "EXPIRED", "never": ""}.get(c["expiry_state"], f"expires in {c['days_left']}d")
+            typer.echo(f"{c['name']:<20} {c['type']:<9} global-vault {state:<16} fields={','.join(c['fields'])}")
+    else:
+        creds = _run(s.credentials.list)
+        if not creds:
+            typer.echo("No credentials yet. Add one with 'portwright cred add'.")
+        for c in creds:
+            state = {"expired": "EXPIRED", "never": ""}.get(c["expiry_state"], f"expires in {c['days_left']}d")
+            typer.echo(f"{c['name']:<20} {c['type']:<9} {c['provider']:<9} {state:<16} "
+                       f"fields={','.join(c['fields'])}  used-by={','.join(c['used_by']) or '-'}")
 
 
 @cred_app.command("show")
@@ -505,9 +523,10 @@ def cred_show(name: str, reveal: bool = typer.Option(False, "--reveal", help="Pr
 @cred_app.command("rotate")
 def cred_rotate(name: str,
                 field: list[str] = typer.Option([], "--field", "-f", help="Change a non-secret field KEY=VALUE."),
-                secret_from_env: list[str] = typer.Option([], "--secret-from-env"),
-                keep_secrets: bool = typer.Option(False, help="Only change the given --field values."),
-                expires_days: Optional[int] = None,
+                secret_from_env: list[str] = typer.Option([], "--secret-from-env",
+                                                          help="FIELD=ENV_VAR – read the new secret from the environment (CI)."),
+                keep_secrets: bool = typer.Option(False, help="Only change the given --field values; keep current secrets."),
+                expires_days: Optional[int] = typer.Option(None, help="Restart the rotation clock: expire in N days."),
                 config: str = CONFIG_OPT):
     """Replace a credential's secret(s). Running servers pick it up within cache_ttl_seconds
     and rebuild their connection pools – no restart needed."""
@@ -523,10 +542,27 @@ def cred_rotate(name: str,
 
 
 @cred_app.command("remove")
-def cred_remove(name: str, force: bool = typer.Option(False, "--force"), config: str = CONFIG_OPT):
+def cred_remove(
+    name: str,
+    force: bool = typer.Option(False, "--force"),
+    global_vault: bool = typer.Option(False, "--global", help="Remove from the global vault."),
+    config: str = CONFIG_OPT,
+):
     """Delete a credential (refuses while sources still use it, unless --force)."""
-    _run(_svc(config).credentials.remove, name, force)
-    _ok(f"Credential '{name}' removed")
+    s = _svc(config)
+    if global_vault:
+        _run(s.credentials.remove_global, name)
+        _ok(f"Global credential '{name}' removed")
+    else:
+        _run(s.credentials.remove, name, force)
+        _ok(f"Credential '{name}' removed")
+
+
+@cred_app.command("promote")
+def cred_promote(name: str, config: str = CONFIG_OPT):
+    """Move a project credential to the global vault so all projects can use it."""
+    _run(_svc(config).credentials.promote_to_global, name)
+    _ok(f"Credential '{name}' moved to global vault (~/.portwright/credentials.vault)")
 
 
 @cred_app.command("test")
@@ -540,7 +576,9 @@ def cred_test(name: str, url: Optional[str] = typer.Option(None, help="HTTP type
 
 
 @cred_app.command("rekey")
-def cred_rekey(passphrase: bool = typer.Option(False, "--passphrase"), config: str = CONFIG_OPT):
+def cred_rekey(passphrase: bool = typer.Option(False, "--passphrase",
+                                               help="Derive the new key from a passphrase you keep yourself."),
+               config: str = CONFIG_OPT):
     """Re-encrypt the vault under a new master key (key rotation)."""
     s = _svc(config)
     new = typer.prompt("New master passphrase", hide_input=True, confirmation_prompt=True) if passphrase else None
@@ -1096,6 +1134,118 @@ def load_rejects(run_id: str, last: int = typer.Option(20, "--limit", help="Rows
 
 
 
+# ----------------------------------------------------------------- reports
+report_app = typer.Typer(help="Generate HTML/PDF reports from Jinja2 templates.", no_args_is_help=True)
+app.add_typer(report_app, name="report")
+
+
+@report_app.command("add")
+def report_add(
+    name: str,
+    template: str = typer.Option(..., "--template", "-t", help="Path to the Jinja2 HTML template file."),
+    endpoint: Optional[str] = typer.Option(None, "--endpoint", "-e", help="Endpoint to pull data from."),
+    source: Optional[str] = typer.Option(None, "--source", "-s", help="Source to pull data from directly."),
+    output: Optional[str] = typer.Option(None, "--output", "-o",
+                                         help="Output path (Jinja2 expressions supported, e.g. reports/{{ now | strftime('%Y-%m') }}/sales)."),
+    description: str = "",
+    param: list[str] = typer.Option([], "--param", help="Default param KEY=VALUE (repeatable)."),
+    config: str = CONFIG_OPT,
+):
+    """Register a report definition in portwright.yaml."""
+    if not endpoint and not source:
+        raise typer.BadParameter("give --endpoint or --source")
+    if endpoint and source:
+        raise typer.BadParameter("give only one of --endpoint or --source")
+    cfg = _load(config)
+    if any(r.name == name for r in cfg.reports):
+        _fail(Exception(f"report '{name}' exists – remove it first with 'portwright report remove {name}'"))
+    from .config import ReportSpec, ReportFrom
+    spec = ReportSpec(
+        name=name,
+        description=description,
+        template=template,
+        **{"from": ReportFrom(endpoint=endpoint, source=source, params=_kv(param))},
+        output=output,
+    )
+    cfg.reports.append(spec)
+    _save(cfg, config)
+    _ok(f"Report '{name}' added (template: {template})")
+    typer.echo(f"Next: portwright report run {name}")
+
+
+@report_app.command("list")
+def report_list(config: str = CONFIG_OPT):
+    """List report definitions."""
+    items = _svc(config).reports.list()
+    if not items:
+        typer.echo("No reports yet. Add one with 'portwright report add'.")
+        return
+    for r in items:
+        typer.echo(f"{r['name']:<20} {r['from']:<32} {r['template']}")
+        if r["description"]:
+            typer.echo(f"  {r['description']}")
+
+
+@report_app.command("show")
+def report_show(name: str, config: str = CONFIG_OPT):
+    """Show a report definition."""
+    spec = _run(_svc(config).reports.get, name)
+    typer.echo(yaml.safe_dump(spec.model_dump(mode="json", by_alias=True, exclude_none=True), sort_keys=False))
+
+
+@report_app.command("run")
+def report_run(
+    name: str,
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Override the output path."),
+    html: bool = typer.Option(False, "--html", help="Produce HTML instead of PDF."),
+    param: list[str] = typer.Option([], "--param", "-p", help="NAME=VALUE params passed to the data source (repeatable)."),
+    var: list[str] = typer.Option([], "--var", help="NAME=VALUE extra template variable (repeatable)."),
+    open_: bool = typer.Option(False, "--open", help="Open the output file after rendering."),
+    config: str = CONFIG_OPT,
+):
+    """Render a report to PDF (or HTML with --html)."""
+    svc = _svc(config)
+    result = _run(svc.reports.run, name,
+                  output=output, as_html=html,
+                  params=_kv(param), extra_vars=_kv(var) if var else None)
+    _ok(f"Report '{name}' written to {result.output_path}  ({result.format}, {result.row_count} rows, {result.seconds}s)")
+    if open_:
+        import subprocess, sys
+        if sys.platform == "win32":
+            subprocess.Popen(["start", "", str(result.output_path)], shell=True)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(result.output_path)])
+        else:
+            subprocess.Popen(["xdg-open", str(result.output_path)])
+
+
+@report_app.command("template")
+def report_template(
+    name: str,
+    path: Optional[str] = typer.Option(None, "--path", help="Where to write the template (default: templates/<name>.html)."),
+    config: str = CONFIG_OPT,
+):
+    """Write a starter Jinja2 HTML template for a report."""
+    svc = _svc(config)
+    spec = _run(svc.reports.get, name)
+    dest_path = path or spec.template
+    out = _run(svc.reports.scaffold_template, name, dest_path)
+    _ok(f"Starter template written to {out}")
+    typer.echo("Edit it, then run:  portwright report run " + name + " --html   to preview before generating PDF.")
+
+
+@report_app.command("remove")
+def report_remove(name: str, config: str = CONFIG_OPT):
+    """Remove a report definition from portwright.yaml."""
+    cfg = _load(config)
+    before = len(cfg.reports)
+    cfg.reports = [r for r in cfg.reports if r.name != name]
+    if len(cfg.reports) == before:
+        _fail(Exception(f"no report '{name}' – see 'portwright report list'"))
+    _save(cfg, config)
+    _ok(f"Report '{name}' removed")
+
+
 # ------------------------------------------------------------------ users
 @user_app.command("add")
 def user_add(username: str, scope: list[str] = typer.Option([], "--scope"),
@@ -1262,6 +1412,290 @@ def studio(config: str = CONFIG_OPT,
            open_browser=not no_browser)
 
 
+
+
+# ----------------------------------------------------- agents, tools, workflows, MCP
+model_app = typer.Typer(help="LLM models agents call (OpenAI-compatible or Anthropic, with your own CA/client "
+                             "certificate and API-key credential).", no_args_is_help=True)
+tool_app = typer.Typer(help="Tools agents/workflows may call: endpoints, SQL sources, MCP servers.", no_args_is_help=True)
+skill_app = typer.Typer(help="Skills: markdown playbooks an agent reads on demand.", no_args_is_help=True)
+agent_app = typer.Typer(help="Agents: an LLM that uses tools and skills for up to N steps.", no_args_is_help=True)
+workflow_app = typer.Typer(help="Workflows: ordered tool / agent / condition steps.", no_args_is_help=True)
+mcp_app = typer.Typer(help="MCP servers: publish endpoints and SQL sources as MCP tools.", no_args_is_help=True)
+for _n, _a in (("model", model_app), ("tool", tool_app), ("skill", skill_app), ("agent", agent_app),
+               ("workflow", workflow_app), ("mcp", mcp_app)):
+    app.add_typer(_a, name=_n)
+
+
+def _list_kind(kind: str, config: str, cols: list[str]) -> None:
+    rows = _run(_svc(config).agents.list, kind)
+    if not rows:
+        typer.echo(f"No {kind}s yet.")
+    for r in rows:
+        typer.echo(f"{r['name']:<18}  " + "  ".join(f"{c}={r.get(c, '')}" for c in cols))
+
+
+def _remove_kind(kind: str, name: str, config: str) -> None:
+    _run(_svc(config).agents.remove, kind, name)
+    _ok(f"{kind.capitalize()} '{name}' removed")
+
+
+@model_app.command("list")
+def model_list(config: str = CONFIG_OPT):
+    """List models (inline and from llm_models_include files)."""
+    _list_kind("model", config, ["provider", "base_url", "model"])
+
+
+@model_app.command("add")
+def model_add(name: str, base_url: str = typer.Option(..., help="e.g. https://llm.corp.local/v1"),
+              model: str = typer.Option(..., help="Model/deployment name."),
+              provider: str = typer.Option("openai_compatible", help="openai_compatible | anthropic"),
+              credential: Optional[str] = typer.Option(None, help="bearer/api_key credential with the API key."),
+              ca_bundle: Optional[str] = typer.Option(None, help="PEM file of your corporate CA (project-relative)."),
+              client_cert: Optional[str] = typer.Option(None, help="Client certificate PEM for mutual TLS."),
+              client_key: Optional[str] = typer.Option(None, help="Client private key PEM."),
+              header: list[str] = typer.Option([], "--header", help="Extra header KEY=VALUE (may use ${CRED:..})."),
+              timeout: float = typer.Option(120, help="Seconds."), max_tokens: int = 4096,
+              replace: bool = typer.Option(False, help="Overwrite an existing model."), config: str = CONFIG_OPT):
+    """Define a model and allow its host in security.allowed_llm_hosts."""
+    from urllib.parse import urlsplit
+    svc = _svc(config)
+    tls = {k: v for k, v in (("ca_bundle", ca_bundle), ("client_cert", client_cert), ("client_key", client_key)) if v}
+    _run(svc.agents.set, "model", name, {"provider": provider, "base_url": base_url, "model": model,
+                                         "credential": credential, "headers": _kv(header), "tls": tls,
+                                         "timeout_seconds": timeout, "max_tokens": max_tokens}, replace)
+    host = urlsplit(base_url).hostname
+    sec = svc.project.config.security
+    if host and host not in sec.allowed_llm_hosts:
+        sec.allowed_llm_hosts.append(host)
+        _run(svc.project.save)
+    _ok(f"Model '{name}' saved. Check it with: portwright model test {name}")
+
+
+@model_app.command("test")
+def model_test(name: str, prompt: str = "Reply with the single word: ready", config: str = CONFIG_OPT):
+    """One real call: proves URL, certificates, API key and model name work."""
+    r = _run(_svc(config).agents.test_model, name, prompt)
+    _ok(f"{name}: {r['reply']!r} ({r['tokens']} tokens)")
+
+
+@model_app.command("remove")
+def model_remove(name: str, config: str = CONFIG_OPT):
+    """Remove an inline model."""
+    _remove_kind("model", name, config)
+
+
+@tool_app.command("list")
+def tool_list(config: str = CONFIG_OPT):
+    """List tools."""
+    _list_kind("tool", config, ["type", "endpoint", "source", "server"])
+
+
+@tool_app.command("add")
+def tool_add(name: str, type: str = typer.Option(..., "--type", "-t", help="endpoint | source | mcp"),
+             endpoint: Optional[str] = None, source: Optional[str] = None,
+             server: Optional[str] = typer.Option(None, help="type mcp: an MCP server name."),
+             write: bool = typer.Option(False, help="type source: allow non-SELECT statements (writable source)."),
+             max_rows: int = typer.Option(200, help="type source: rows returned per call."),
+             description: str = "", replace: bool = False, config: str = CONFIG_OPT):
+    """Define a tool (endpoint: API call through the full pipeline; source: SQL; mcp: an MCP server's tools)."""
+    _run(_svc(config).agents.set, "tool", name, {"type": type, "endpoint": endpoint, "source": source,
+                                                 "server": server, "read_only": not write, "max_rows": max_rows,
+                                                 "description": description}, replace)
+    _ok(f"Tool '{name}' saved")
+
+
+@tool_app.command("remove")
+def tool_remove(name: str, config: str = CONFIG_OPT):
+    """Remove a tool (refuses while an agent or workflow uses it)."""
+    _remove_kind("tool", name, config)
+
+
+@skill_app.command("list")
+def skill_list(config: str = CONFIG_OPT):
+    """List skills."""
+    _list_kind("skill", config, ["file", "description"])
+
+
+@skill_app.command("add")
+def skill_add(name: str, file: str = typer.Option(..., help="Markdown file inside the project, e.g. skills/audit.md"),
+              description: str = "", replace: bool = False, config: str = CONFIG_OPT):
+    """Register a skill file (optional front-matter: description)."""
+    svc = _svc(config)
+    _run(svc.agents.set, "skill", name, {"file": file, "description": description}, replace)
+    for problem in svc.agents.validate():
+        if problem.startswith(f"skill '{name}'"):
+            _warn(problem)
+    _ok(f"Skill '{name}' saved")
+
+
+@skill_app.command("remove")
+def skill_remove(name: str, config: str = CONFIG_OPT):
+    """Remove a skill."""
+    _remove_kind("skill", name, config)
+
+
+@agent_app.command("list")
+def agent_list(config: str = CONFIG_OPT):
+    """List agents."""
+    _list_kind("agent", config, ["model", "max_steps", "tools", "skills"])
+
+
+@agent_app.command("add")
+def agent_add(name: str, model: str = typer.Option(..., help="A model name (see 'portwright model list')."),
+              instructions: str = typer.Option("", help="System prompt."),
+              tool: list[str] = typer.Option([], "--tool", help="Tool the agent may use (repeatable)."),
+              skill: list[str] = typer.Option([], "--skill", help="Skill the agent may read (repeatable)."),
+              scope: list[str] = typer.Option([], "--scope", help="Scope of the principal used for tool calls."),
+              max_steps: int = typer.Option(8, help="Hard cap on model calls."),
+              budget: Optional[int] = typer.Option(None, help="Stop after this many total tokens."),
+              timeout: float = typer.Option(300, help="Seconds."), description: str = "",
+              replace: bool = False, config: str = CONFIG_OPT):
+    """Define an agent."""
+    _run(_svc(config).agents.set, "agent", name, {
+        "model": model, "instructions": instructions, "tools": tool, "skills": skill, "scopes": scope,
+        "max_steps": max_steps, "max_tokens_budget": budget, "timeout_seconds": timeout,
+        "description": description}, replace)
+    _ok(f"Agent '{name}' saved. Run it: portwright agent run {name} \"your task\"")
+
+
+@agent_app.command("show")
+def agent_show(name: str, config: str = CONFIG_OPT):
+    """Show an agent definition."""
+    spec = _run(_svc(config).agents.get, "agent", name)
+    typer.echo(yaml.safe_dump(spec.model_dump(mode="json", exclude_none=True), sort_keys=False))
+
+
+@agent_app.command("remove")
+def agent_remove(name: str, config: str = CONFIG_OPT):
+    """Remove an agent."""
+    _remove_kind("agent", name, config)
+
+
+@agent_app.command("run")
+def agent_run(name: str, task: str = typer.Argument(..., help="What the agent should do."),
+              verbose: bool = typer.Option(False, "--verbose", "-v", help="Show every step and tool call."),
+              as_json: bool = typer.Option(False, "--json", help="Print the full result as JSON."),
+              config: str = CONFIG_OPT):
+    """Run an agent on a task. The trace is saved under .portwright/agent_runs/."""
+    r = _run(_svc(config).agents.run_agent, name, task)
+    if as_json:
+        typer.echo(json.dumps(r.to_dict(), indent=2, default=str))
+    else:
+        if verbose:
+            for st in r.steps:
+                for c in st.tool_calls:
+                    typer.echo(f"  step {st.n}: {c.name}({json.dumps(c.arguments, default=str)}) -> "
+                               f"{'ok' if c.ok else 'ERROR'} {c.result[:120]}")
+        typer.echo(r.answer)
+        typer.secho(f"[{r.stopped_by} - {len(r.steps)} step(s) - {r.tokens} tokens - run {r.run_id}]", dim=True)
+    if not r.ok:
+        _fail(Exception(r.error or f"agent stopped: {r.stopped_by}"))
+
+
+@agent_app.command("runs")
+def agent_runs(limit: int = 20, config: str = CONFIG_OPT):
+    """Recent agent and workflow runs."""
+    for r in _run(_svc(config).agents.runs, limit):
+        typer.echo(f"{r['run_id']}  {r['kind']:<8} {r['name']:<18} {r['stopped_by']}  tokens={r['tokens']}")
+
+
+@workflow_app.command("list")
+def workflow_list(config: str = CONFIG_OPT):
+    """List workflows."""
+    for r in _run(_svc(config).agents.list, "workflow"):
+        typer.echo(f"{r['name']:<18} steps={','.join(s['id'] for s in r['steps'])}")
+
+
+@workflow_app.command("add")
+def workflow_add(name: str, file: Path = typer.Option(..., help="YAML file with the workflow (steps: [...])."),
+                 replace: bool = False, config: str = CONFIG_OPT):
+    """Define a workflow from a YAML file."""
+    try:
+        data = yaml.safe_load(file.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        _fail(exc)
+    _run(_svc(config).agents.set, "workflow", name, data, replace)
+    _ok(f"Workflow '{name}' saved")
+
+
+@workflow_app.command("templates")
+def workflow_templates(name: str = typer.Argument(None, help="Show this template as YAML (omit to list them).")):
+    """List ready-made workflow templates, or print one as YAML to save and edit (workflow add NAME --file ...)."""
+    from .agents.templates import list_templates, template_yaml
+    if name:
+        if name not in {t["id"] for t in list_templates()}:
+            _fail(Exception(f"no template '{name}' (see: workflow templates)"))
+        typer.echo(template_yaml(name))
+        return
+    for t in list_templates():
+        typer.echo(f"{t['id']:<22} {t['title']}")
+        typer.echo(f"{'':<22} {t['description']}  [{t['tools']} tool, {t['agents']} agent step(s)]")
+
+
+@workflow_app.command("run")
+def workflow_run(name: str, input: list[str] = typer.Option([], "--input", "-i", help="Workflow input KEY=VALUE."),
+                 as_json: bool = typer.Option(False, "--json"), config: str = CONFIG_OPT):
+    """Run a workflow; ${input.KEY} in its steps reads the --input values."""
+    r = _run(_svc(config).agents.run_workflow, name, _kv(input))
+    if as_json:
+        typer.echo(json.dumps(r.to_dict(), indent=2, default=str))
+    else:
+        for s in r.steps:
+            typer.echo(f"  {s.id:<14} {s.type:<9} {'ok' if s.ok else 'FAILED ' + s.error}")
+        out = r.output if isinstance(r.output, str) else json.dumps(r.output, indent=2, default=str)
+        typer.echo(out)
+        typer.secho(f"[{r.status} - run {r.run_id}]", dim=True)
+    if not r.ok:
+        _fail(Exception(r.error))
+
+
+@workflow_app.command("remove")
+def workflow_remove(name: str, config: str = CONFIG_OPT):
+    """Remove a workflow."""
+    _remove_kind("workflow", name, config)
+
+
+@mcp_app.command("list")
+def mcp_list(config: str = CONFIG_OPT):
+    """List MCP server definitions."""
+    _list_kind("mcp", config, ["transport", "scopes"])
+
+
+@mcp_app.command("add")
+def mcp_add(name: str, endpoint: list[str] = typer.Option([], "--endpoint", help="Endpoint to expose (repeatable)."),
+            source: list[str] = typer.Option([], "--source", help="SQL source to expose (repeatable)."),
+            table: list[str] = typer.Option([], "--table", help="Table the exposed sources may be queried on."),
+            load: list[str] = typer.Option([], "--load", help="Load to expose as run_load_<name>."),
+            scope: list[str] = typer.Option([], "--scope", help="Scope of the principal used for tool calls."),
+            transport: str = typer.Option("stdio", help="stdio | http"), description: str = "",
+            replace: bool = False, config: str = CONFIG_OPT):
+    """Define an MCP server. Sources are read-only; --table limits what can be queried."""
+    _run(_svc(config).agents.set, "mcp", name, {
+        "description": description, "transport": transport, "scopes": scope,
+        "expose": {"endpoints": endpoint, "loads": load,
+                   "sources": [{"name": s, "tables": table, "read_only": True} for s in source]}}, replace)
+    _ok(f"MCP server '{name}' saved. See its tools: portwright mcp tools {name}")
+
+
+@mcp_app.command("tools")
+def mcp_tools_cmd(name: str, config: str = CONFIG_OPT):
+    """Tools the server publishes."""
+    for t in _run(_svc(config).agents.mcp_tools, name):
+        typer.echo(f"{t['tool']:<28} {t['kind']:<9} {t['description']}")
+
+
+@mcp_app.command("serve")
+def mcp_serve(name: str, transport: Optional[str] = typer.Option(None, help="stdio | http (default: the definition)"),
+              host: str = "127.0.0.1", port: int = 8765, config: str = CONFIG_OPT):
+    """Run the MCP server. stdio: launched by an MCP client. http: every request needs an API key header."""
+    _run(_svc(config).agents.serve_mcp, name, transport, host, port)
+
+
+@mcp_app.command("remove")
+def mcp_remove(name: str, config: str = CONFIG_OPT):
+    """Remove an MCP server definition."""
+    _remove_kind("mcp", name, config)
 
 
 @app.command()

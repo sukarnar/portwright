@@ -15,7 +15,7 @@ class SourcesView:
 
     def __init__(self, ctx: Ctx):
         self.ctx = ctx
-        self.root = ft.Column(expand=True, scroll=ft.ScrollMode.AUTO, spacing=16)
+        self.root = ft.Column(expand=True, scroll=ft.ScrollMode.ALWAYS, spacing=16)
         self.picker = ft.FilePicker()
 
     def build(self) -> ft.Control:

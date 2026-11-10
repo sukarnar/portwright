@@ -36,10 +36,13 @@ class Ctx:
     def dialog(self, title: str, body: list[ft.Control], actions: list[ft.Control], width: int = 560,
                modal: bool = True, scroll: bool = True) -> ft.AlertDialog:
         """scroll=False for short bodies: a scrolling column takes the full dialog height."""
+        pw = getattr(self.page, "width", None)                # never wider than the window
+        if isinstance(pw, (int, float)) and pw:
+            width = int(max(320, min(width, pw - 96)))
         dlg = ft.AlertDialog(
             modal=modal, title=ft.Text(title, weight=ft.FontWeight.W_600),
             content=ft.Container(width=width, content=ft.Column(
-                body, tight=True, scroll=ft.ScrollMode.AUTO if scroll else None, spacing=12,
+                body, tight=True, scroll=ft.ScrollMode.ALWAYS if scroll else None, spacing=12,
                 horizontal_alignment=ft.CrossAxisAlignment.STRETCH)),
             actions=actions, actions_alignment=ft.MainAxisAlignment.END)
         self.page.show_dialog(dlg)

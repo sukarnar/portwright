@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "portwright"
-version = "0.7.0"
+version = "0.8.0"
 description = "Portwright – secure REST endpoints and data loads over SQL databases, files, upstream APIs and Python callables"
 authors = [{ name = "Sukarna Chinchod" }]
 requires-python = ">=3.11"
@@ -27,8 +27,10 @@ postgres = ["psycopg[binary]>=3.1"]
 mysql = ["pymysql>=1.1"]
 mssql = ["pyodbc>=5"]
 oracle = ["oracledb>=2.0"]
+agents = ["mcp>=1.2"]       # MCP servers (agents themselves need no extra package)
 keyring = ["keyring>=25"]   # Windows Credential Manager / macOS Keychain
 gui = ["flet==1.0.4", "flet-desktop==1.0.4", "flet-web==1.0.4"]   # portwright studio
+reports = ["jinja2>=3.1", "weasyprint>=62"]   # HTML/PDF report generation
 dev = ["pytest>=8"]
 
 [project.scripts]
@@ -40,4 +42,4 @@ restforge = "portwright.cli:app"          # old name, kept so existing scripts a
 include = ["portwright*", "restforge"]
 
 [tool.setuptools.package-data]
-portwright = ["static/swagger/*", "docs/*.md"]
+portwright = ["static/swagger/*", "docs/*.md", "reports/templates/*.html"]

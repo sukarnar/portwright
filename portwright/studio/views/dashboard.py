@@ -11,7 +11,7 @@ class DashboardView:
 
     def __init__(self, ctx: Ctx):
         self.ctx = ctx
-        self.root = ft.Column(expand=True, scroll=ft.ScrollMode.AUTO, spacing=20)
+        self.root = ft.Column(expand=True, scroll=ft.ScrollMode.ALWAYS, spacing=20)
         self.validation = ft.Column(spacing=6)
 
     def build(self) -> ft.Control:

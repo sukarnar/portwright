@@ -42,7 +42,7 @@ class EndpointsView:
 
     def __init__(self, ctx: Ctx):
         self.ctx = ctx
-        self.root = ft.Column(expand=True, scroll=ft.ScrollMode.AUTO, spacing=16)
+        self.root = ft.Column(expand=True, scroll=ft.ScrollMode.ALWAYS, spacing=16)
         self.editor = None
 
     def build(self) -> ft.Control:

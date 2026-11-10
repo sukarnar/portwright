@@ -65,7 +65,8 @@ def get(slug: str) -> Topic:
 def for_screen(screen: str) -> str:
     """The topic that documents a Studio screen."""
     first = {"dashboard": "getting-started", "sources": "sources", "credentials": "credentials",
-             "endpoints": "endpoints", "loads": "loads", "access": "security"}
+             "endpoints": "endpoints", "loads": "loads", "access": "security",
+             "reports": "reports"}
     return first.get(screen, "getting-started")
 
 

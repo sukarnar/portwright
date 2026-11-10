@@ -2,17 +2,19 @@
 
 Every operation lives here once; front-ends only collect input and display results.
 """
+from .agents import AgentService
 from .catalog import EndpointService, SourceService, TestResult
 from .migration import ConfigObjects, MigrationService, load_vars
 from .loads import Check, Inspection, LoadService, Suggestion, TargetColumn
 from .project import Project, ServiceError, load_dotenv, set_env_line
 from .runtime import CallResult, RuntimeService, Validation
 from .security import AccessService, CredentialService, NewKey, expiry_state
+from ..reports import ReportService
 
 __all__ = ["Project", "ServiceError", "load_dotenv", "set_env_line", "SourceService", "EndpointService",
            "TestResult", "CredentialService", "AccessService", "NewKey", "expiry_state", "RuntimeService",
            "Validation", "CallResult", "LoadService", "Inspection", "Check", "Suggestion",
-           "TargetColumn", "Services", "MigrationService", "ConfigObjects", "load_vars"]
+           "TargetColumn", "AgentService", "Services", "MigrationService", "ConfigObjects", "load_vars", "ReportService"]
 
 
 class Services:
@@ -28,6 +30,8 @@ class Services:
         self.loads = LoadService(project)
         self.migration = MigrationService(project)
         self.objects = self.migration.objects
+        self.reports = ReportService(project)
+        self.agents = AgentService(project)
 
     @classmethod
     def open(cls, config_path, actor: str = "cli") -> "Services":
