@@ -58,8 +58,10 @@ def _resolve_output_path(template: str, now: datetime, **extra: Any) -> str:
 
 
 def template_context(data: list[dict] | dict, *, report_name: str = "",
-                     extra_vars: dict[str, Any] | None = None, now: datetime | None = None) -> dict[str, Any]:
-    """The variables every report template sees."""
+                     extra_vars: dict[str, Any] | None = None, now: datetime | None = None,
+                     datasets: dict[str, list[dict]] | None = None) -> dict[str, Any]:
+    """The variables every report template sees. ``datasets`` holds every dataset's rows by name, plus
+    ``master`` (the same rows as ``rows``); attached datasets also appear on their parent rows."""
     now = now or datetime.now(timezone.utc)
     rows: list[dict] = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
     record: dict = rows[0] if rows and len(rows) == 1 else {}
@@ -72,6 +74,7 @@ def template_context(data: list[dict] | dict, *, report_name: str = "",
         "report_name": report_name,
         "generated_at": now,
         "now": now,
+        "datasets": {"master": rows, **(datasets or {})},
         "vars": ev,             # accessible as vars.key or vars['key'] in templates
         **ev,                   # also flat: {{ company_name }} works too
     }
@@ -94,11 +97,12 @@ def render_html(
     extra_vars: dict[str, Any] | None = None,
     report_name: str = "",
     now: datetime | None = None,
+    datasets: dict[str, list[dict]] | None = None,
 ) -> str:
     """Render a Jinja2 HTML template with report data, returning the HTML string."""
     tpl_path = resolve_template_path(template_path, project_root)
     env = _jinja_env(tpl_path.parent)
-    ctx = template_context(data, report_name=report_name, extra_vars=extra_vars, now=now)
+    ctx = template_context(data, report_name=report_name, extra_vars=extra_vars, now=now, datasets=datasets)
     try:
         tmpl = env.get_template(tpl_path.name)
     except Exception as exc:

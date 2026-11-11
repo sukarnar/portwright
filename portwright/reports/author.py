@@ -112,7 +112,8 @@ def parse_reply(text: str) -> tuple[dict | None, str]:
 
 
 def check_template(text: str, rows: list[dict], *, vars: dict | None = None, formats: list[str] = (),
-                   report_name: str = "report") -> tuple[list[str], list[str]]:
+                   report_name: str = "report", datasets: dict[str, list[dict]] | None = None
+                   ) -> tuple[list[str], list[str]]:
     """(errors, warnings) for a candidate template. Renders only in the sandbox and in a temp folder."""
     from .engine import _jinja_env, render_pdf, template_context
     errors: list[str] = []
@@ -132,9 +133,11 @@ def check_template(text: str, rows: list[dict], *, vars: dict | None = None, for
         except Exception as exc:                                    # noqa: BLE001 - syntax errors of any kind
             return [f"Jinja2 syntax error: {exc}"], warnings
         html = ""
-        for label, data in (("the sample rows", rows), ("no rows", [])):
+        empty = {n: [] for n in (datasets or {})}
+        for label, data, sets in (("the sample rows", rows, datasets), ("no rows", [], empty)):
             try:
-                out = tmpl.render(**template_context(data, report_name=report_name, extra_vars=vars or None))
+                out = tmpl.render(**template_context(data, report_name=report_name, extra_vars=vars or None,
+                                                     datasets=sets))
             except Exception as exc:                                # noqa: BLE001
                 errors.append(f"rendering with {label} failed: {type(exc).__name__}: {exc}")
                 continue
@@ -216,6 +219,73 @@ class ReportAuthor:
         rows, _ = ReportService(self._p)._fetch(probe, dict(params or {}))
         return rows
 
+    def _gather(self, name: str, existing: ReportSpec | None, frm: ReportFrom, params: dict | None,
+                limits: dict[str, int]) -> tuple[list[dict], dict[str, list[dict]]]:
+        """Sample rows of the master and of each dataset the report defines (``limits`` per dataset)."""
+        if not existing or not existing.datasets:
+            return self._sample(name, frm, params, limits["master"]), {}
+        from .service import ReportService
+        svc = ReportService(self._p)
+        master, _ = svc._read_from(name, "master", frm.model_copy(update={"max_rows": max(1, limits["master"])}),
+                                   dict(params or {}), also_used=svc._dataset_params(existing))
+        sets = {}
+        for n, ds in existing.datasets.items():
+            sets[n], _ = svc._read_from(name, n, ds.from_.model_copy(update={"max_rows": max(1, limits[n])}),
+                                        dict(params or {}))
+        return master, sets
+
+    def _policies(self, model_name: str, model_spec, frm: ReportFrom | None, existing: ReportSpec | None,
+                  data_access: str | None, sample_rows: int | None) -> dict[str, "pol.Policy"]:
+        """One policy per dataset ('master' first): each is limited by its own source."""
+        froms = [("master", frm)] + [(n, ds.from_) for n, ds in ((existing.datasets if existing else {}) or {}).items()]
+        out = {}
+        for n, f in froms:
+            try:
+                out[n] = pol.resolve(self.cfg, model_spec=model_spec, model_name=model_name,
+                                     source=pol.source_of(self.cfg, f), report=existing, override=data_access,
+                                     sample_rows=sample_rows)
+            except ValueError as exc:
+                raise _err(str(exc)) from None
+        closed = [n for n, p in out.items() if not p.allowed]
+        if closed:
+            what = ", ".join("the master rows" if n == "master" else f"dataset '{n}'" for n in closed)
+            raise _err(f"AI authoring is not allowed for {what}: {out[closed[0]].explain()}. "
+                       "Write the template by hand.")
+        return out
+
+    @staticmethod
+    def _payload(spec: ReportSpec | None, master: list[dict], sets: dict[str, list[dict]],
+                 policies: dict[str, "pol.Policy"]) -> tuple[dict, list[str], int]:
+        """The data section of the prompt (each dataset shaped by its own policy), columns sent, rows sent."""
+        data = pol.payload(master, policies["master"])
+        cols = [c["name"] for c in data["columns"]]
+        rows = len(data.get("rows", []))
+        if spec is not None and sets:
+            data["datasets"] = {}
+            for n, ds in spec.datasets.items():
+                p = pol.payload(sets.get(n, []), policies[n])
+                entry: dict[str, Any] = {"description": ds.description} if ds.description else {}
+                if ds.attach:
+                    key, pkey = ds.attach.keys()
+                    entry["attached"] = {"to": ds.attach.to, "as": ds.attach.as_ or n, "one": ds.attach.one,
+                                         "key": key, "parent_key": pkey}
+                data["datasets"][n] = {**entry, **p}
+                cols += [f"{n}.{c['name']}" for c in p["columns"]]
+                rows += len(p.get("rows", []))
+        return data, cols, rows
+
+    @staticmethod
+    def _joined(spec: ReportSpec | None, master: list[dict], sets: dict[str, list[dict]]):
+        """The sample as a template sees it: datasets attached to their parents."""
+        if spec is None or not spec.datasets:
+            return master, {}
+        from .datasets import DatasetError, join
+        try:
+            m, s, _ = join(spec, master, sets)
+        except DatasetError as exc:
+            raise _err(str(exc)) from None
+        return m, s
+
     def _audit(self, **event) -> None:
         try:
             from ..security.audit import AuditLogger
@@ -254,19 +324,16 @@ class ReportAuthor:
                            "use --force to replace it (the old one is kept in .history)")
 
         model_name, model_spec = self._model(model)
-        try:
-            policy = pol.resolve(self.cfg, model_spec=model_spec, model_name=model_name,
-                                 source=pol.source_of(self.cfg, frm), report=existing, override=data_access,
-                                 sample_rows=sample_rows)
-        except ValueError as exc:
-            raise _err(str(exc)) from None
-        if not policy.allowed:
-            raise _err(f"AI authoring is not allowed for this data: {policy.explain()}. Write the template by hand.")
-        local = list(rows) if rows is not None else self._sample(name, frm, params, pol.fetch_limit(policy))
+        policies = self._policies(model_name, model_spec, frm, existing, data_access, sample_rows)
+        policy = min(policies.values(), key=lambda p: pol.DATA_ACCESS_ORDER.index(p.level))   # strictest, for the record
+        limits = {n: pol.fetch_limit(p) for n, p in policies.items()}
+        if rows is not None:
+            local, sets = list(rows), {}
+        else:
+            local, sets = self._gather(name, existing, frm, params, limits)
         local = [r if isinstance(r, dict) else {"value": r} for r in local]
-        data = pol.payload(local, policy)
-        sent_cols = [c["name"] for c in data["columns"]]
-        rows_sent = len(data.get("rows", []))
+        data, sent_cols, rows_sent = self._payload(existing, local, sets, policies)
+        joined, joined_sets = self._joined(existing, local, sets)
 
         user: dict[str, Any] = {
             "request": prompt.strip(), "report_name": name, "formats": fmts,
@@ -289,8 +356,8 @@ class ReportAuthor:
                 if reply is None:
                     last_errors = [problem]
                 else:
-                    last_errors, warnings = check_template(reply["template"], local, vars=reply.get("vars"),
-                                                           formats=fmts, report_name=name)
+                    last_errors, warnings = check_template(reply["template"], joined, vars=reply.get("vars"),
+                                                           formats=fmts, report_name=name, datasets=joined_sets)
                 if not last_errors:
                     break
                 if attempt < self.cfg.report_ai.max_repairs:
@@ -315,8 +382,10 @@ class ReportAuthor:
                 "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "data_access": policy.level, "limits": policy.reasons, "columns_sent": sent_cols,
                 "rows_sent": rows_sent, "excluded_columns": policy.exclude,
-                "schema_hash": hashlib.sha256(json.dumps([(c["name"], c["type"]) for c in data["columns"]])
-                                              .encode()).hexdigest()[:16],
+                "schema_hash": hashlib.sha256(json.dumps(
+                    [(c["name"], c["type"]) for c in data["columns"]]
+                    + [(f"{n}.{c['name']}", c["type"]) for n, d in (data.get("datasets") or {}).items()
+                       for c in d["columns"]]).encode()).hexdigest()[:16],
                 "repairs": repairs, "draft": True}
         self._register(name, existing, frm, fmts, reply, prov)
         self._audit(outcome="saved", template=self._rel(target), **outcome)
@@ -344,8 +413,11 @@ class ReportAuthor:
         if target.exists() and if_exists == "error":
             raise _err(f"an AI template for '{name}' already exists; pass overwrite to replace it")
         fmts = list(formats or (existing.effective_formats() if existing else ["pdf", "html"]))
-        rows = self._sample(name, frm, None, 20)
-        errors, warnings = check_template(template, rows, vars=vars, formats=fmts, report_name=name)
+        master, sets = self._gather(name, existing, frm, None,
+                                    {"master": 20, **{n: 20 for n in (existing.datasets if existing else {})}})
+        rows, joined_sets = self._joined(existing, master, sets)
+        errors, warnings = check_template(template, rows, vars=vars, formats=fmts, report_name=name,
+                                          datasets=joined_sets)
         if errors:
             raise _err("the template fails these checks: " + "; ".join(errors[:5]))
         self._write_template(target, template)
@@ -366,18 +438,13 @@ class ReportAuthor:
         if frm is None:
             raise _err("give a report name or 'from' (an endpoint, or a SQL source and query)")
         model_name, model_spec = self._model(model)
-        try:
-            policy = pol.resolve(self.cfg, model_spec=model_spec, model_name=model_name,
-                                 source=pol.source_of(self.cfg, frm), report=existing, override=data_access,
-                                 sample_rows=sample_rows)
-        except ValueError as exc:
-            raise _err(str(exc)) from None
-        if not policy.allowed:
-            raise _err(f"this data is closed to AI: {policy.explain()}")
-        rows = self._sample(name or "sample", frm, params, pol.fetch_limit(policy))
-        data = pol.payload(rows, policy)
-        self._audit(outcome="sampled", report=name, model=model_name, data_access=policy.level,
-                    columns_sent=[c["name"] for c in data["columns"]], rows_sent=len(data.get("rows", [])))
+        policies = self._policies(model_name, model_spec, frm, existing, data_access, sample_rows)
+        master, sets = self._gather(name or "sample", existing, frm, params,
+                                    {n: pol.fetch_limit(p) for n, p in policies.items()})
+        data, cols, rows_sent = self._payload(existing, master, sets, policies)
+        level = min((p.level for p in policies.values()), key=pol.DATA_ACCESS_ORDER.index)
+        self._audit(outcome="sampled", report=name, model=model_name, data_access=level,
+                    columns_sent=cols, rows_sent=rows_sent)
         return data
 
     def _base_text(self, base: str) -> str:

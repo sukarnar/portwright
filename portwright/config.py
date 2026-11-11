@@ -496,13 +496,60 @@ class ReportFrom(BaseModel):
         return self
 
 
+_DATASET_NAME = r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$"
+# Names a dataset may not take: "master" means the report's own rows, the rest are template variables.
+RESERVED_DATASETS = {"master", "data", "rows", "record", "row_count", "report_name", "generated_at", "now",
+                     "vars", "datasets"}
+
+
+class ReportAttach(BaseModel):
+    """Hang a dataset's rows on its parent's rows: each parent row gets a list (or one row) under ``as``.
+
+    Keys are compared as text after number normalisation, so 7, 7.0, Decimal('7') and "7" match across
+    databases and files. ``key`` / ``parent_key`` may be lists for composite keys."""
+    to: str = "master"                       # "master" or another dataset (multi-level: order → line → serial)
+    key: str | list[str]                     # column(s) in this dataset
+    parent_key: str | list[str]              # matching column(s) in the parent
+    as_: str | None = Field(None, alias="as", pattern=_DATASET_NAME)   # field on the parent row; default: dataset name
+    one: bool = False                        # a lookup: one row (or null) instead of a list
+
+    model_config = {"populate_by_name": True}
+
+    @model_validator(mode="after")
+    def _keys(self) -> "ReportAttach":
+        k = [self.key] if isinstance(self.key, str) else list(self.key)
+        p = [self.parent_key] if isinstance(self.parent_key, str) else list(self.parent_key)
+        if not k or len(k) != len(p) or not all(k) or not all(p):
+            raise ValueError("attach needs 'key' and 'parent_key' with the same number of columns")
+        return self
+
+    def keys(self) -> tuple[list[str], list[str]]:
+        k = [self.key] if isinstance(self.key, str) else list(self.key)
+        p = [self.parent_key] if isinstance(self.parent_key, str) else list(self.parent_key)
+        return k, p
+
+
+class ReportDataset(BaseModel):
+    """One more query for a report (another table, database or endpoint), optionally attached to a parent."""
+    from_: ReportFrom = Field(alias="from")
+    attach: ReportAttach | None = None       # without it the rows are only in datasets.<name>
+    description: str = ""
+    # xlsx: this dataset's sheet; column order/subset and header renames
+    columns: list[str] = Field(default_factory=list)
+    rename: dict[str, str] = Field(default_factory=dict)
+
+    model_config = {"populate_by_name": True}
+
+
 class ReportSpec(BaseModel):
     """Declaration of one report, rendered to one or more formats."""
     name: str = Field(pattern=_NAME)
     description: str = ""
     # Jinja2 HTML template (relative to the project root, or absolute). Needed for pdf/html output only.
     template: str | None = None
-    from_: ReportFrom = Field(alias="from")
+    from_: ReportFrom = Field(alias="from")        # the master rows: row_count, csv/md, the first xlsx sheet
+    # More queries joined in memory (master-detail, lookups); see ReportDataset / ReportAttach.
+    datasets: dict[str, ReportDataset] = Field(default_factory=dict)
     # Formats to produce on every run. Empty: taken from the output suffix (.html → html), else pdf.
     formats: list[ReportFormat] = Field(default_factory=list)
     # Output path *stem*; may contain Jinja2 expressions, e.g.
@@ -536,6 +583,47 @@ class ReportSpec(BaseModel):
         if need and not self.template:
             raise ValueError(f"report '{self.name}': format(s) {sorted(need)} need a 'template'")
         return self
+
+    @model_validator(mode="after")
+    def _datasets_valid(self) -> "ReportSpec":
+        where = f"report '{self.name}'"
+        fields: dict[str, set[str]] = {"master": set()}     # parent -> the fields attached to it
+        for n, ds in self.datasets.items():
+            if not re.match(_DATASET_NAME, n) or n in RESERVED_DATASETS:
+                raise ValueError(f"{where}: invalid dataset name '{n}' (letters, digits, _; not "
+                                 f"{', '.join(sorted(RESERVED_DATASETS))})")
+            fields.setdefault(n, set())
+        for n, ds in self.datasets.items():
+            a = ds.attach
+            if a is None:
+                continue
+            if a.to != "master" and a.to not in self.datasets:
+                raise ValueError(f"{where}: dataset '{n}' attaches to unknown dataset '{a.to}'")
+            if a.to == n:
+                raise ValueError(f"{where}: dataset '{n}' cannot attach to itself")
+            name = a.as_ or n
+            if name in fields[a.to]:
+                raise ValueError(f"{where}: two datasets attach as '{name}' to '{a.to}'")
+            fields[a.to].add(name)
+        for n in self.datasets:                              # no cycles: following 'to' must reach master
+            seen, cur = {n}, n
+            while cur != "master":
+                a = self.datasets[cur].attach
+                if a is None:
+                    break
+                cur = a.to
+                if cur in seen:
+                    raise ValueError(f"{where}: datasets attach in a loop ({' -> '.join([*seen, cur])})")
+                seen.add(cur)
+        return self
+
+    def attached_fields(self, parent: str = "master") -> list[str]:
+        """The fields the datasets add to *parent*'s rows (left out of its csv/xlsx/md columns)."""
+        return [ds.attach.as_ or n for n, ds in self.datasets.items() if ds.attach and ds.attach.to == parent]
+
+    def all_froms(self) -> list[tuple[str, ReportFrom]]:
+        """('master', from) followed by each dataset's (name, from)."""
+        return [("master", self.from_), *((n, ds.from_) for n, ds in self.datasets.items())]
 
 
 # --------------------------------------------------------------------------- #
@@ -662,17 +750,15 @@ class ProjectConfig(BaseModel):
             if rpt.name in report_names:
                 raise ValueError(f"duplicate report name '{rpt.name}'")
             report_names.add(rpt.name)
-            if rpt.from_.endpoint and rpt.from_.endpoint not in ep_names:
-                raise ValueError(
-                    f"report '{rpt.name}' reads unknown endpoint '{rpt.from_.endpoint}'"
-                )
-            if rpt.from_.source and rpt.from_.source not in self.sources:
-                raise ValueError(
-                    f"report '{rpt.name}' reads unknown source '{rpt.from_.source}'"
-                )
-            if rpt.from_.query is not None and self.sources[rpt.from_.source].type != "sql":
-                raise ValueError(f"report '{rpt.name}': 'from.query' needs a SQL source, "
-                                 f"'{rpt.from_.source}' is {self.sources[rpt.from_.source].type}")
+            for ds, frm in rpt.all_froms():
+                who = f"report '{rpt.name}'" + ("" if ds == "master" else f" dataset '{ds}'")
+                if frm.endpoint and frm.endpoint not in ep_names:
+                    raise ValueError(f"{who} reads unknown endpoint '{frm.endpoint}'")
+                if frm.source and frm.source not in self.sources:
+                    raise ValueError(f"{who} reads unknown source '{frm.source}'")
+                if frm.query is not None and self.sources[frm.source].type != "sql":
+                    raise ValueError(f"{who}: 'from.query' needs a SQL source, "
+                                     f"'{frm.source}' is {self.sources[frm.source].type}")
         self._check_filesystem()
         self._check_agents()
         return self

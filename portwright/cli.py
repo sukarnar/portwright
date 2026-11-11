@@ -1203,6 +1203,93 @@ def report_add(
     typer.echo(f"Next: portwright report run {name}")
 
 
+report_dataset_app = typer.Typer(help="More queries for a report (master-detail, lookups), joined in memory.",
+                                 no_args_is_help=True)
+report_app.add_typer(report_dataset_app, name="dataset")
+
+
+def _keys(value: str) -> str | list[str]:
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    return parts[0] if len(parts) == 1 else parts
+
+
+@report_dataset_app.command("add")
+def report_dataset_add(
+    report: str = typer.Argument(..., help="The report to add the dataset to."),
+    name: str = typer.Argument(..., help="Dataset name: the field on the parent rows and datasets.<name>."),
+    endpoint: Optional[str] = typer.Option(None, "--endpoint", "-e", help="Endpoint to read the rows from."),
+    source: Optional[str] = typer.Option(None, "--source", "-s", help="File or SQL source to read the rows from."),
+    query: Optional[str] = typer.Option(None, "--query", "-q", help="SQL sources: one SELECT (binds :name)."),
+    param: list[str] = typer.Option([], "--param", help="Default param KEY=VALUE for this query (repeatable)."),
+    max_rows: Optional[int] = typer.Option(None, "--max-rows", help="Stop reading after this many rows."),
+    to: str = typer.Option("master", "--to", help="Attach to 'master' or to another dataset."),
+    key: Optional[str] = typer.Option(None, "--key", help="This dataset's join column(s), comma-separated."),
+    parent_key: Optional[str] = typer.Option(None, "--parent-key", help="The parent's matching column(s)."),
+    as_: Optional[str] = typer.Option(None, "--as", help="Field name on the parent rows (default: the dataset name)."),
+    one: bool = typer.Option(False, "--one", help="A lookup: one row (or none) per parent instead of a list."),
+    description: str = "",
+    replace: bool = typer.Option(False, "--replace", help="Replace a dataset with the same name."),
+    config: str = CONFIG_OPT,
+):
+    """Add a dataset to a report. With --key and --parent-key its rows are attached to each parent row;
+    without them they are only available to the template as datasets.<name> (and as an Excel sheet)."""
+    from .config import ReportDataset, ReportFrom
+    if bool(key) != bool(parent_key):
+        raise typer.BadParameter("give both --key and --parent-key (or neither)")
+    cfg = _load(config)
+    spec = cfg.report(report)
+    if spec is None:
+        _fail(Exception(f"no report '{report}' – see 'portwright report list'"))
+    if name in spec.datasets and not replace:
+        _fail(Exception(f"report '{report}' already has a dataset '{name}' (use --replace)"))
+    try:
+        frm = ReportFrom(endpoint=endpoint, source=source, query=query, params=_kv(param),
+                         **({"max_rows": max_rows} if max_rows else {}))
+        attach = ({"to": to, "key": _keys(key), "parent_key": _keys(parent_key), "as": as_, "one": one}
+                  if key else None)
+        ds = ReportDataset.model_validate({"from": frm.model_dump(), "attach": attach, "description": description})
+        new = spec.model_copy(update={"datasets": {**spec.datasets, name: ds}})
+        new = type(spec).model_validate(new.model_dump(mode="json", by_alias=True))   # runs the dataset checks
+        cfg.reports = [new if r.name == report else r for r in cfg.reports]
+    except ValueError as exc:
+        raise typer.BadParameter(_clean_validation(exc))
+    _save(cfg, config)
+    how = (f"attached to {to} as '{as_ or name}' ({key} = {parent_key}{', one row' if one else ''})" if key
+           else "available as datasets." + name)
+    _ok(f"Dataset '{name}' added to report '{report}', {how}")
+
+
+@report_dataset_app.command("list")
+def report_dataset_list(report: str, config: str = CONFIG_OPT):
+    """List a report's datasets and how they are attached."""
+    spec = _run(_svc(config).reports.get, report)
+    if not spec.datasets:
+        typer.echo(f"Report '{report}' has no datasets.")
+        return
+    for n, ds in spec.datasets.items():
+        frm = ds.from_.endpoint and f"endpoint:{ds.from_.endpoint}" or f"source:{ds.from_.source}"
+        a = ds.attach
+        how = (f"-> {a.to}.{a.as_ or n} on {a.key} = {a.parent_key}{' (one)' if a.one else ''}" if a
+               else "(not attached)")
+        typer.echo(f"{n:<18} {frm:<28} {how}")
+
+
+@report_dataset_app.command("remove")
+def report_dataset_remove(report: str, name: str, config: str = CONFIG_OPT):
+    """Remove a dataset from a report (fails while another dataset attaches to it)."""
+    cfg = _load(config)
+    spec = cfg.report(report)
+    if spec is None or name not in spec.datasets:
+        _fail(Exception(f"report '{report}' has no dataset '{name}'"))
+    users = [n for n, ds in spec.datasets.items() if ds.attach and ds.attach.to == name]
+    if users:
+        _fail(Exception(f"dataset(s) {', '.join(users)} attach to '{name}'; remove them first"))
+    new = spec.model_copy(update={"datasets": {n: d for n, d in spec.datasets.items() if n != name}})
+    cfg.reports = [new if r.name == report else r for r in cfg.reports]
+    _save(cfg, config)
+    _ok(f"Dataset '{name}' removed from report '{report}'")
+
+
 @report_app.command("list")
 def report_list(config: str = CONFIG_OPT):
     """List report definitions."""
@@ -1212,6 +1299,8 @@ def report_list(config: str = CONFIG_OPT):
         return
     for r in items:
         typer.echo(f"{r['name']:<20} {r['from']:<32} {','.join(r['formats']):<14} {r['template']}")
+        if r["datasets"]:
+            typer.echo(f"  datasets: {', '.join(r['datasets'])}")
         if r["description"]:
             typer.echo(f"  {r['description']}")
 
@@ -1233,18 +1322,26 @@ def report_run(
     param: list[str] = typer.Option([], "--param", "-p", help="NAME=VALUE params passed to the data source (repeatable)."),
     var: list[str] = typer.Option([], "--var", help="NAME=VALUE extra template variable (repeatable)."),
     open_: bool = typer.Option(False, "--open", help="Open the output file after rendering."),
+    as_json: bool = typer.Option(False, "--json", help="Print the result as JSON (outputs, rows, warnings)."),
     config: str = CONFIG_OPT,
 ):
-    """Render a report to its formats (default PDF; override with --format or --html)."""
+    """Render a report to its formats (default PDF; override with --format or --html).
+
+    Exit code: 0 done, 1 failed, 2 done with warnings (e.g. rows cut off at max_rows)."""
     svc = _svc(config)
     result = _run(svc.reports.run, name,
                   output=output, as_html=html, formats=_formats(fmt) or None,
                   params=_kv(param), extra_vars=_kv(var) if var else None)
-    _ok(f"Report '{name}': {result.row_count} rows, {result.seconds}s")
-    for o in result.outputs:
-        typer.echo(f"  {o.format:<5} {o.path}  ({o.bytes:,} bytes)")
-    for w in result.warnings:
-        typer.secho(f"  warning: {w}", fg=typer.colors.YELLOW)
+    if as_json:
+        typer.echo(json.dumps(result.to_dict(), indent=2, default=str))
+    else:
+        _ok(f"Report '{name}': {result.row_count} rows, {result.seconds}s")
+        for o in result.outputs:
+            typer.echo(f"  {o.format:<5} {o.path}  ({o.bytes:,} bytes)")
+        for n, count in result.dataset_rows.items():
+            typer.echo(f"  dataset {n}: {count} rows")
+        for w in result.warnings:
+            typer.secho(f"  warning: {w}", fg=typer.colors.YELLOW)
     if open_:
         import subprocess, sys
         if sys.platform == "win32":
@@ -1253,6 +1350,7 @@ def report_run(
             subprocess.Popen(["open", str(result.output_path)])
         else:
             subprocess.Popen(["xdg-open", str(result.output_path)])
+    raise typer.Exit(result.exit_code)
 
 
 @report_app.command("template")
@@ -1831,7 +1929,10 @@ def workflow_templates(name: str = typer.Argument(None, help="Show this template
 @workflow_app.command("run")
 def workflow_run(name: str, input: list[str] = typer.Option([], "--input", "-i", help="Workflow input KEY=VALUE."),
                  as_json: bool = typer.Option(False, "--json"), config: str = CONFIG_OPT):
-    """Run a workflow; ${input.KEY} in its steps reads the --input values."""
+    """Run a workflow; ${input.KEY} in its steps reads the --input values.
+
+    Exit code: 0 done, 1 failed, 2 done with warnings (a step failed under on_error: continue,
+    foreach items failed, or a report hit max_rows)."""
     r = _run(_svc(config).agents.run_workflow, name, _kv(input))
     if as_json:
         typer.echo(json.dumps(r.to_dict(), indent=2, default=str))
@@ -1840,9 +1941,12 @@ def workflow_run(name: str, input: list[str] = typer.Option([], "--input", "-i",
             typer.echo(f"  {s.id:<14} {s.type:<9} {'ok' if s.ok else 'FAILED ' + s.error}")
         out = r.output if isinstance(r.output, str) else json.dumps(r.output, indent=2, default=str)
         typer.echo(out)
-        typer.secho(f"[{r.status} - run {r.run_id}]", dim=True)
+        for w in r.warnings:
+            typer.secho(f"  warning: {w}", fg=typer.colors.YELLOW)
+        typer.secho(f"[{r.status}{' with warnings' if r.ok and r.warnings else ''} - run {r.run_id}]", dim=True)
     if not r.ok:
         _fail(Exception(r.error))
+    raise typer.Exit(r.exit_code)
 
 
 @workflow_app.command("remove")

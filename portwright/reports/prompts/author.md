@@ -19,6 +19,14 @@ Reply with ONE JSON object and nothing else (no prose, no code fences):
 - `row_count`: number of rows
 - `report_name`, `generated_at` / `now` (UTC datetime)
 - `vars`: extra variables (also available directly by name)
+- `datasets`: every dataset's rows by name (`datasets.master` is the same as `rows`)
+
+When the data section has `datasets`, the report is master-detail. A dataset with `attached` hangs on its
+parent's rows under the name in `as`: a list of rows (loop `{% for line in row.lines %}`), or with
+`one: true` a single row or none (`{{ row.customer.name if row.customer else '-' }}`). A dataset attached to
+another dataset appears on that dataset's rows, so nest the loops. A parent can have no children: show a
+short "No lines." note instead of an empty table. Datasets without `attached` are only in `datasets.<name>`.
+Their columns are listed under each dataset; do not expect them on the master rows.
 
 Undefined variables are errors. Use only the columns listed in the data section, write `row['col name']` for
 names with spaces, and guard optional values with `| default_if_none('-')`. The template must also render when

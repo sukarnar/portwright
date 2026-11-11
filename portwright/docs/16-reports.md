@@ -55,6 +55,10 @@ Click **+ Add Report**. Fill in the form fields and click **Save**.
 Supply either an **Endpoint** or a **Source** — not both. The dropdowns are populated from the
 live project configuration so only valid names appear.
 
+**Datasets** (optional, YAML) adds more queries to the report, for example order lines for each
+order. The field's placeholder shows the shape; see *Master-detail: datasets* below. The **Data from**
+column on the Reports screen lists a report's datasets after its main source.
+
 ### Running a report
 
 Click ▶ on a report row. The engine will:
@@ -191,11 +195,102 @@ Remove a report definition with:
 portwright report remove <name>
 ```
 
+### Master-detail: datasets
+
+`from` gives the report's **master** rows. `datasets` adds more queries: other tables, other databases,
+files or endpoints. Portwright reads each one and joins them in memory, so the tables do not have to
+live in the same database.
+
+```yaml
+reports:
+  - name: orders
+    template: templates/orders.html
+    formats: [pdf, xlsx]
+    from:                                   # master: one row per order
+      source: sales
+      query: "select id, customer_id, placed from orders where placed >= :since"
+      params: {since: "2026-10-01"}
+    datasets:
+      lines:                                # each order gets order.lines (a list)
+        from: {source: erp, query: "select * from order_lines where order_date >= :since"}
+        attach: {key: order_id, parent_key: id}
+      serials:                              # each line gets line.serials (a level deeper)
+        from: {source: erp, query: "select line_id, serial from serials"}
+        attach: {to: lines, key: line_id, parent_key: line_id}
+      customer:                             # each order gets order.customer (one row or null)
+        from: {endpoint: customer-list}
+        attach: {key: id, parent_key: customer_id, one: true}
+      rates:                                # not attached: only datasets.rates
+        from: {source: fx, query: "select ccy, rate from rates"}
+```
+
+```jinja
+{% for o in rows %}
+  <h2>Order {{ o.id }} – {{ o.customer.name if o.customer else 'unknown customer' }}</h2>
+  <table>
+  {% for l in o.lines %}
+    <tr><td>{{ l.product }}</td><td>{{ l.qty }}</td><td>{{ l.serials | map(attribute='serial') | join(', ') }}</td></tr>
+  {% else %}
+    <tr><td colspan="3">No lines.</td></tr>
+  {% endfor %}
+  </table>
+{% endfor %}
+```
+
+**Attach**
+
+| Key | Meaning |
+|---|---|
+| `to` | `master` (default) or another dataset, for several levels |
+| `key` / `parent_key` | the join columns; a list for composite keys, e.g. `[order_id, line_no]` |
+| `as` | the field name on the parent row (default: the dataset name) |
+| `one` | `true` for a lookup: one row or `null` instead of a list |
+
+- **Matching.** Keys are compared as text after normalising numbers, so `7`, `7.0`, `Decimal('7')`
+  and `"7"` match across databases and CSV files. A null key never matches. Column names are found
+  exactly, else ignoring case (`ORDER_ID` = `order_id`).
+- **A parent with no children** gets an empty list (or `null` with `one`). Child rows whose key
+  matches no parent are not shown under any parent, but they stay in `datasets.<name>`.
+- **Params** are shared. `--param since=2026-10-01` goes to every query that uses `:since`, and to
+  every endpoint that declares `since`. A dataset's own `from.params` are its defaults.
+- **`max_rows`** applies to each dataset on its own. When a dataset is cut off, the run warns that some
+  detail rows are missing, and `report run` exits with 2.
+- **Warnings** are also given for a lookup (`one: true`) that matches several rows (the first is used),
+  and for an attached field that replaces a column of the parent.
+
+**Output per format**
+
+| Format | With datasets |
+|---|---|
+| PDF / HTML | the template sees `rows` with the attached fields, and every dataset as `datasets.<name>` |
+| Excel | the master rows on the first sheet, then one sheet per dataset |
+| JSON | the master rows, with attached datasets nested in each row |
+| CSV / Markdown | the master rows only (attached fields are not columns) |
+
+Each dataset can set its own `columns` and `rename` for its Excel sheet.
+
+Datasets from the CLI:
+
+```powershell
+portwright report dataset add orders lines -s erp -q "select * from order_lines" --key order_id --parent-key id
+portwright report dataset add orders customer -e customer-list --key id --parent-key customer_id --one
+portwright report dataset add orders lines_by_no -s erp -q "select * from order_lines" `
+  --key "order_id,line_no" --parent-key "id,line_no"       # composite key
+portwright report dataset list orders
+portwright report dataset remove orders customer
+```
+
+A workflow `report` step can supply a dataset's rows instead of reading them (`datasets: {lines:
+"${steps.pull.output.rows}"}`); the other datasets are read as usual. **Design with AI** profiles
+every dataset, each under its own source's data access level, so the model knows the relations and
+the columns of each level.
+
 ### Jinja2 template variables
 
 | Variable | Type | Description |
 |---|---|---|
-| `data` / `rows` | list of dicts | Rows from the data source |
+| `data` / `rows` | list of dicts | Rows from the data source (the master rows, with attached datasets) |
+| `datasets` | dict | Every dataset's rows by name; `datasets.master` is the same as `rows` |
 | `row_count` | int | Number of rows |
 | `report_name` | str | Report definition name |
 | `record` | dict | The single row, when there is exactly one |

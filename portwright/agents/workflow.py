@@ -37,6 +37,7 @@ class StepResult:
     seconds: float = 0.0
     run_id: str = ""          # agent steps: the agent run's trace
     tokens: int = 0           # llm / agent steps: model tokens used
+    warnings: list[str] = field(default_factory=list)    # finished, but not fully (failed items, capped rows)
 
 
 @dataclass
@@ -52,8 +53,25 @@ class WorkflowResult:
     def ok(self) -> bool:
         return self.status == "ok"
 
+    @property
+    def warnings(self) -> list[str]:
+        """What went wrong in a run that still finished: steps that failed under ``on_error: continue``
+        (a failed condition or switch is not counted: it takes its else/default branch), failed
+        ``foreach`` items, and report warnings such as rows cut off at ``max_rows``."""
+        out = []
+        for s in self.steps:
+            if not s.ok and s.type not in ("condition", "switch"):
+                out.append(f"step '{s.id}' failed and the workflow continued: {s.error}")
+            out.extend(f"step '{s.id}': {w}" for w in s.warnings)
+        return out
+
+    @property
+    def exit_code(self) -> int:
+        """For schedulers: 0 done, 1 failed, 2 done with warnings."""
+        return 1 if not self.ok else (2 if self.warnings else 0)
+
     def to_dict(self) -> dict:
-        return asdict(self)
+        return {**asdict(self), "warnings": self.warnings, "exit_code": self.exit_code}
 
 
 def _lookup(path: str, scope: dict) -> Any:
@@ -237,6 +255,9 @@ async def _report(st, raw_input: Any, scope: dict, env: "_Env") -> dict:
     if not isinstance(params, dict):
         raise ToolError("report step 'input' must be a mapping of report params")
     data = resolve(st.data, scope) if st.data is not None else None
+    sets = resolve(st.datasets, scope) if st.datasets else None
+    if sets is not None and not st.report:
+        raise ToolError("report step 'datasets' needs 'report' (a report that defines those datasets)")
     formats = _formats(resolve(st.formats, scope)) if st.formats else None
     extra = resolve(st.vars, scope) if st.vars else None
     out = resolve(st.output_path, scope) if st.output_path else None
@@ -244,7 +265,7 @@ async def _report(st, raw_input: Any, scope: dict, env: "_Env") -> dict:
     try:
         if st.report:
             res = await asyncio.to_thread(svc.run, st.report, formats=formats, output=out, params=params,
-                                          data=data, extra_vars=extra)
+                                          data=data, datasets=sets, extra_vars=extra)
         else:
             res = await asyncio.to_thread(svc.render_inline, data, formats, out or f"reports/output/{st.id}",
                                           name=st.id, template=resolve(st.template, scope) if st.template else None,
@@ -405,7 +426,9 @@ async def run_workflow(config: ProjectConfig, root: str | Path, credentials, nam
                 elif st.type == "report_design":
                     res.output, res.tokens = await _report_design(st, scope, env)
                 elif st.type == "foreach":
-                    res.output, res.tokens = await _foreach(st, scope, env)
+                    res.output, res.tokens, failed = await _foreach(st, scope, env)
+                    if failed:
+                        res.warnings.append(f"{failed} of {len(res.output)} item(s) failed")
                 elif st.type == "input":
                     scope["input"] = apply_inputs(st.inputs, scope["input"])
                     res.output = ({k: scope["input"].get(k) for k in (st.inputs or {})}
@@ -424,6 +447,8 @@ async def run_workflow(config: ProjectConfig, root: str | Path, credentials, nam
             except (ToolError, ConfigError) as exc:
                 res.ok, res.error = False, str(exc)
                 res.output = {"error": str(exc)}
+            if res.ok and st.type == "report" and isinstance(res.output, dict):
+                res.warnings.extend(str(w) for w in res.output.get("warnings") or [])
             if st.type == "output":
                 jump = "end"
             elif st.type not in ("condition", "switch"):
@@ -457,13 +482,14 @@ async def run_workflow(config: ProjectConfig, root: str | Path, credentials, nam
     return result
 
 
-async def _foreach(st, scope: dict, env: _Env) -> tuple[list, int]:
-    """Run the step's action once per item; ``${item}`` and ``${index}`` are available to its input."""
+async def _foreach(st, scope: dict, env: _Env) -> tuple[list, int, int]:
+    """Run the step's action once per item; ``${item}`` and ``${index}`` are available to its input.
+    Returns the outputs, the tokens used and how many items failed (only with ``on_error: continue``)."""
     items = _items(resolve(st.items, scope))
     if len(items) > st.max_items:
         raise ToolError(f"{len(items)} items is more than max_items ({st.max_items}); raise it or filter the list")
     outs: list = []
-    tokens = 0
+    tokens = failed = 0
     for idx, item in enumerate(items):
         try:
             out, _, tok = await _do(st.do, st, st.input, {**scope, "item": item, "index": idx}, env)
@@ -473,4 +499,5 @@ async def _foreach(st, scope: dict, env: _Env) -> tuple[list, int]:
             if st.on_error != "continue":
                 raise ToolError(f"item {idx}: {exc}") from None
             outs.append({"error": str(exc)})
-    return outs, tokens
+            failed += 1
+    return outs, tokens, failed

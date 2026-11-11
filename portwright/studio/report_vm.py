@@ -199,3 +199,55 @@ def ai_templates(svc) -> list[dict]:
 def is_ai_report(svc, spec) -> bool:
     from ..reports.author import ReportAuthor
     return ReportAuthor(svc.project).is_ai_template(spec)
+
+
+# --------------------------------------------------------------------------- report editor: datasets
+DATASETS_HINT = """\
+lines:
+  from: {source: erp, query: "select * from order_lines where order_date >= :since"}
+  attach: {key: order_id, parent_key: id}          # each master row gets row.lines
+customer:
+  from: {endpoint: customer-list}
+  attach: {key: id, parent_key: customer_id, one: true}"""
+
+
+def datasets_yaml(spec) -> str:
+    """The report's datasets as the editor shows them (empty when it has none)."""
+    if spec is None or not spec.datasets:
+        return ""
+    data = {n: ds.model_dump(mode="json", by_alias=True, exclude_none=True, exclude_defaults=True)
+            for n, ds in spec.datasets.items()}
+    for d in data.values():                                     # 'from' always has its endpoint/source
+        d.setdefault("from", {})
+    return yaml.safe_dump(data, sort_keys=False, allow_unicode=True).strip()
+
+
+def parse_datasets(text: str) -> dict:
+    """The editor's datasets text as a mapping for ReportSpec(datasets=...); ServiceError when it is not."""
+    t = (text or "").strip()
+    if not t:
+        return {}
+    try:
+        v = yaml.safe_load(t)
+    except yaml.YAMLError as exc:
+        raise ServiceError(f"Datasets: not valid YAML ({str(exc).splitlines()[0]})") from None
+    if not isinstance(v, dict) or not all(isinstance(d, dict) for d in v.values()):
+        raise ServiceError("Datasets: a mapping of name: {from: ..., attach: ...}")
+    return v
+
+
+def edited_report(old, values: dict):
+    """The report after the editor's Save: the form fields replace theirs, everything else on *old*
+    (datasets unless given, AI settings, provenance, vars, columns) is kept."""
+    from ..config import ReportFrom, ReportSpec
+    frm = old.from_.model_dump() if old else {}                 # keep params, paginate, max_rows
+    frm.update(endpoint=values.get("endpoint"), source=values.get("source"),
+               query=values.get("query") if values.get("source") else None)
+    base = old.model_dump(mode="json", by_alias=True) if old else {}
+    base.update(name=values["name"], description=values.get("description", ""),
+                template=values.get("template") or None, formats=values["formats"],
+                output=values.get("output") or None)
+    base["from"] = ReportFrom(**frm).model_dump(mode="json")
+    if "datasets" in values:
+        base["datasets"] = values["datasets"]
+    return ReportSpec.model_validate(base)

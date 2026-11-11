@@ -89,7 +89,7 @@ class ReportsView:
                               lambda _, n=r["name"]: self._promote(n), ft.Colors.AMBER_800)] if ai else []
             rows.append(ft.DataRow(cells=[
                 ft.DataCell(ft.Text(r["name"], weight=ft.FontWeight.W_500)),
-                ft.DataCell(_small(r["from"])),
+                ft.DataCell(_small(r["from"] + (f"  + {', '.join(r['datasets'])}" if r["datasets"] else ""))),
                 ft.DataCell(_small(", ".join(r["formats"]))),
                 ft.DataCell(tpl_cell),
                 ft.DataCell(_small(r["description"] or "")),
@@ -329,6 +329,9 @@ class _ReportEditor:
 
         self.output = text_field("Output path", spec.output or "" if spec else "", expand=True,
                                  hint="reports/output/{{ now | strftime('%Y-%m') }}/sales")
+        self.datasets = text_field("Datasets (YAML, optional): more queries joined to the rows above",
+                                   rvm.datasets_yaml(spec), expand=True, multiline=True, min_lines=3,
+                                   hint_text=rvm.DATASETS_HINT)
         self.error = ft.Text("", color=ft.Colors.ERROR, size=12)
 
     def _on_endpoint_change(self, e) -> None:
@@ -381,6 +384,10 @@ class _ReportEditor:
             checkbox_rows(self.formats.values(), 6),
             _small("Output path supports Jinja2 e.g. reports/{{ now | strftime('%Y-%m') }}/sales  "
                    "(each format adds its own suffix: .pdf, .xlsx, …)"),
+            self.datasets,
+            _small("Master-detail: each dataset with 'attach' is added to every row (row.lines), matched on "
+                   "key = parent_key. Excel gets one sheet per dataset; JSON nests them; CSV/Markdown keep the "
+                   "rows above. Templates also see datasets.<name>."),
             self.error,
         ], actions=[
             ft.FilledButton("Save", icon=ft.Icons.SAVE, on_click=self._save),
@@ -388,7 +395,6 @@ class _ReportEditor:
         ])
 
     def _save(self, _) -> None:
-        from ...config import ReportFrom, ReportSpec
         name = self.name.value.strip()
         template = self.template.value.strip()
         endpoint = (self.endpoint.value or "").strip() or None
@@ -413,21 +419,11 @@ class _ReportEditor:
             return
 
         try:
-            old = self.spec
-            query = (self.query.value or "").strip() or None
-            frm = (old.from_.model_dump() if old else {})          # keep params, paginate, max_rows
-            frm.update(endpoint=endpoint, source=source, query=query if source else None)
-            new_spec = ReportSpec(
-                name=name,
-                description=self.description.value.strip(),
-                template=template or None,
-                **{"from": ReportFrom(**frm)},
-                formats=formats,
-                output=self.output.value.strip() or None,
-                vars=dict(old.vars) if old else {},
-                columns=list(old.columns) if old else [],
-                rename=dict(old.rename) if old else {},
-            )
+            new_spec = rvm.edited_report(self.spec, {
+                "name": name, "description": self.description.value.strip(), "template": template,
+                "endpoint": endpoint, "source": source, "query": (self.query.value or "").strip() or None,
+                "formats": formats, "output": self.output.value.strip(),
+                "datasets": rvm.parse_datasets(self.datasets.value)})
             cfg = self.ctx.svc.project.config
             cfg.reports = [r for r in cfg.reports if r.name != (self.spec.name if self.spec else name)]
             cfg.reports.append(new_spec)

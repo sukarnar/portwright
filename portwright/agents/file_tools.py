@@ -354,9 +354,12 @@ def report_run_tool(rt, report: str) -> Tool:
         oas = {"string": "string", "integer": "integer", "number": "number", "boolean": "boolean"}
         for p in ep.params:
             props[p.name] = {"type": oas.get(p.type, "string"), **({"description": p.description} if p.description else {})}
-    elif spec.from_.query:
-        for b in sorted(set(re.findall(r"(?<![:\w]):([A-Za-z_]\w*)", spec.from_.query))):
-            props[b] = {"type": ["string", "number", "null"]}
+    binds = set()
+    for _, frm in spec.all_froms():                   # the master's and every dataset's query binds
+        if frm.query:
+            binds |= set(re.findall(r"(?<![:\w]):([A-Za-z_]\w*)", frm.query))
+    for b in sorted(binds - set(props)):
+        props[b] = {"type": ["string", "number", "null"]}
     props["formats"] = {"type": "array", "items": {"type": "string", "enum": ["pdf", "html", "md", "csv", "xlsx", "json"]}}
 
     async def run(a: dict) -> Any:
