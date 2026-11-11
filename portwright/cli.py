@@ -1270,6 +1270,110 @@ def report_template(
     typer.echo("Edit it, then run:  portwright report run " + name + " --html   to preview before generating PDF.")
 
 
+def _print_design(d) -> None:
+    if d.action == "kept":
+        typer.echo(f"  kept the existing AI template {d.template}")
+        return
+    typer.echo(f"  template  {d.template}  (model {d.model}, {d.tokens} tokens, {d.repairs} repair(s))")
+    sent = f"{d.rows_sent} row(s)" if d.rows_sent else "no row values"
+    typer.echo(f"  the model saw: data access '{d.data_access}', {sent}, columns: {', '.join(d.columns_sent) or '-'}")
+    if d.title:
+        typer.echo(f"  title     {d.title}")
+    for w in d.warnings:
+        typer.secho(f"  warning: {w}", fg=typer.colors.YELLOW)
+
+
+@report_app.command("design")
+def report_design(
+    name: str,
+    prompt: str = typer.Option(..., "--prompt", "-P", help="What the report should show and how it should look."),
+    endpoint: Optional[str] = typer.Option(None, "--from-endpoint", "-e", help="Data from this endpoint (new reports)."),
+    source: Optional[str] = typer.Option(None, "--from-source", "-s", help="Data from this source (new reports)."),
+    query: Optional[str] = typer.Option(None, "--query", "-q", help="SQL sources: one SELECT (bind :name)."),
+    param: list[str] = typer.Option([], "--param", "-p", help="NAME=VALUE param for the data (repeatable)."),
+    fmt: list[str] = typer.Option([], "--format", "-f", help="Formats the template must suit: pdf, html, …"),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="LLM model (default: the only one defined)."),
+    base: Optional[str] = typer.Option(None, "--base", help="Gallery template to start from, e.g. summary_dashboard."),
+    sample_rows: Optional[int] = typer.Option(None, "--sample-rows", help="Rows profiled / sent (lower only)."),
+    data_access: Optional[str] = typer.Option(None, "--data-access",
+                                              help="Lower what the model sees: full, sample, profile, schema."),
+    force: bool = typer.Option(False, "--force", help="Replace an existing AI template (old one kept in .history)."),
+    run_after: bool = typer.Option(False, "--run", help="Run the report right after designing it."),
+    config: str = CONFIG_OPT,
+):
+    """Have an AI model write the report's template; it is checked before it is saved.
+
+    The template goes to .portwright/templates/ (outside git); 'report promote' moves it into templates/.
+    """
+    import asyncio
+    from .config import ReportFrom
+    from .reports.author import ReportAuthor
+    svc = _svc(config)
+    frm = None
+    if endpoint or source:
+        try:
+            frm = ReportFrom(endpoint=endpoint, source=source, query=query, params=_kv(param))
+        except ValueError as exc:
+            raise typer.BadParameter(_clean_validation(exc))
+    author = ReportAuthor(svc.project)
+    d = _run(lambda: asyncio.run(author.design(
+        name, prompt, frm=frm, params=None if frm else _kv(param), formats=_formats(fmt) or None, model=model,
+        base=base, sample_rows=sample_rows, data_access=data_access, if_exists="replace" if force else "error")))
+    _ok(f"Report '{name}' designed")
+    _print_design(d)
+    if run_after:
+        result = _run(svc.reports.run, name)
+        for o in result.outputs:
+            typer.echo(f"  {o.format:<5} {o.path}")
+    else:
+        typer.echo(f"Next: portwright report run {name}   ·   keep it in git: portwright report promote {name}")
+
+
+@report_app.command("ask")
+def report_ask(
+    question: str = typer.Argument(..., help="The report you want, in your own words."),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="LLM model (default: the only one defined)."),
+    endpoint: Optional[str] = typer.Option(None, "--endpoint", "-e", help="Only consider this endpoint."),
+    source: Optional[str] = typer.Option(None, "--source", "-s", help="Only consider this source."),
+    fmt: list[str] = typer.Option([], "--format", "-f", help="Formats to produce (default: the model's choice)."),
+    name: Optional[str] = typer.Option(None, "--name", help="Name of the new report (default: the model's choice)."),
+    data_access: Optional[str] = typer.Option(None, "--data-access", help="Lower what the model sees."),
+    no_run: bool = typer.Option(False, "--no-run", help="Register and design the report, but do not run it."),
+    config: str = CONFIG_OPT,
+):
+    """One question → the model picks the data and formats, designs the template, and the report runs."""
+    import asyncio
+    from .reports.author import ReportAuthor
+    svc = _svc(config)
+    author = ReportAuthor(svc.project)
+    out = _run(lambda: asyncio.run(author.ask(question, model=model, endpoint=endpoint, source=source,
+                                              formats=_formats(fmt) or None, name=name, data_access=data_access,
+                                              run=not no_run)))
+    plan = out["plan"]
+    frm = plan["from"]
+    where = f"endpoint {frm.endpoint}" if frm.endpoint else f"source {frm.source}: {frm.query}"
+    _ok(f"Report '{plan['name']}' created from {where}")
+    _print_design(out["design"])
+    if out["run"] is not None:
+        for o in out["run"].outputs:
+            typer.echo(f"  {o.format:<5} {o.path}")
+        for w in out["run"].warnings:
+            typer.secho(f"  warning: {w}", fg=typer.colors.YELLOW)
+
+
+@report_app.command("promote")
+def report_promote(
+    name: str,
+    to: Optional[str] = typer.Option(None, "--to", help="Where in the project (default: templates/<name>.html)."),
+    force: bool = typer.Option(False, "--force", help="Replace an existing file there."),
+    config: str = CONFIG_OPT,
+):
+    """Copy a report's AI template into templates/ (kept in git) and point the report at it."""
+    from .reports.author import ReportAuthor
+    dest = _run(ReportAuthor(_svc(config).project).promote, name, to, force)
+    _ok(f"Report '{name}' now uses {dest}")
+
+
 @report_app.command("remove")
 def report_remove(name: str, config: str = CONFIG_OPT):
     """Remove a report definition from portwright.yaml."""

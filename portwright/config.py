@@ -14,7 +14,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .agents.spec import (AgentSpec, LlmModelSpec, McpServerSpec, SkillSpec, ToolSpec, WorkflowSpec)
+from .agents.spec import (AgentSpec, DataAccess, LlmModelSpec, McpServerSpec, SkillSpec, ToolSpec, WorkflowSpec)
 
 DEFAULT_CONFIG = "portwright.yaml"      # an existing restforge.yaml is used when this is missing
 _ENV_REF = re.compile(r"\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -142,6 +142,9 @@ class SourceSpec(BaseModel):
     ca_file: str | None = None                         # extra CA bundle (PEM); default: system store
     allow_plain_ldap: bool = False                     # ldap:// without TLS is refused unless set
     test_group: str | None = None                      # 'source test' lists this group's members
+    # AI report authoring: ceiling on what a model may see of this source (and endpoints on it)
+    ai_data_access: DataAccess = "full"
+    ai_exclude_columns: list[str] = Field(default_factory=list)   # never sent to a model, whatever the level
 
     @model_validator(mode="after")
     def _check(self) -> "SourceSpec":
@@ -511,6 +514,9 @@ class ReportSpec(BaseModel):
     # Data formats (csv / xlsx / json / md): column order/subset and header renames
     columns: list[str] = Field(default_factory=list)
     rename: dict[str, str] = Field(default_factory=dict)
+    # AI report authoring: ceiling for this report, and where its AI template came from (written by the author)
+    ai_data_access: DataAccess | None = None
+    provenance: dict[str, Any] | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -575,6 +581,21 @@ def path_allowed(p: str, allowed: list[str]) -> bool:
     return any(n == a or n.startswith(a + "/") for a in (norm(x) for x in allowed))
 
 
+class ReportAiSettings(BaseModel):
+    """Project-wide settings for AI report authoring (`pw report design`, report_design steps)."""
+    data_access: DataAccess = "full"     # project ceiling; models are local, so real rows are allowed by default
+    sample_rows: int = Field(50, ge=0, le=500)      # rows profiled (and sent at 'sample'/'full') per design run
+    max_repairs: int = Field(2, ge=0, le=5)         # times a failing template goes back to the model with the error
+    templates_dir: str = ".portwright/templates"    # where AI templates are written (outside git until promoted)
+
+    @field_validator("templates_dir")
+    @classmethod
+    def _inside_project(cls, v: str) -> str:
+        if is_absolute_path(v) or ".." in re.split(r"[\\/]", v):
+            raise ValueError("report_ai.templates_dir must be a folder inside the project (no '..')")
+        return v
+
+
 class ProjectConfig(BaseModel):
     project: str = "portwright-project"
     version: str = "1.0.0"
@@ -593,6 +614,7 @@ class ProjectConfig(BaseModel):
     mcp_servers: dict[str, McpServerSpec] = Field(default_factory=dict)
     filesystem: FilesystemSettings = Field(default_factory=FilesystemSettings)
     destinations: dict[str, DestinationSpec] = Field(default_factory=dict)
+    report_ai: ReportAiSettings = Field(default_factory=ReportAiSettings)
 
     @model_validator(mode="after")
     def _integrity(self) -> "ProjectConfig":
@@ -726,8 +748,12 @@ class ProjectConfig(BaseModel):
                 if st.type == "load" and st.load not in {x.name for x in self.loads}:
                     raise ValueError(f"workflow '{n}' step '{st.id}': unknown load '{st.load}'")
                 kind = st.do if st.type == "foreach" else st.type
-                if kind == "report" and st.report and self.report(st.report) is None:
+                designed = {x.report for x in w.steps if x.type == "report_design"}
+                if kind == "report" and st.report and self.report(st.report) is None and st.report not in designed:
                     raise ValueError(f"workflow '{n}' step '{st.id}': unknown report '{st.report}'")
+                if st.type == "report_design" and self.report(st.report) is None and not st.from_:
+                    raise ValueError(f"workflow '{n}' step '{st.id}': report '{st.report}' does not exist yet; "
+                                     "add 'from' (an endpoint or source) so the step can create it")
                 for addr in (st.to, st.path) if st.type in ("copy", "move", "file", "foreach") else ():
                     self._check_address(n, st.id, addr)
                 if st.type == "foreach":

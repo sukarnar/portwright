@@ -1,6 +1,6 @@
 # Design: AI-authored reports, report/file workflow nodes, filesystem tools
 
-Status: **phases 1–2 implemented**, phases 3–5 proposed · Target: portwright 0.9 · Branch: `design/ai-reports-fs-nodes`
+Status: **phases 1–3 implemented**, phases 4–5 proposed · Target: portwright 0.9 · Branch: `design/ai-reports-fs-nodes`
 
 ## 1. Goals
 
@@ -130,7 +130,7 @@ ReportService.render_inline(template: str | Path | None, rows, formats, output, 
 ### 5.1 `ReportAuthor` — `portwright/reports/author.py`
 
 Inputs: `prompt`, a data spec (`from` block or inline rows), `formats`, `model` (from
-`llm_models`), optional `base` gallery template, `sample_rows` (default from `reports.ai.sample_rows`), optional `data_access` override (§5.5).
+`llm_models`), optional `base` gallery template, `sample_rows` (default from `report_ai.sample_rows`), optional `data_access` override (§5.5).
 
 Pipeline:
 
@@ -165,10 +165,17 @@ plumbing is needed.
 - Switch `render_html` to `SandboxedEnvironment`. Built-in templates already work under it.
 - Give WeasyPrint a `url_fetcher` that only allows `data:` and `file:` under the template folder
   and blocks remote fetches (SSRF). xhtml2pdf gets a `link_callback` with the same rule.
-- Cap the render time and output size (`reports.max_render_seconds`, `max_output_mb`). *Deferred to
-  phase 3, where AI-written templates make it matter; `from.max_rows` already bounds the input.*
+- Cap the render time and output size. *Implemented in phase 3 for AI templates as size limits: a template
+  may be at most 200,000 characters and a test render at most 10 MB of HTML. Jinja's sandbox already caps
+  `range()`, and `from.max_rows` bounds the input, so no separate timer was added.*
 
 ### 5.3 "Ask for a report" (agent end-to-end)
+
+*Phase 3 ships `pw report ask` as a fixed pipeline, not a tool-using agent. A planning call sees a catalog of
+GET endpoints and SQL tables (names and columns only, sources at level `none` left out) and returns
+`{name, from, formats, design_prompt}`. That plan is checked (with up to `max_repairs` corrections), then goes
+through `design`, then the report runs. The agent below needs the report and filesystem tools, so it moves
+to phase 4.*
 
 A built-in agent template `report_author` whose tools are the report and filesystem tools from §7:
 
@@ -226,10 +233,11 @@ Access levels, from most to least access:
 Where it is set:
 
 ```yaml
-reports:
-  ai:
-    data_access: full            # project ceiling (default: full)
-    sample_rows: 50              # default rows per authoring run (cap: 500)
+report_ai:                       # top-level: `reports:` is already the list of reports
+  data_access: full              # project ceiling (default: full)
+  sample_rows: 50                # default rows per authoring run (cap: 500)
+  max_repairs: 2
+  templates_dir: .portwright/templates
 
 llm_models:
   corp-gpt:
@@ -242,7 +250,7 @@ sources:
     ai_exclude_columns: [salary, ssn]   # always dropped before profiling, whatever the level
 ```
 
-The same setting also exists on a single report (`ai.data_access`), on a `report_design` step
+The same setting also exists on a single report (`ai_data_access`), on a `report_design` step
 (`data_access:`) and on the CLI (`pw report design … --data-access schema --sample-rows 10`). At
 these levels it can only lower the effective access, never raise it above a ceiling.
 
@@ -480,7 +488,7 @@ mcp_servers:
 |---|---|---|---|
 | 1 ✅ | Renderer registry, `formats`, `data=`, pagination, `from.query`, sandboxed env, URL fetcher, bug fixes (incl. file-source reports, which called a missing `FileSource.read_all`) | `reports/renderers.py`, `reports/service.py`, `reports/engine.py`, `config.py` | `test_reports.py` (each format, multi-format, pagination, sandbox escape attempts) |
 | 2 ✅ | `fs/sandbox.py`, `filesystem`/`destinations` config, `copy`/`move`/`file` steps, `${run.*}` scope, `report` step | `fs/`, `agents/spec.py`, `agents/workflow.py`, `config.py` | `test_fs_sandbox.py` (traversal, ADS, junction, UNC), move = verified copy then delete (incl. cross-volume, delete failure), `test_workflow_files.py` (report → copy pipeline, scopes, foreach, canvas round trip). Also done early: Report / Copy / Move / Files canvas nodes with a YAML *Settings* field, and the canvas keeps any step keys it has no field for, so saving never drops them |
-| 3 | `ReportAuthor`, `report_design` step, `.portwright/templates/` storage, `pw report design/ask/promote`, `report_author` agent template, `pw validate` warning, AI data access policy (§5.5) | `reports/author.py`, `reports/policy.py`, `reports/prompts/author.md`, `config.py`, `agents/spec.py`, `cli.py`, `agents/templates.py` | fake `provider_factory`: valid reply, invalid → repair, repairs exhausted; author cannot write `templates/`; promote; policy: most restrictive level wins, excluded columns never in payload, override cannot raise above ceiling |
+| 3 ✅ | `ReportAuthor`, `report_design` step (+ canvas node), `.portwright/templates/` storage, `pw report design/ask/promote`, `pw validate` warning, `pw init` adds `.portwright/` to an existing `.gitignore`, AI data access policy (§5.5) | `reports/author.py`, `reports/policy.py`, `reports/prompts/author.md`, `config.py`, `agents/spec.py`, `cli.py` (the `report_author` agent template moves to phase 4 with the tools it needs) | `test_report_author.py`, using a fake `provider_factory`: valid reply, invalid → repair, repairs exhausted; author cannot write `templates/`; promote; policy: most restrictive level wins, excluded columns never in payload, override cannot raise above ceiling |
 | 4 | fs/report tool types, MCP expose + blob results + resources | `agents/tools.py`, `mcp/__init__.py` | scope enforcement per tool, `describe_server` output |
 | 5 | Studio: Report / Design / Copy / Move / Files nodes, destination picker, Design-with-AI dialog, gallery badges + promote, docs 16/17/18 | `studio/graph_vm.py`, `studio/views/*`, `docs/*.md` | `test_studio_*` viewmodel tests |
 

@@ -118,6 +118,11 @@ workflows:
   own). `data: ${steps.q.output.rows}` uses rows from an earlier step instead of the report's source; without
   `report`, `formats` + `data` (+ `template` for pdf/html) make an inline report. The output is
   `{outputs: [{path, format, bytes, sha256}], row_count, ...}`. Needs the scope `reports:run`.
+- `report_design`: an AI `model` writes the template of `report` (`input` = what it should show; see *Templates
+  written by AI* in the Reports help). When the report doesn't exist yet, give `from:` (`{endpoint: …}` or
+  `{source: …, query: …}`) and it is created. `overwrite: never` (default) reuses an existing AI template without
+  calling the model, so a scheduled workflow designs once; `always` designs again. `formats`, `base`,
+  `sample_rows` and `data_access` work as on the CLI. Needs the scope `reports:write`.
 - `copy` / `move`: put `files` into the folder `to`. `files` takes a report's `outputs`, a `file list` result,
   paths, or addresses like `reports:2026-11/a.pdf`. `to` is a folder: `dest:<name>/sub/folder` or `<root>:folder`.
   - Each file is written to `name.partial`, checked (`verify: sha256` by default; `size` or `none`), then renamed,

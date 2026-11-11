@@ -13,17 +13,18 @@ import yaml
 
 NODE_W, NODE_H = 200, 78
 GAP_X, GAP_Y = 80, 50
-TYPES = ("input", "tool", "agent", "llm", "load", "report", "copy", "move", "file", "foreach", "condition", "switch",
-         "set", "output")
+TYPES = ("input", "tool", "agent", "llm", "load", "report_design", "report", "copy", "move", "file", "foreach",
+         "condition", "switch", "set", "output")
 OUT_PORTS = {"input": ("next",), "tool": ("next",), "agent": ("next",), "llm": ("next",), "load": ("next",),
-             "report": ("next",), "copy": ("next",), "move": ("next",), "file": ("next",),
-             "foreach": ("next",), "set": ("next",), "condition": ("then", "else"), "output": ()}
-SETTINGS_TYPES = ("report", "copy", "move", "file")   # configured through the node's Settings (YAML)
+             "report_design": ("next",), "report": ("next",), "copy": ("next",), "move": ("next",),
+             "file": ("next",), "foreach": ("next",), "set": ("next",), "condition": ("then", "else"), "output": ()}
+SETTINGS_TYPES = ("report_design", "report", "copy", "move", "file")   # configured through Settings (YAML)
 # step keys the node fields handle; anything else is kept in Node.settings, so saving never drops it
 KNOWN_KEYS = {"id", "type", "x", "y", "tool", "agent", "input", "when", "then", "else", "else_", "next", "value",
               "inputs", "model", "system", "format", "load", "items", "do", "max_items", "cases", "default",
               "on_error"}
 DEFAULT_SETTINGS = {
+    "report_design": "report: \nformats: [pdf]\noverwrite: never",
     "report": "report: \nformats: [pdf]",
     "copy": "files: ${steps.report_1.output.outputs}\nto: dest:\noverwrite: never\nmanifest: false",
     "move": "files: ${steps.report_1.output.outputs}\nto: dest:\noverwrite: never",
@@ -76,7 +77,7 @@ class Node:
     def target_kind(self) -> str | None:
         """The kind of thing this node needs picked: tool | agent | model | load (None if nothing)."""
         kind = self.do if self.type == "foreach" else self.type
-        return {"tool": "tool", "agent": "agent", "llm": "model", "load": "load"}.get(kind)
+        return {"tool": "tool", "agent": "agent", "llm": "model", "report_design": "model", "load": "load"}.get(kind)
 
     def target(self) -> str:
         return {"tool": self.tool, "agent": self.agent, "model": self.model, "load": self.load}.get(self.target_kind or "", "")
@@ -205,7 +206,11 @@ def to_steps(g: Graph) -> list[dict]:
         elif n.type == "set":
             s["value"] = _parse(n.value) if _parse(n.value) is not None else ""
         elif n.type in SETTINGS_TYPES:
-            if n.type == "report" and _parse(n.input) is not None:
+            if n.type == "report_design":
+                s["model"] = n.model
+                if (n.input or "").strip():
+                    s["input"] = _parse(n.input)
+            elif n.type == "report" and _parse(n.input) is not None:
                 s["input"] = _parse(n.input)
         else:                                            # condition, switch
             s["when"] = n.when
@@ -402,6 +407,11 @@ def problems(g: Graph, tools: list[str], agents: list[str], models: list[str] | 
             opts = _parse(n.settings) if isinstance(_parse(n.settings), dict) else {}
             if n.type == "report" and not (opts.get("report") or opts.get("formats")):
                 out.append(f"{n.id}: name the report to run (report: <name>)")
+            if n.type == "report_design":
+                if not opts.get("report"):
+                    out.append(f"{n.id}: name the report to design (report: <name>)")
+                if not (n.input or "").strip():
+                    out.append(f"{n.id}: describe what the report should show")
             if n.type in ("copy", "move"):
                 if not opts.get("files"):
                     out.append(f"{n.id}: say which files to {n.type} (files: ${{steps.<report>.output.outputs}})")

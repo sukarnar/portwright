@@ -86,6 +86,10 @@ class Project:
         gi = directory / ".gitignore"
         if not gi.exists():
             gi.write_text(".env\nlogs/\n__pycache__/\n.portwright/\n", encoding="utf-8")
+        else:                                 # vault, run traces and AI templates must stay out of git
+            lines = gi.read_text(encoding="utf-8").splitlines()
+            if not any(l.strip().rstrip("/") in (".portwright", "/.portwright") for l in lines):
+                gi.write_text("\n".join(lines + [".portwright/"]) + "\n", encoding="utf-8")
         for d in ("data", "handlers", "logs"):
             (directory / d).mkdir(exist_ok=True)
         return cls(cfg_path, actor)

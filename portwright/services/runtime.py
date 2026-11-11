@@ -46,6 +46,12 @@ class RuntimeService:
         public = [e.name for e in cfg.endpoints if e.public]
         if public:
             warnings.append(f"public endpoints: {', '.join(public)}")
+        ai_dir = cfg.report_ai.templates_dir.replace("\\", "/").rstrip("/") + "/"
+        unpromoted = [r.name for r in cfg.reports
+                      if r.template and r.template.replace("\\", "/").startswith(ai_dir)]
+        if unpromoted:
+            warnings.append(f"reports using AI templates outside git ({ai_dir}): {', '.join(unpromoted)} - "
+                            "they won't exist in another checkout; run 'portwright report promote <name>'")
         return Validation(True, f"{len(cfg.endpoints)} endpoints across {len(cfg.sources)} sources are valid",
                           warnings)
 

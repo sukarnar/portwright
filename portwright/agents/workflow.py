@@ -255,6 +255,26 @@ async def _report(st, raw_input: Any, scope: dict, env: "_Env") -> dict:
     return res.to_dict()
 
 
+async def _report_design(st, scope: dict, env: "_Env") -> tuple[dict, int]:
+    """AI-author the report's template. overwrite: never (default) reuses an existing AI template, always
+    designs again. Needs the scope reports:write."""
+    _need_scope(env, "reports:write")
+    from ..reports.author import ReportAuthor
+    prompt = resolve(st.input, scope)
+    author = ReportAuthor(_ProjectView(env.config, env.root, env.credentials), actor=env.actor,
+                          provider_factory=env.provider_factory)
+    try:
+        res = await author.design(st.report, prompt if isinstance(prompt, str) else json.dumps(prompt, default=str),
+                                  frm=resolve(st.from_, scope) if st.from_ else None,
+                                  formats=resolve(st.formats, scope) if st.formats else None, model=st.model,
+                                  base=st.base, sample_rows=st.sample_rows, data_access=st.data_access,
+                                  if_exists="replace" if st.overwrite == "always" else "keep")
+    except _fs_errors() as exc:
+        raise ToolError(str(exc)) from None
+    env._reports = None                      # the report definition may have changed
+    return res.to_dict(), res.tokens
+
+
 async def _transfer(kind: str, st, scope: dict, env: "_Env") -> list:
     files, to = resolve(st.files, scope), resolve(st.to, scope)
     try:
@@ -382,6 +402,8 @@ async def run_workflow(config: ProjectConfig, root: str | Path, credentials, nam
                     res.output, res.run_id, res.tokens = await _do(st.type, st, st.input, scope, env)
                 elif st.type == "file":
                     res.output = await _file(st, scope, env)
+                elif st.type == "report_design":
+                    res.output, res.tokens = await _report_design(st, scope, env)
                 elif st.type == "foreach":
                     res.output, res.tokens = await _foreach(st, scope, env)
                 elif st.type == "input":

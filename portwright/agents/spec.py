@@ -7,6 +7,10 @@ from pydantic import BaseModel, Field, model_validator
 
 NAME = r"^[a-zA-Z][a-zA-Z0-9_\-]{0,63}$"
 
+# How much report data an AI model may see, from least to most (see portwright/reports/policy.py)
+DataAccess = Literal["none", "schema", "profile", "sample", "full"]
+DATA_ACCESS_ORDER = ("none", "schema", "profile", "sample", "full")
+
 
 class LlmTls(BaseModel):
     """TLS for corporate gateways: private CA and/or mutual TLS. Paths are relative to the project root."""
@@ -32,6 +36,7 @@ class LlmModelSpec(BaseModel):
     timeout_seconds: float = Field(120, gt=0, le=3600)
     max_tokens: int = Field(4096, ge=1)
     temperature: float | None = Field(None, ge=0, le=2)
+    data_access: DataAccess = "full"     # ceiling on report data this model may see (AI report authoring)
 
 
 ToolType = Literal["endpoint", "source", "mcp"]
@@ -73,7 +78,7 @@ class AgentSpec(BaseModel):
 
 
 StepType = Literal["input", "tool", "agent", "llm", "load", "foreach", "condition", "switch", "set", "output",
-                   "report", "copy", "move", "file"]
+                   "report", "report_design", "copy", "move", "file"]
 FileOp = Literal["write", "read", "list", "mkdir", "delete", "zip"]
 Overwrite = Literal["never", "always", "rename", "if_newer"]
 
@@ -121,6 +126,11 @@ class WorkflowStep(BaseModel):
     manifest: bool = False               # copy / move: write manifest.json beside the files
     glob: str | None = None              # file list
     recursive: bool = False              # file list
+    # report_design: an AI model writes the report's template (input = what the report should show)
+    from_: dict[str, Any] | None = Field(None, alias="from")   # the report's data, when it does not exist yet
+    base: str | None = None              # a gallery template (or project file) to start from
+    sample_rows: int | None = Field(None, ge=0, le=500)
+    data_access: DataAccess | None = None   # lower the data access for this run (never raises it)
 
     model_config = {"populate_by_name": True}
 
@@ -138,6 +148,14 @@ class WorkflowStep(BaseModel):
             raise ValueError(f"step '{self.id}': type load needs 'load'")
         if self.type == "switch" and not self.when:
             raise ValueError(f"step '{self.id}': type switch needs 'when' (the value to switch on)")
+        if self.type == "report_design":
+            if not (self.model and self.report):
+                raise ValueError(f"step '{self.id}': type report_design needs 'model' and 'report' (the name)")
+            if self.input in (None, ""):
+                raise ValueError(f"step '{self.id}': type report_design needs 'input' (what the report shows)")
+            if self.overwrite not in (None, "never", "always"):
+                raise ValueError(f"step '{self.id}': report_design 'overwrite' is never (keep an existing AI "
+                                 "template) or always (design again)")
         kind = self.do if self.type == "foreach" else self.type
         if kind == "report" and not (self.report or self.formats):
             raise ValueError(f"step '{self.id}': a report step needs 'report' (a report name), or 'formats' "

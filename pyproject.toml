@@ -42,4 +42,4 @@ restforge = "portwright.cli:app"          # old name, kept so existing scripts a
 include = ["portwright*", "restforge"]
 
 [tool.setuptools.package-data]
-portwright = ["static/swagger/*", "docs/*.md", "reports/templates/*.html"]
+portwright = ["static/swagger/*", "docs/*.md", "reports/templates/*.html", "reports/prompts/*.md"]

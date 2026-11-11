@@ -192,6 +192,70 @@ portwright report remove <name>
 | `sum_col` | `{{ rows \| sum_col('amount') }}` | Sum a column |
 | `groupby_col` | `{% for k, grp in rows \| groupby_col('dept') %}` | Group rows by column |
 
+### Templates written by AI
+
+An LLM model from `llm_models` can write the template for you. Portwright checks every template it
+writes before saving it.
+
+```
+portwright report design staff --from-source hr --query "select name, dept, salary from employees" \
+    --prompt "Staff by department: KPI cards on top, then a table" --format pdf,xlsx --base summary_dashboard
+portwright report design dept-headcount --prompt "Highlight departments over 50 people" --force   # existing report
+portwright report ask "Monthly salary cost by department as PDF" --model corp
+portwright report promote staff          # copy it into templates/ so it goes into git
+```
+
+What happens on `report design`:
+
+1. The report's data is read (up to `report_ai.sample_rows` rows) and described to the model: column names and
+   types, and, depending on the data access level, statistics and real rows.
+2. The model replies with a template. It is checked: no scripts, no remote files (`src`, `url()`, `@import`,
+   `<link>`), no `{% include %}`; it must render in the sandbox with the real rows **and** with no rows; and,
+   when PDF is wanted, a test PDF must build.
+3. If a check fails, the error goes back to the model, up to `report_ai.max_repairs` times (default 2). If it
+   still fails, nothing is saved and the last attempt is kept in `.portwright/drafts/`.
+4. The template is saved to `.portwright/templates/<name>.html` (outside git; the previous one goes to
+   `.history/`), and the report is created or updated with a `provenance` record: model, prompt, data access
+   level, the columns and number of rows the model saw.
+
+`report ask` adds a first step: the model sees a catalog of GET endpoints and SQL tables (names and columns only)
+and picks the data, the formats and a name; then the template is designed and the report runs (`--no-run` to
+skip). Use `--endpoint` / `--source` to narrow the catalog.
+
+A report using an AI template works locally but its template is not in git, so `portwright validate` warns until
+you run `report promote`. A report with a hand-written template is only switched to an AI one with `--force`
+(the hand-written file is never changed).
+
+**What the model may see.** The models are expected to run locally, so by default the model sees real rows.
+Every setting below can only *lower* that; the strictest one wins:
+
+| Level | The model receives |
+|---|---|
+| `full` (default) | real rows, as they are |
+| `sample` | real rows, long values cut to 200 characters |
+| `profile` | column names, types, null rate, distinct count, numeric/date min and max |
+| `schema` | column names and types only |
+| `none` | nothing: AI authoring is refused for this data |
+
+```yaml
+report_ai:
+  data_access: full          # project ceiling
+  sample_rows: 50            # rows read per design run (0-500)
+  max_repairs: 2
+llm_models:
+  cloud-model: {base_url: https://api.example.com/v1, model: m, data_access: schema}   # per model
+sources:
+  hr:
+    ai_data_access: profile          # this source and every endpoint on it
+    ai_exclude_columns: [ssn, salary] # never sent, at any level
+reports:
+  - name: payroll
+    ai_data_access: schema           # this report
+```
+
+`--data-access` / `--sample-rows` on the CLI (and `data_access` / `sample_rows` on a `report_design` workflow step)
+lower it for one run. Every design run is written to the audit log (`report_ai_author`) with what was sent.
+
 ### Template safety
 
 Templates render in Jinja2's **sandbox**: they can format and loop over data but cannot reach Python

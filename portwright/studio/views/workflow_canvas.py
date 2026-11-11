@@ -15,6 +15,7 @@ NODE_STYLE = {   # type -> (label, icon, background, accent)
     "condition": ("Condition", ft.Icons.CALL_SPLIT, ft.Colors.AMBER_50, ft.Colors.AMBER_800),
     "llm": ("LLM prompt", ft.Icons.AUTO_AWESOME, ft.Colors.CYAN_50, ft.Colors.CYAN_800),
     "load": ("Run load", ft.Icons.STORAGE, ft.Colors.ORANGE_50, ft.Colors.ORANGE_800),
+    "report_design": ("Design report (AI)", ft.Icons.AUTO_AWESOME_MOSAIC, ft.Colors.PURPLE_50, ft.Colors.PURPLE_900),
     "report": ("Report", ft.Icons.DESCRIPTION, ft.Colors.LIGHT_BLUE_50, ft.Colors.LIGHT_BLUE_900),
     "copy": ("Copy", ft.Icons.FILE_COPY, ft.Colors.LIGHT_GREEN_50, ft.Colors.LIGHT_GREEN_900),
     "move": ("Move", ft.Icons.DRIVE_FILE_MOVE, ft.Colors.DEEP_ORANGE_50, ft.Colors.DEEP_ORANGE_800),
@@ -185,7 +186,8 @@ class WorkflowCanvas:
         to = to if to.rstrip("/:") not in ("", "dest") else "choose a folder"
         fmts = opts.get("formats")
         fmts = ", ".join(fmts) if isinstance(fmts, list) else (fmts or "")
-        return {"report": (opts.get("report") or "inline report") + (f" · {fmts}" if fmts else ""),
+        return {"report_design": (opts.get("report") or "name the report") + " · " + (n.model or "choose a model"),
+                "report": (opts.get("report") or "inline report") + (f" · {fmts}" if fmts else ""),
                 "copy": f"→ {to}", "move": f"→ {to} (removes sources)",
                 "file": str(opts.get("op") or "choose an operation") + " " + str(opts.get("to") or opts.get("path") or ""),
                 "input": names or "declare the inputs", "tool": n.tool or "choose a tool",
@@ -395,6 +397,10 @@ class WorkflowCanvas:
                                         n.format or "text"))]
 
     _SETTINGS_HELP = {
+        "report_design": "report: the report to design (it is created when it does not exist; then add from: "
+                         "{endpoint: <name>} or {source: <sql>, query: ...}). formats: [pdf, xlsx]. base: a gallery "
+                         "template to start from. overwrite: never reuses an existing AI template, always designs "
+                         "again. data_access / sample_rows can only lower what the model sees. Needs reports:write.",
         "report": "report: <name> runs a saved report (formats: [pdf, xlsx] overrides its formats; "
                   "data: ${steps.q.output.rows} uses rows from an earlier step). Needs the scope reports:run. "
                   "Later steps use ${steps.<id>.output.outputs}.",
@@ -410,6 +416,10 @@ class WorkflowCanvas:
 
     def _settings_fields(self, n: gv.Node, bind) -> list[ft.Control]:
         out: list[ft.Control] = []
+        if n.type == "report_design":
+            out += [self._pick(n, bind, "model", "Model", self.models, "No models yet. Add one on the Models tab."),
+                    bind("input", text_field("What should the report show?", n.input, multiline=True, min_lines=3,
+                                             hint="e.g. Headcount by department as KPI cards and a table"))]
         if n.type == "report":
             out.append(bind("input", text_field("Report params (YAML)", n.input, multiline=True, min_lines=2,
                                                 hint="e.g. dept: ${input.dept}")))
