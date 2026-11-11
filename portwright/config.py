@@ -677,6 +677,14 @@ class ProjectConfig(BaseModel):
         self._check_agents()
         return self
 
+    def _check_place(self, who: str, name: str) -> None:
+        """A root name, or dest:<name>, must exist (reports, templates and data always do)."""
+        if name.startswith("dest:"):
+            if name[5:] not in self.destinations:
+                raise ValueError(f"{who} uses unknown destination '{name[5:]}'")
+        elif name not in self.filesystem.roots and name not in ("reports", "templates", "data"):
+            raise ValueError(f"{who} uses unknown filesystem root '{name}'")
+
     def _check_address(self, wf: str, step: str, addr: str | None) -> None:
         """A literal 'root:...' / 'dest:name/...' in a step must name a defined root or destination."""
         if not addr or "${" in addr.split(":", 1)[0]:          # the root itself is chosen at run time
@@ -729,6 +737,21 @@ class ProjectConfig(BaseModel):
                     raise ValueError(f"tool '{n}': source '{t.source}' is read-only; allow writes there first")
             if t.type == "mcp" and t.server not in self.mcp_servers:
                 raise ValueError(f"tool '{n}' uses unknown MCP server '{t.server}'")
+            if t.type == "filesystem":
+                for r in t.roots:
+                    self._check_place(f"tool '{n}'", r)
+            if t.type == "report":
+                for r in t.reports:
+                    if self.report(r) is None:
+                        raise ValueError(f"tool '{n}' uses unknown report '{r}'")
+        for n, m in self.mcp_servers.items():
+            for r in m.expose.reports:
+                if self.report(r) is None:
+                    raise ValueError(f"MCP server '{n}' exposes unknown report '{r}'")
+            for f in m.expose.filesystem:
+                self._check_place(f"MCP server '{n}'", f.root)
+                if f.root.startswith("dest:") and set(f.ops) - {"write", "mkdir", "copy", "move", "zip"}:
+                    raise ValueError(f"MCP server '{n}': {f.root} is write-only; it cannot be listed or read")
         for n, a in self.agents.items():
             for t in a.tools:
                 if t not in self.tools:
@@ -743,6 +766,10 @@ class ProjectConfig(BaseModel):
             for st in w.steps:
                 if st.type == "tool" and st.tool not in self.tools:
                     raise ValueError(f"workflow '{n}' step '{st.id}': unknown tool '{st.tool}'")
+                if st.type in ("tool", "foreach") and st.tool in self.tools and \
+                        self.tools[st.tool].type in ("filesystem", "report"):
+                    raise ValueError(f"workflow '{n}' step '{st.id}': tool '{st.tool}' is for agents; in a workflow "
+                                     "use the report, copy, move and file steps")
                 if st.type == "agent" and st.agent not in self.agents:
                     raise ValueError(f"workflow '{n}' step '{st.id}': unknown agent '{st.agent}'")
                 if st.type == "load" and st.load not in {x.name for x in self.loads}:

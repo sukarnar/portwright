@@ -49,6 +49,32 @@ workflows:
     output: "${steps.review.output}"
 ```
 
+**File and report tools for agents.** Two more tool types give an agent several tools each, named
+`<tool>_<op>` (so a tool called `fs` gives `fs_list`, `fs_read`, ...):
+
+```yaml
+tools:
+  fs:     {type: filesystem, roots: [reports, dest:finance], ops: [list, read, search, copy]}
+  report: {type: report, reports: [staff], ops: [sources, sample, preview, save, run]}
+```
+
+- `filesystem`: `list`, `stat`, `read` (Excel comes back as rows), `search` (by name and/or text), `write`,
+  `mkdir`, `copy`, `move`, `delete`, `zip` on the listed `roots` only, with the same sandbox and scopes as
+  workflow file steps (`fs:<root>:read`, `fs:<root>:write`, `fs:dest:<name>`). Default ops: list, stat, read.
+- `report`: `sources` (reports, GET endpoints and SQL sources), `sample` (a report's data, shaped by the AI data
+  access policy for the agent's model), `preview` (check a template against real data; the rendered text is
+  only returned at data access `sample` or `full`), `save` (save a template the agent wrote, after the same
+  checks as `report design`), `run`, and `design` (let the report author model write it). `reports` limits
+  which reports it may use (empty: all). Reading and running need `reports:run`; `save` and `design` need
+  `reports:write`.
+
+These tools are for agents; in a workflow use the `report`, `copy`, `move` and `file` steps instead.
+
+**Ready-made agent.** `portwright agent from-template report-author author --model corp` creates the `report`
+and `fs` tools and an agent that turns a request into a report: it looks at the sources, samples the data,
+writes a template, previews and fixes it, saves it and runs it. Its templates stay in `.portwright/templates/`
+until you `report promote` them.
+
 Workflow references: `${input.KEY}` and `${steps.ID.output.field[0]}`. A condition jumps to the step named in
 `then` / `else` (`end` stops). `on_error: continue` on a step lets the workflow go on after a failure.
 An agent answer that is JSON becomes structured data for later steps.

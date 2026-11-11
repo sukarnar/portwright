@@ -89,6 +89,7 @@ async def run_agent(config: ProjectConfig, root: str | Path, credentials, name: 
     try:
         async with ToolRuntime(config, root, credentials, spec.scopes, f"agent:{name}",
                                transport_factory) as rt:
+            rt.agent_model, rt.provider_factory = spec.model, provider_factory
             registry = build_registry(rt, spec.tools, config.tools)
             if skills:
                 registry.add(_skill_tool(skills))

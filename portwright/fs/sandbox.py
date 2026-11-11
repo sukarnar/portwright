@@ -100,9 +100,11 @@ def _inside(base: Path, target: Path) -> bool:
 
 class Sandbox:
     def __init__(self, config: ProjectConfig, project_root: str | Path, *, scopes: Iterable[str] | None = None,
-                 actor: str = "portwright", audit: Any = None):
+                 actor: str = "portwright", audit: Any = None, allowed: Iterable[str] | None = None):
         """``scopes=None`` means unrestricted (local admin use, e.g. the CLI); otherwise every operation needs
-        ``fs:<root>:read`` / ``fs:<root>:write`` / ``fs:dest:<name>`` (or ``*``)."""
+        ``fs:<root>:read`` / ``fs:<root>:write`` / ``fs:dest:<name>`` (or ``*``). ``allowed`` (root names and
+        ``dest:<name>``) limits the places at all - a tool only reaches the roots it was given."""
+        self.allowed = None if allowed is None else frozenset(allowed)
         self.cfg = config
         self.project = Path(project_root).resolve()
         self.scopes = None if scopes is None else frozenset(scopes)
@@ -152,6 +154,9 @@ class Sandbox:
             base = self._base(spec.path, f"root '{name}'")
             readable, writable = spec.mode in ("read", "read_write"), spec.mode in ("write", "read_write")
             patterns, delete = tuple(spec.patterns), spec.delete
+        key = f"dest:{name}" if kind == "dest" else name
+        if self.allowed is not None and key not in self.allowed:
+            raise FsError(f"'{key}' is not available here; allowed: {', '.join(sorted(self.allowed)) or 'none'}")
         parts = _check_parts(rel)
         try:
             target = base.joinpath(*parts).resolve() if parts else base
@@ -287,6 +292,76 @@ class Sandbox:
         self._record("read", path=pl.address, bytes=size)
         return {"path": str(pl.path), "address": pl.address, "bytes": size, "content": text[:cap],
                 "truncated": len(text) > cap}
+
+    def search(self, address: Any, glob: str | None = None, text: str | None = None,
+               max_results: int = 50) -> list[dict]:
+        """Files under a folder matching *glob*; with *text*, only text files containing it (with line hits)."""
+        pl = self.resolve(address)
+        self._need_read(pl)
+        if not pl.path.is_dir():
+            raise FsError(f"'{pl.address}' is not a folder")
+        needle = (text or "").lower()
+        cap = max(1, min(int(max_results or 50), MAX_LIST))
+        out: list[dict] = []
+        for p in sorted(pl.path.rglob(glob or "*")):
+            try:
+                rp = p.resolve()
+            except OSError:
+                continue
+            if not p.is_file() or not _inside(pl.base, rp):
+                continue
+            entry = {"name": p.name, "address": self._addr(pl, rp), "bytes": p.stat().st_size}
+            if needle:
+                if entry["bytes"] > min(self.max_bytes, 5 * 1024 * 1024):
+                    continue
+                try:
+                    lines = rp.read_text(encoding="utf-8-sig").splitlines()
+                except (UnicodeDecodeError, OSError):
+                    continue
+                hits = [{"line": i + 1, "text": ln.strip()[:200]} for i, ln in enumerate(lines) if needle in ln.lower()]
+                if not hits:
+                    continue
+                entry["matches"] = hits[:5]
+            out.append(entry)
+            if len(out) >= cap:
+                break
+        self._record("search", path=pl.address, glob=glob, text=bool(text), count=len(out))
+        return out
+
+    def read_table(self, address: Any, max_rows: int = 50) -> dict:
+        """The first rows of a CSV / Excel / JSON file (Excel cannot be read as text)."""
+        from ..sources.files import parse_file
+        pl = self.resolve(address)
+        self._need_read(pl)
+        if not pl.path.is_file():
+            raise FsError(f"'{pl.address}' is not a file")
+        size = pl.path.stat().st_size
+        if size > self.max_bytes:
+            raise FsError(f"'{pl.address}' is {size:,} bytes; the limit is {self.max_bytes:,}")
+        try:
+            rows = parse_file(pl.path)
+        except Exception as exc:                                     # noqa: BLE001 - parser messages vary
+            raise FsError(f"could not read '{pl.address}' as a table: {str(exc)[:200]}") from None
+        cols: dict[str, None] = {}
+        for r in rows[:max_rows]:
+            for k in r:
+                cols.setdefault(k, None)
+        self._record("read", path=pl.address, bytes=size, table=True)
+        return {"address": pl.address, "columns": list(cols), "row_count": len(rows),
+                "rows": [{k: (v if isinstance(v, (str, int, float, bool)) or v is None else str(v)) for k, v in r.items()}
+                         for r in rows[:max_rows]], "truncated": len(rows) > max_rows}
+
+    def read_bytes(self, address: Any, max_bytes: int) -> tuple[Place, bytes]:
+        pl = self.resolve(address)
+        self._need_read(pl)
+        if not pl.path.is_file():
+            raise FsError(f"'{pl.address}' is not a file")
+        size = pl.path.stat().st_size
+        if size > min(max_bytes, self.max_bytes):
+            raise FsError(f"'{pl.address}' is {size:,} bytes; the limit here is {min(max_bytes, self.max_bytes):,}")
+        data = pl.path.read_bytes()
+        self._record("read", path=pl.address, bytes=size, blob=True)
+        return pl, data
 
     @staticmethod
     def _addr(pl: Place, p: Path) -> str:

@@ -1632,16 +1632,24 @@ def tool_list(config: str = CONFIG_OPT):
 
 
 @tool_app.command("add")
-def tool_add(name: str, type: str = typer.Option(..., "--type", "-t", help="endpoint | source | mcp"),
+def tool_add(name: str, type: str = typer.Option(..., "--type", "-t", help="endpoint | source | mcp | filesystem | report"),
              endpoint: Optional[str] = None, source: Optional[str] = None,
              server: Optional[str] = typer.Option(None, help="type mcp: an MCP server name."),
              write: bool = typer.Option(False, help="type source: allow non-SELECT statements (writable source)."),
              max_rows: int = typer.Option(200, help="type source: rows returned per call."),
+             root: list[str] = typer.Option([], "--root", help="type filesystem: a root or dest:<name> (repeatable)."),
+             op: list[str] = typer.Option([], "--op", help="filesystem: list stat read search write mkdir copy move "
+                                                         "delete zip · report: sources sample preview save run design"),
+             report: list[str] = typer.Option([], "--report", help="type report: a report it may use (default: all)."),
+             model: Optional[str] = typer.Option(None, help="type report: model for 'design' and data access."),
              description: str = "", replace: bool = False, config: str = CONFIG_OPT):
-    """Define a tool (endpoint: API call through the full pipeline; source: SQL; mcp: an MCP server's tools)."""
-    _run(_svc(config).agents.set, "tool", name, {"type": type, "endpoint": endpoint, "source": source,
-                                                 "server": server, "read_only": not write, "max_rows": max_rows,
-                                                 "description": description}, replace)
+    """Define a tool. endpoint: API call through the full pipeline; source: SQL; mcp: an MCP server's tools;
+    filesystem: <name>_<op> tools on the given roots; report: <name>_<op> report tools."""
+    data: dict = {"type": type, "endpoint": endpoint, "source": source, "server": server, "read_only": not write,
+                  "max_rows": max_rows, "description": description}
+    if type in ("filesystem", "report"):
+        data.update(roots=root, ops=[o for v in op for o in v.split(",") if o], reports=report, model=model)
+    _run(_svc(config).agents.set, "tool", name, data, replace)
     _ok(f"Tool '{name}' saved")
 
 
@@ -1697,6 +1705,24 @@ def agent_add(name: str, model: str = typer.Option(..., help="A model name (see 
         "max_steps": max_steps, "max_tokens_budget": budget, "timeout_seconds": timeout,
         "description": description}, replace)
     _ok(f"Agent '{name}' saved. Run it: portwright agent run {name} \"your task\"")
+
+
+@agent_app.command("templates")
+def agent_templates(config: str = CONFIG_OPT):
+    """Ready-made agents (create one with 'agent from-template')."""
+    for t in _svc(config).agents.agent_templates():
+        typer.echo(f"{t['id']:<16} {t['title']:<16} {t['description']}  (tools: {', '.join(t['tools'])})")
+
+
+@agent_app.command("from-template")
+def agent_from_template(template: str = typer.Argument(..., help="Template id, e.g. report-author."),
+                        name: str = typer.Argument(..., help="Name of the new agent."),
+                        model: str = typer.Option(..., help="The model the agent uses."),
+                        config: str = CONFIG_OPT):
+    """Create an agent and the tools it needs from a ready-made template."""
+    made = _run(_svc(config).agents.add_agent_from_template, template, name, model)
+    _ok("Created " + ", ".join(made))
+    typer.echo(f'Run it: portwright agent run {name} "your request"')
 
 
 @agent_app.command("show")
@@ -1807,15 +1833,33 @@ def mcp_add(name: str, endpoint: list[str] = typer.Option([], "--endpoint", help
             source: list[str] = typer.Option([], "--source", help="SQL source to expose (repeatable)."),
             table: list[str] = typer.Option([], "--table", help="Table the exposed sources may be queried on."),
             load: list[str] = typer.Option([], "--load", help="Load to expose as run_load_<name>."),
+            report: list[str] = typer.Option([], "--report", help="Report to expose as run_report_<name>."),
+            fs: list[str] = typer.Option([], "--fs", help="ROOT[:op,op] folder to expose as fs_<op> tools "
+                                                         "(default ops list,stat,read), e.g. reports:list,read"),
             scope: list[str] = typer.Option([], "--scope", help="Scope of the principal used for tool calls."),
             transport: str = typer.Option("stdio", help="stdio | http"), description: str = "",
             replace: bool = False, config: str = CONFIG_OPT):
     """Define an MCP server. Sources are read-only; --table limits what can be queried."""
     _run(_svc(config).agents.set, "mcp", name, {
         "description": description, "transport": transport, "scopes": scope,
-        "expose": {"endpoints": endpoint, "loads": load,
+        "expose": {"endpoints": endpoint, "loads": load, "reports": report,
+                   "filesystem": [_fs_expose(f) for f in fs],
                    "sources": [{"name": s, "tables": table, "read_only": True} for s in source]}}, replace)
     _ok(f"MCP server '{name}' saved. See its tools: portwright mcp tools {name}")
+
+
+def _fs_expose(value: str) -> dict:
+    """'reports' / 'reports:list,read' / 'dest:finance:copy'"""
+    if value.startswith("dest:"):
+        rest = value[5:]
+        name, _, ops = rest.partition(":")
+        root = f"dest:{name}"
+    else:
+        root, _, ops = value.partition(":")
+    out: dict = {"root": root}
+    if ops:
+        out["ops"] = [o for o in ops.split(",") if o]
+    return out
 
 
 @mcp_app.command("tools")

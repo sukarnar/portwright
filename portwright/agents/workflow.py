@@ -196,15 +196,9 @@ class _Env:
         return self._reports
 
 
-@dataclass
-class _ProjectView:
-    """What ReportService needs from a Project, built from a running workflow's config."""
-    config: ProjectConfig
-    root: Path
-    creds: Any
-
-    def credentials(self):
-        return self.creds
+def _ProjectView(config, root, creds):                 # noqa: N802 - kept name; see reports.service.ProjectView
+    from ..reports.service import ProjectView
+    return ProjectView(config, Path(root), creds)
 
 
 def run_info(run_id: str, now: datetime | None = None) -> dict:

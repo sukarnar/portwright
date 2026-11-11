@@ -39,7 +39,10 @@ class LlmModelSpec(BaseModel):
     data_access: DataAccess = "full"     # ceiling on report data this model may see (AI report authoring)
 
 
-ToolType = Literal["endpoint", "source", "mcp"]
+ToolType = Literal["endpoint", "source", "mcp", "filesystem", "report"]
+FsToolOp = Literal["list", "stat", "read", "search", "write", "mkdir", "copy", "move", "delete", "zip"]
+ReportToolOp = Literal["sources", "sample", "preview", "save", "run", "design"]
+FS_READ_OPS = ("list", "stat", "read", "search")
 
 
 class ToolSpec(BaseModel):
@@ -50,9 +53,29 @@ class ToolSpec(BaseModel):
     server: str | None = None            # type mcp: a defined MCP server (all of its tools)
     read_only: bool = True               # source tools: SELECT only unless false (needs a writable source)
     max_rows: int = Field(200, ge=1, le=10000)
+    # type filesystem: one tool per op, named <tool>_<op> (name the tool 'fs' to get fs_list, fs_read, ...)
+    roots: list[str] = Field(default_factory=list)   # root names and dest:<name>; the only places it may touch
+    ops: list[str] = Field(default_factory=list)     # filesystem default: list, stat, read · report: sources, run
+    # type report: report_<op> tools (name the tool 'report'); reports: the reports it may use (empty: all)
+    reports: list[str] = Field(default_factory=list)
+    model: str | None = None             # report design: the model that writes templates (default: the only one)
 
     @model_validator(mode="after")
     def _fields(self) -> "ToolSpec":
+        if self.type == "filesystem":
+            if not self.roots:
+                raise ValueError("tool of type 'filesystem' needs 'roots' (root names and/or dest:<name>)")
+            self.ops = self.ops or list(FS_READ_OPS[:3])
+            bad = sorted(set(self.ops) - set(FsToolOp.__args__))
+            if bad:
+                raise ValueError(f"unknown filesystem op(s) {bad}; choose from {', '.join(FsToolOp.__args__)}")
+            return self
+        if self.type == "report":
+            self.ops = self.ops or ["sources", "run"]
+            bad = sorted(set(self.ops) - set(ReportToolOp.__args__))
+            if bad:
+                raise ValueError(f"unknown report op(s) {bad}; choose from {', '.join(ReportToolOp.__args__)}")
+            return self
         need = {"endpoint": self.endpoint, "source": self.source, "mcp": self.server}[self.type]
         key = {"endpoint": "endpoint", "source": "source", "mcp": "server"}[self.type]
         if not need:
@@ -197,10 +220,17 @@ class McpSourceExpose(BaseModel):
     read_only: bool = True
 
 
+class McpFsExpose(BaseModel):
+    root: str                                            # a root name, or dest:<name> (write-only)
+    ops: list[FsToolOp] = Field(default_factory=lambda: ["list", "stat", "read"])
+
+
 class McpExpose(BaseModel):
     endpoints: list[str] = Field(default_factory=list)
     sources: list[McpSourceExpose] = Field(default_factory=list)
     loads: list[str] = Field(default_factory=list)       # run_load_<name> tools (needs scope load:run)
+    reports: list[str] = Field(default_factory=list)     # run_report_<name> tools (needs scope reports:run)
+    filesystem: list[McpFsExpose] = Field(default_factory=list)   # fs_<op> tools on these roots
 
 
 class McpServerSpec(BaseModel):
@@ -208,3 +238,4 @@ class McpServerSpec(BaseModel):
     transport: Literal["stdio", "http"] = "stdio"
     expose: McpExpose = Field(default_factory=McpExpose)
     scopes: list[str] = Field(default_factory=list)      # principal used for tool calls
+    max_blob_mb: float = Field(10, gt=0, le=100)         # fs_read returns files up to this size as MCP resources

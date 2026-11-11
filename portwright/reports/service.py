@@ -37,6 +37,17 @@ class ReportResult:
                 "seconds": self.seconds, "truncated": self.truncated, "warnings": self.warnings}
 
 
+@dataclass
+class ProjectView:
+    """What the report services need from a Project, for callers that only hold a config (workflows, tools)."""
+    config: Any
+    root: Path
+    creds: Any = None
+
+    def credentials(self):
+        return self.creds
+
+
 def _err(msg: str) -> Exception:
     from ..services.project import ServiceError
     return ServiceError(msg)

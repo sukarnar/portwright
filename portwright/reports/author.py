@@ -324,6 +324,58 @@ class ReportAuthor:
                             repairs, tokens, str(reply.get("title") or ""), str(reply.get("description") or ""),
                             warnings)
 
+    def save_written(self, name: str, template: str, *, frm: ReportFrom | dict | None = None,
+                     formats: list[str] | None = None, vars: dict | None = None, description: str = "",
+                     written_by: str = "agent", if_exists: str = "error", data_access: str = "",
+                     columns_seen: list[str] | None = None) -> DesignResult:
+        """Save a template an agent wrote itself (draft → report_preview → report_save). Same checks, storage and
+        provenance as ``design``; the data the agent saw went through ``report_sample`` and its policy."""
+        if not re.match(r"^[a-zA-Z][a-zA-Z0-9_\-]{0,63}$", name or ""):
+            raise _err(f"invalid report name '{name}'")
+        existing = self.cfg.report(name)
+        if isinstance(frm, dict):
+            frm = ReportFrom.model_validate(frm)
+        frm = frm or (existing.from_ if existing else None)
+        if frm is None:
+            raise _err(f"report '{name}' does not exist yet: give 'from' (an endpoint or a SQL source and query)")
+        if existing and existing.template and not self.is_ai_template(existing) and if_exists != "replace":
+            raise _err(f"report '{name}' uses the hand-written template {existing.template}; it is not replaced")
+        target = self.template_path(name)
+        if target.exists() and if_exists == "error":
+            raise _err(f"an AI template for '{name}' already exists; pass overwrite to replace it")
+        fmts = list(formats or (existing.effective_formats() if existing else ["pdf", "html"]))
+        rows = self._sample(name, frm, None, 20)
+        errors, warnings = check_template(template, rows, vars=vars, formats=fmts, report_name=name)
+        if errors:
+            raise _err("the template fails these checks: " + "; ".join(errors[:5]))
+        self._write_template(target, template)
+        prov = {"generated_by": written_by, "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "data_access": data_access, "columns_sent": list(columns_seen or []), "draft": True}
+        self._register(name, existing, frm, fmts, {"vars": vars or {}, "description": description}, prov)
+        self._audit(outcome="saved", report=name, template=self._rel(target), written_by=written_by)
+        return DesignResult(name, self._rel(target), "designed", written_by, data_access, list(columns_seen or []),
+                            warnings=warnings)
+
+    def sample(self, name: str | None, *, frm: ReportFrom | dict | None = None, params: dict | None = None,
+               model: str | None = None, sample_rows: int | None = None) -> dict:
+        """What a model may see of a report's data (the policy payload), for agents' report_sample."""
+        existing = self.cfg.report(name) if name else None
+        if isinstance(frm, dict):
+            frm = ReportFrom.model_validate(frm)
+        frm = frm or (existing.from_ if existing else None)
+        if frm is None:
+            raise _err("give a report name or 'from' (an endpoint, or a SQL source and query)")
+        model_name, model_spec = self._model(model)
+        policy = pol.resolve(self.cfg, model_spec=model_spec, model_name=model_name,
+                             source=pol.source_of(self.cfg, frm), report=existing, sample_rows=sample_rows)
+        if not policy.allowed:
+            raise _err(f"this data is closed to AI: {policy.explain()}")
+        rows = self._sample(name or "sample", frm, params, pol.fetch_limit(policy))
+        data = pol.payload(rows, policy)
+        self._audit(outcome="sampled", report=name, model=model_name, data_access=policy.level,
+                    columns_sent=[c["name"] for c in data["columns"]], rows_sent=len(data.get("rows", [])))
+        return data
+
     def _base_text(self, base: str) -> str:
         b = base.removesuffix(".html")
         p = BUILTIN_TEMPLATES / f"{b}.html"

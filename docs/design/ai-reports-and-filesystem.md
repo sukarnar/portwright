@@ -1,6 +1,6 @@
 # Design: AI-authored reports, report/file workflow nodes, filesystem tools
 
-Status: **phases 1–3 implemented**, phases 4–5 proposed · Target: portwright 0.9 · Branch: `design/ai-reports-fs-nodes`
+Status: **phases 1–4 implemented**, phase 5 proposed · Target: portwright 0.9 · Branch: `design/ai-reports-fs-nodes`
 
 ## 1. Goals
 
@@ -489,7 +489,7 @@ mcp_servers:
 | 1 ✅ | Renderer registry, `formats`, `data=`, pagination, `from.query`, sandboxed env, URL fetcher, bug fixes (incl. file-source reports, which called a missing `FileSource.read_all`) | `reports/renderers.py`, `reports/service.py`, `reports/engine.py`, `config.py` | `test_reports.py` (each format, multi-format, pagination, sandbox escape attempts) |
 | 2 ✅ | `fs/sandbox.py`, `filesystem`/`destinations` config, `copy`/`move`/`file` steps, `${run.*}` scope, `report` step | `fs/`, `agents/spec.py`, `agents/workflow.py`, `config.py` | `test_fs_sandbox.py` (traversal, ADS, junction, UNC), move = verified copy then delete (incl. cross-volume, delete failure), `test_workflow_files.py` (report → copy pipeline, scopes, foreach, canvas round trip). Also done early: Report / Copy / Move / Files canvas nodes with a YAML *Settings* field, and the canvas keeps any step keys it has no field for, so saving never drops them |
 | 3 ✅ | `ReportAuthor`, `report_design` step (+ canvas node), `.portwright/templates/` storage, `pw report design/ask/promote`, `pw validate` warning, `pw init` adds `.portwright/` to an existing `.gitignore`, AI data access policy (§5.5) | `reports/author.py`, `reports/policy.py`, `reports/prompts/author.md`, `config.py`, `agents/spec.py`, `cli.py` (the `report_author` agent template moves to phase 4 with the tools it needs) | `test_report_author.py`, using a fake `provider_factory`: valid reply, invalid → repair, repairs exhausted; author cannot write `templates/`; promote; policy: most restrictive level wins, excluded columns never in payload, override cannot raise above ceiling |
-| 4 | fs/report tool types, MCP expose + blob results + resources | `agents/tools.py`, `mcp/__init__.py` | scope enforcement per tool, `describe_server` output |
+| 4 ✅ | fs/report tool types, MCP expose + blob results + resources | `agents/tools.py`, `mcp/__init__.py` | scope enforcement per tool, `describe_server` output. Also: the `report_author` agent template (`pw agent from-template report-author`); report tools gained `sample` and `save` so an agent can write the template itself (draft → preview → save); MCP folders exposed with `read` are listed as resources; `fs_read` decides between text and blob by file type, not by whether the bytes decode. Tests: `test_file_tools.py` |
 | 5 | Studio: Report / Design / Copy / Move / Files nodes, destination picker, Design-with-AI dialog, gallery badges + promote, docs 16/17/18 | `studio/graph_vm.py`, `studio/views/*`, `docs/*.md` | `test_studio_*` viewmodel tests |
 
 Phases 1–2 ship value without any LLM: multi-format reports copied to a share on a schedule.
