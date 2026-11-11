@@ -83,10 +83,52 @@ class RuntimeService:
         cfg = ProjectConfig.model_validate(self.p.config.model_dump(mode="json", by_alias=True))
         return self._call(cfg, endpoint, values, body=body, limit=limit, offset=offset, actor=actor)
 
-    def _call(self, cfg: ProjectConfig, endpoint: str, values, *, body, limit, offset, actor) -> CallResult:
-        from fastapi.testclient import TestClient
-        from ..server import create_app
+    def fetch_rows(self, endpoint: str, values: dict[str, Any] | None = None, *, paginate: bool = True,
+                   max_rows: int = 50_000, actor: str = "report") -> tuple[list[dict], bool]:
+        """All rows an endpoint returns, following limit/offset pages through one in-process app.
 
+        Returns ``(rows, truncated)``; ``truncated`` is True when *max_rows* stopped the read early.
+        A non-paginated endpoint is called once: a list is the rows, ``{items: [...]}`` is unwrapped,
+        any other object is one row.
+        """
+        from fastapi.testclient import TestClient
+        from ..builder import is_paginated
+
+        cfg = ProjectConfig.model_validate(self.p.config.model_dump(mode="json", by_alias=True))
+        ep, path, query, json_body = self._prepare(cfg, endpoint, values, None)
+        paged = paginate and is_paginated(ep, cfg.sources[ep.source].type)
+        app, key = self._app(cfg, actor)
+        base = cfg.server.base_path.rstrip("/") + path
+        headers = {cfg.security.api_key_header: key}
+        rows: list[dict] = []
+        with TestClient(app, raise_server_exceptions=False) as client:
+            offset, page = 0, min(ep.max_limit, max_rows) if paged else None
+            while True:
+                q = dict(query)
+                if paged:
+                    q.update(limit=min(page, max_rows - len(rows) + 1), offset=offset)
+                resp = client.request(ep.method, base + (("?" + urlencode(q)) if q else ""), headers=headers,
+                                      json=json_body or None)
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"content": resp.text}
+                if resp.status_code >= 400:
+                    raise ServiceError(f"endpoint '{endpoint}' returned HTTP {resp.status_code}: {data}")
+                if isinstance(data, list):
+                    batch = data
+                elif isinstance(data, dict) and isinstance(data.get("items"), list):
+                    batch = data["items"]
+                else:
+                    batch = [data]
+                rows.extend(batch)
+                if len(rows) > max_rows:
+                    return rows[:max_rows], True
+                if not paged or len(batch) < q["limit"]:
+                    return rows, False
+                offset += len(batch)
+
+    def _prepare(self, cfg: ProjectConfig, endpoint: str, values, body):
         ep = cfg.endpoint(endpoint)
         if ep is None:
             raise ServiceError(f"no endpoint '{endpoint}'")
@@ -102,13 +144,13 @@ class RuntimeService:
                     raise ServiceError(f"missing path param '{n}'")
                 path = path.replace("{" + n + "}", quote(str(values[n]), safe=""))
         query: dict[str, Any] = {n: v for n, v in values.items() if where[n] == "query"}
-        if limit is not None:
-            query["limit"] = limit
-        if offset is not None:
-            query["offset"] = offset
         json_body = {n: v for n, v in values.items() if where[n] == "body"}
         json_body.update(body or {})
+        return ep, path, query, json_body
 
+    def _app(self, cfg: ProjectConfig, actor: str):
+        """The project app plus a single-use, never-saved admin key for it."""
+        from ..server import create_app
         key_id, key = generate_api_key()
         cfg.security.api_keys.append(ApiKeyRecord(
             id=key_id, name=f"{actor}:{getpass.getuser()}", hash=hash_api_key(key), scopes=["*"],
@@ -116,9 +158,19 @@ class RuntimeService:
         if "api_key" not in cfg.security.auth_methods:
             cfg.security.auth_methods.append("api_key")
         try:
-            app = create_app(cfg, project_root=self.p.root)
+            return create_app(cfg, project_root=self.p.root), key
         except Exception as exc:
             raise ServiceError(_clean(exc)) from None
+
+    def _call(self, cfg: ProjectConfig, endpoint: str, values, *, body, limit, offset, actor) -> CallResult:
+        from fastapi.testclient import TestClient
+
+        ep, path, query, json_body = self._prepare(cfg, endpoint, values, body)
+        if limit is not None:
+            query["limit"] = limit
+        if offset is not None:
+            query["offset"] = offset
+        app, key = self._app(cfg, actor)
         url = cfg.server.base_path.rstrip("/") + path + (("?" + urlencode(query)) if query else "")
         with TestClient(app, raise_server_exceptions=False) as client:
             resp = client.request(ep.method, url, headers={cfg.security.api_key_header: key},

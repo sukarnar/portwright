@@ -1135,16 +1135,41 @@ def load_rejects(run_id: str, last: int = typer.Option(20, "--limit", help="Rows
 
 
 # ----------------------------------------------------------------- reports
-report_app = typer.Typer(help="Generate HTML/PDF reports from Jinja2 templates.", no_args_is_help=True)
+def _formats(values: list[str]) -> list[str]:
+    """--format pdf --format xlsx  or  --format pdf,xlsx"""
+    from .reports.renderers import RENDERERS
+    out = [f.strip().lower() for v in values for f in v.split(",") if f.strip()]
+    bad = [f for f in out if f not in RENDERERS]
+    if bad:
+        raise typer.BadParameter(f"unknown format(s) {bad}; choose from {', '.join(RENDERERS)}")
+    return list(dict.fromkeys(out))
+
+
+def _clean_validation(exc: Exception) -> str:
+    errs = getattr(exc, "errors", None)
+    if callable(errs):
+        try:
+            return "; ".join(str(e.get("msg", e)).removeprefix("Value error, ") for e in errs())
+        except Exception:
+            pass
+    return str(exc)
+
+
+report_app = typer.Typer(help="Generate PDF, HTML, Markdown, CSV, Excel and JSON reports.", no_args_is_help=True)
 app.add_typer(report_app, name="report")
 
 
 @report_app.command("add")
 def report_add(
     name: str,
-    template: str = typer.Option(..., "--template", "-t", help="Path to the Jinja2 HTML template file."),
+    template: Optional[str] = typer.Option(None, "--template", "-t",
+                                           help="Path to the Jinja2 HTML template file (needed for pdf/html)."),
     endpoint: Optional[str] = typer.Option(None, "--endpoint", "-e", help="Endpoint to pull data from."),
     source: Optional[str] = typer.Option(None, "--source", "-s", help="Source to pull data from directly."),
+    query: Optional[str] = typer.Option(None, "--query", "-q",
+                                        help="SQL sources: one SELECT; bind values with :name and --param name=value."),
+    fmt: list[str] = typer.Option([], "--format", "-f",
+                                  help="Output format: pdf, html, md, csv, xlsx, json (repeatable or comma-separated)."),
     output: Optional[str] = typer.Option(None, "--output", "-o",
                                          help="Output path (Jinja2 expressions supported, e.g. reports/{{ now | strftime('%Y-%m') }}/sales)."),
     description: str = "",
@@ -1160,16 +1185,21 @@ def report_add(
     if any(r.name == name for r in cfg.reports):
         _fail(Exception(f"report '{name}' exists – remove it first with 'portwright report remove {name}'"))
     from .config import ReportSpec, ReportFrom
-    spec = ReportSpec(
-        name=name,
-        description=description,
-        template=template,
-        **{"from": ReportFrom(endpoint=endpoint, source=source, params=_kv(param))},
-        output=output,
-    )
+    try:
+        spec = ReportSpec(
+            name=name,
+            description=description,
+            template=template,
+            **{"from": ReportFrom(endpoint=endpoint, source=source, params=_kv(param), query=query)},
+            formats=_formats(fmt),
+            output=output,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(_clean_validation(exc))
     cfg.reports.append(spec)
     _save(cfg, config)
-    _ok(f"Report '{name}' added (template: {template})")
+    _ok(f"Report '{name}' added ({', '.join(spec.effective_formats())}"
+        + (f", template: {template})" if template else ")"))
     typer.echo(f"Next: portwright report run {name}")
 
 
@@ -1181,7 +1211,7 @@ def report_list(config: str = CONFIG_OPT):
         typer.echo("No reports yet. Add one with 'portwright report add'.")
         return
     for r in items:
-        typer.echo(f"{r['name']:<20} {r['from']:<32} {r['template']}")
+        typer.echo(f"{r['name']:<20} {r['from']:<32} {','.join(r['formats']):<14} {r['template']}")
         if r["description"]:
             typer.echo(f"  {r['description']}")
 
@@ -1196,19 +1226,25 @@ def report_show(name: str, config: str = CONFIG_OPT):
 @report_app.command("run")
 def report_run(
     name: str,
-    output: Optional[str] = typer.Option(None, "--output", "-o", help="Override the output path."),
-    html: bool = typer.Option(False, "--html", help="Produce HTML instead of PDF."),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Override the output path (stem)."),
+    fmt: list[str] = typer.Option([], "--format", "-f",
+                                  help="Override the formats: pdf, html, md, csv, xlsx, json (repeatable or comma-separated)."),
+    html: bool = typer.Option(False, "--html", help="Produce HTML only (same as --format html)."),
     param: list[str] = typer.Option([], "--param", "-p", help="NAME=VALUE params passed to the data source (repeatable)."),
     var: list[str] = typer.Option([], "--var", help="NAME=VALUE extra template variable (repeatable)."),
     open_: bool = typer.Option(False, "--open", help="Open the output file after rendering."),
     config: str = CONFIG_OPT,
 ):
-    """Render a report to PDF (or HTML with --html)."""
+    """Render a report to its formats (default PDF; override with --format or --html)."""
     svc = _svc(config)
     result = _run(svc.reports.run, name,
-                  output=output, as_html=html,
+                  output=output, as_html=html, formats=_formats(fmt) or None,
                   params=_kv(param), extra_vars=_kv(var) if var else None)
-    _ok(f"Report '{name}' written to {result.output_path}  ({result.format}, {result.row_count} rows, {result.seconds}s)")
+    _ok(f"Report '{name}': {result.row_count} rows, {result.seconds}s")
+    for o in result.outputs:
+        typer.echo(f"  {o.format:<5} {o.path}  ({o.bytes:,} bytes)")
+    for w in result.warnings:
+        typer.secho(f"  warning: {w}", fg=typer.colors.YELLOW)
     if open_:
         import subprocess, sys
         if sys.platform == "win32":
@@ -1228,7 +1264,7 @@ def report_template(
     """Write a starter Jinja2 HTML template for a report."""
     svc = _svc(config)
     spec = _run(svc.reports.get, name)
-    dest_path = path or spec.template
+    dest_path = path or spec.template or f"templates/{name}.html"
     out = _run(svc.reports.scaffold_template, name, dest_path)
     _ok(f"Starter template written to {out}")
     typer.echo("Edit it, then run:  portwright report run " + name + " --html   to preview before generating PDF.")

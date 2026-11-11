@@ -470,33 +470,66 @@ class ServerSettings(BaseModel):
 # Reports  (Jinja2-templated PDF / HTML generation)
 # --------------------------------------------------------------------------- #
 
+REPORT_FORMATS = ("pdf", "html", "md", "csv", "xlsx", "json")
+TEMPLATE_FORMATS = {"pdf", "html"}       # formats rendered from the Jinja2 HTML template
+ReportFormat = Literal["pdf", "html", "md", "csv", "xlsx", "json"]
+
+
 class ReportFrom(BaseModel):
     """Where the report pulls its data from."""
-    endpoint: str | None = None   # a GET endpoint name (all pages fetched automatically)
+    endpoint: str | None = None   # a GET endpoint name
     source: str | None = None     # a file or SQL source (direct read, no HTTP round-trip)
-    params: dict[str, Any] = Field(default_factory=dict)   # endpoint query/path params
+    params: dict[str, Any] = Field(default_factory=dict)   # endpoint params / SQL bind values
+    query: str | None = None      # SQL sources: one read-only SELECT, values bound from params (:name)
+    paginate: bool = True         # endpoints: follow limit/offset until every page is read
+    max_rows: int = Field(50_000, ge=1, le=1_000_000)       # stop reading after this many rows
 
     @model_validator(mode="after")
     def _one(self) -> "ReportFrom":
         if bool(self.endpoint) == bool(self.source):
             raise ValueError("report 'from' needs exactly one of 'endpoint' or 'source'")
+        if self.query is not None and not self.source:
+            raise ValueError("report 'from.query' needs 'from.source' (a SQL source)")
         return self
 
 
 class ReportSpec(BaseModel):
-    """Declaration of one PDF/HTML report."""
+    """Declaration of one report, rendered to one or more formats."""
     name: str = Field(pattern=_NAME)
     description: str = ""
-    # Jinja2 template file path (relative to the project root, or absolute)
-    template: str
+    # Jinja2 HTML template (relative to the project root, or absolute). Needed for pdf/html output only.
+    template: str | None = None
     from_: ReportFrom = Field(alias="from")
-    # Output path; may contain Jinja2 expressions, e.g.
-    #   reports/output/{{ now | strftime('%Y-%m') }}-{{ report_name }}.pdf
+    # Formats to produce on every run. Empty: taken from the output suffix (.html → html), else pdf.
+    formats: list[ReportFormat] = Field(default_factory=list)
+    # Output path *stem*; may contain Jinja2 expressions, e.g.
+    #   reports/output/{{ now | strftime('%Y-%m') }}/{{ report_name }}
+    # A known suffix (.pdf, .html, …) is ignored; each format adds its own.
     output: str | None = None
     # Extra variables injected into every template render
     vars: dict[str, Any] = Field(default_factory=dict)
+    # Data formats (csv / xlsx / json / md): column order/subset and header renames
+    columns: list[str] = Field(default_factory=list)
+    rename: dict[str, str] = Field(default_factory=dict)
 
     model_config = {"populate_by_name": True}
+
+    @field_validator("formats")
+    @classmethod
+    def _unique(cls, v: list[str]) -> list[str]:
+        return list(dict.fromkeys(v))
+
+    def effective_formats(self) -> list[str]:
+        if self.formats:
+            return list(self.formats)
+        return ["html"] if (self.output or "").lower().endswith((".html", ".htm")) else ["pdf"]
+
+    @model_validator(mode="after")
+    def _template_needed(self) -> "ReportSpec":
+        need = TEMPLATE_FORMATS & set(self.effective_formats())
+        if need and not self.template:
+            raise ValueError(f"report '{self.name}': format(s) {sorted(need)} need a 'template'")
+        return self
 
 
 class ProjectConfig(BaseModel):
@@ -570,6 +603,9 @@ class ProjectConfig(BaseModel):
                 raise ValueError(
                     f"report '{rpt.name}' reads unknown source '{rpt.from_.source}'"
                 )
+            if rpt.from_.query is not None and self.sources[rpt.from_.source].type != "sql":
+                raise ValueError(f"report '{rpt.name}': 'from.query' needs a SQL source, "
+                                 f"'{rpt.from_.source}' is {self.sources[rpt.from_.source].type}")
         self._check_agents()
         return self
 

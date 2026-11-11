@@ -1,20 +1,51 @@
-"""ReportService: orchestrates data fetching + template rendering + PDF output."""
+"""ReportService: fetch data → render each requested format → write the output files."""
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass
+import re
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from ..config import TEMPLATE_FORMATS, ReportSpec
+from .renderers import EXTENSIONS, ReportArtifact, ReportContext, renderer
+
+_READ_SQL = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
+_BIND = re.compile(r"(?<![:\w]):([A-Za-z_]\w*)")
 
 
 @dataclass
 class ReportResult:
     name: str
-    output_path: Path
-    format: str          # "pdf" or "html"
+    outputs: list[ReportArtifact]
     row_count: int
     seconds: float
+    truncated: bool = False          # the source had more rows than from.max_rows
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def output_path(self) -> Path:   # first output (kept for single-format callers)
+        return self.outputs[0].path
+
+    @property
+    def format(self) -> str:
+        return self.outputs[0].format
+
+    def to_dict(self) -> dict:
+        return {"report": self.name, "outputs": [o.to_dict() for o in self.outputs], "row_count": self.row_count,
+                "seconds": self.seconds, "truncated": self.truncated, "warnings": self.warnings}
+
+
+def _err(msg: str) -> Exception:
+    from ..services.project import ServiceError
+    return ServiceError(msg)
+
+
+def output_stem(raw: str) -> str:
+    """The output path without a known report extension (``a.b/x.v2.pdf`` → ``a.b/x.v2``)."""
+    p = Path(raw)
+    return str(p.with_suffix("")) if p.suffix.lower() in EXTENSIONS else raw
 
 
 class ReportService:
@@ -30,17 +61,16 @@ class ReportService:
                 "name": r.name,
                 "description": r.description,
                 "from": src,
-                "template": r.template,
+                "template": r.template or "",
+                "formats": r.effective_formats(),
                 "output": r.output,
             })
         return out
 
-    def get(self, name: str):
-        cfg = self._p.config
-        spec = next((r for r in cfg.reports if r.name == name), None)
+    def get(self, name: str) -> ReportSpec:
+        spec = self._p.config.report(name)
         if spec is None:
-            from ..services.project import ServiceError
-            raise ServiceError(f"no report '{name}' – see 'portwright report list'")
+            raise _err(f"no report '{name}' – see 'portwright report list'")
         return spec
 
     # ------------------------------------------------------------------ scaffold
@@ -50,7 +80,6 @@ class ReportService:
         if not dest.is_absolute():
             dest = self._p.root / dest
         dest.parent.mkdir(parents=True, exist_ok=True)
-
         dest.write_text(STARTER_TEMPLATE.strip() + "\n", encoding="utf-8")
         return dest
 
@@ -59,129 +88,157 @@ class ReportService:
         self,
         name: str,
         *,
+        formats: list[str] | None = None,
         output: str | None = None,
-        as_html: bool = False,
-        params: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        data: list[dict] | dict | None = None,
         extra_vars: dict[str, Any] | None = None,
+        as_html: bool = False,
     ) -> ReportResult:
-        import time
-        from ..services.project import ServiceError
+        """Run a registered report.
 
+        ``formats`` overrides the report's formats (``as_html=True`` is the old spelling of ``["html"]``);
+        ``data`` supplies the rows directly (e.g. from a workflow step) instead of reading ``from``.
+        """
         spec = self.get(name)
         t0 = time.monotonic()
-
-        # Fetch data -------------------------------------------------------
-        rows = self._fetch(spec, params or {})
-
-        # Render HTML template ---------------------------------------------
-        from .engine import render_html, _resolve_output_path
-        merged_vars = {**(getattr(spec, "vars", None) or {}), **(extra_vars or {})}
-        html = render_html(
-            spec.template,
-            rows,
-            project_root=self._p.root,
-            report_name=name,
-            extra_vars=merged_vars or None,
-        )
-
-        # Resolve output path (may contain Jinja2 expressions) -------------
-        now = datetime.now(timezone.utc)
-        raw_output = output or spec.output or f"reports/output/{name}"
-        resolved = _resolve_output_path(raw_output, now)
-        if as_html and not resolved.endswith(".html"):
-            resolved = resolved.replace(".pdf", "") + ".html"
-        out_path = Path(resolved)
-        if not out_path.is_absolute():
-            out_path = self._p.root / out_path
-
-        # Write output -----------------------------------------------------
-        if as_html or resolved.endswith(".html"):
-            out_path.with_suffix(".html").parent.mkdir(parents=True, exist_ok=True)
-            out_path = out_path.with_suffix(".html")
-            out_path.write_text(html, encoding="utf-8")
-            fmt = "html"
+        fmts = list(formats or (["html"] if as_html else spec.effective_formats()))
+        truncated = False
+        if data is None:
+            rows, truncated = self._fetch(spec, params or {})
         else:
-            out_path = out_path.with_suffix(".pdf")
-            from .engine import render_pdf
-            base_url = (self._p.root / spec.template).parent.as_uri() if spec.template else None
-            render_pdf(html, out_path, base_url=base_url)
-            fmt = "pdf"
+            rows = _as_rows(data)
+        merged_vars = {**(spec.vars or {}), **(extra_vars or {})}
+        return self._render(name, spec.template, rows, fmts, output or spec.output, merged_vars,
+                            spec.columns, spec.rename, t0, truncated)
 
-        seconds = round(time.monotonic() - t0, 2)
-        return ReportResult(name=name, output_path=out_path, format=fmt,
-                            row_count=len(rows), seconds=seconds)
+    def render_inline(
+        self,
+        rows: list[dict] | dict,
+        formats: list[str],
+        output: str,
+        *,
+        name: str = "report",
+        template: str | None = None,
+        vars: dict[str, Any] | None = None,
+        columns: list[str] | None = None,
+        rename: dict[str, str] | None = None,
+    ) -> ReportResult:
+        """Render rows that are not tied to a registered report."""
+        return self._render(name, template, _as_rows(rows), list(formats), output, vars or {},
+                            columns or [], rename or {}, time.monotonic(), False)
 
-    # ------------------------------------------------------------------ helpers
-    def _fetch(self, spec: Any, extra_params: dict[str, str]) -> list[dict]:
-        """Pull all rows for the report from its configured source."""
-        from ..services.project import ServiceError
-        from ..services.runtime import RuntimeService
+    # ------------------------------------------------------------------ render
+    def _render(self, name: str, template: str | None, rows: list[dict], fmts: list[str], raw_output: str | None,
+                vars: dict[str, Any], columns: list[str], rename: dict[str, str], t0: float,
+                truncated: bool) -> ReportResult:
+        if not fmts:
+            raise _err("no output format given")
+        fmts = list(dict.fromkeys(fmts))
+        rends = [renderer(f) for f in fmts]                     # unknown format → ValueError before any work
+        need = sorted(TEMPLATE_FORMATS & set(fmts))
+        if need and not template:
+            raise _err(f"report '{name}': format(s) {need} need a template")
 
-        merged_params = {**(spec.from_.params or {}), **extra_params}
+        from .engine import _resolve_output_path, render_html, resolve_template_path
+        now = datetime.now(timezone.utc)
+        tpl_dir = resolve_template_path(template, self._p.root).parent if need else None
+        cache: dict[str, str] = {}
 
-        if spec.from_.endpoint:
-            rt = RuntimeService(self._p)
-            result = rt.call(spec.from_.endpoint, merged_params, actor="report")
-            if not result.ok:
-                raise ServiceError(
-                    f"endpoint '{spec.from_.endpoint}' returned HTTP {result.status}: {result.data}"
-                )
-            data = result.data
-            # Unwrap paginated {items: [...]} or a plain list
-            if isinstance(data, list):
-                rows = data
-            elif isinstance(data, dict) and "items" in data:
-                rows = data["items"]
-            else:
-                rows = [data]
-            return rows
+        def html() -> str:
+            if "html" not in cache:
+                cache["html"] = render_html(template, rows, project_root=self._p.root, report_name=name,
+                                            extra_vars=vars or None, now=now)
+            return cache["html"]
 
-        if spec.from_.source:
-            return self._fetch_from_source(spec.from_.source, merged_params)
+        ctx = ReportContext(name, rows, columns, rename, now, html, tpl_dir)
+        stem = output_stem(_resolve_output_path(raw_output or f"reports/output/{name}", now, report_name=name))
+        base = Path(stem)
+        if not base.is_absolute():
+            base = self._p.root / base
+        base.parent.mkdir(parents=True, exist_ok=True)
 
-        raise ServiceError("report has no 'from' configured")
+        outputs = []
+        for r in rends:
+            out = base.parent / (base.name + r.extension)
+            r.render(ctx, out)
+            outputs.append(ReportArtifact.of(out, r.format))
+        warnings = [f"stopped after {len(rows)} rows (from.max_rows); the source has more"] if truncated else []
+        return ReportResult(name, outputs, len(rows), round(time.monotonic() - t0, 2), truncated, warnings)
 
-    def _fetch_from_source(self, source_name: str, params: dict) -> list[dict]:
-        """Read rows directly from a file/SQL source (bypassing HTTP)."""
-        from ..services.project import ServiceError
-
-        cfg = self._p.config
-        src = cfg.sources.get(source_name)
+    # ------------------------------------------------------------------ fetch
+    def _fetch(self, spec: ReportSpec, extra_params: dict[str, Any]) -> tuple[list[dict], bool]:
+        """Rows for the report from its configured endpoint or source, plus a truncated flag."""
+        frm = spec.from_
+        merged = {**(frm.params or {}), **extra_params}
+        if frm.endpoint:
+            from ..services.runtime import RuntimeService
+            return RuntimeService(self._p).fetch_rows(frm.endpoint, merged, paginate=frm.paginate,
+                                                      max_rows=frm.max_rows, actor=f"report:{spec.name}")
+        src = self._p.config.sources.get(frm.source)
         if src is None:
-            raise ServiceError(f"report references unknown source '{source_name}'")
-
+            raise _err(f"report references unknown source '{frm.source}'")
         if src.type == "file":
-            return self._read_file_source(src)
+            rows = self._source(frm.source)._load()
+            return list(rows[:frm.max_rows]), len(rows) > frm.max_rows
         if src.type == "sql":
-            return self._read_sql_source(src, source_name, params)
-
-        raise ServiceError(
+            query = frm.query
+            if query is None:                                   # legacy: query passed as the _sql param
+                query = merged.pop("_sql", None)
+            else:
+                merged.pop("_sql", None)
+            if not query:
+                raise _err(f"report '{spec.name}': SQL sources need 'from.query' (one SELECT statement)")
+            return self._read_sql(frm.source, query, merged, frm.max_rows)
+        raise _err(
             f"source type '{src.type}' is not directly supported for reports; "
             "expose it via an endpoint and use 'from.endpoint' instead"
         )
 
-    def _read_file_source(self, src: Any) -> list[dict]:
-        from ..sources.files import FileSource  # type: ignore[import]
-        fs = FileSource(src, root=self._p.root / self._p.config.security.data_root)
-        return fs.read_all()
+    def _source(self, name: str):
+        from ..sources import create_source
+        cfg = self._p.config
+        return create_source(name, cfg.sources[name], cfg.security, str(self._p.root), self._p.credentials())
 
-    def _read_sql_source(self, src: Any, source_name: str, params: dict) -> list[dict]:
-        """Execute the first query endpoint that uses this source, or run a raw count."""
-        from sqlalchemy import text, create_engine
-        from ..config import resolve_secrets
-        url = resolve_secrets(src.url or "", self._p.credentials)
-        engine = create_engine(url)
-        # Raw SQL from params if supplied, otherwise just return metadata
-        raw_sql = params.pop("_sql", None)
-        if not raw_sql:
-            raise ValueError(
-                "SQL sources need a query. Use 'from.endpoint' for a pre-defined query, "
-                "or pass _sql='SELECT ...' as a report param."
-            )
-        with engine.connect() as conn:
-            result = conn.execute(text(raw_sql), params)
-            cols = list(result.keys())
-            return [dict(zip(cols, row)) for row in result.fetchall()]
+    def _read_sql(self, source: str, query: str, params: dict[str, Any], max_rows: int) -> tuple[list[dict], bool]:
+        """Run one read-only SELECT with bound parameters; the transaction is always rolled back."""
+        from sqlalchemy import text
+        from sqlalchemy.exc import SQLAlchemyError
+        q = query.strip().rstrip(";").strip()
+        if ";" in q:
+            raise _err("report query: one statement only (no ';')")
+        if not _READ_SQL.match(q):
+            raise _err("report query must be a SELECT (or WITH … SELECT) statement")
+        names = set(_BIND.findall(q))
+        missing = sorted(n for n in names if n not in params)
+        if missing:
+            raise _err(f"report query needs param(s) {missing}")
+        binds = {n: (None if params[n] == "" else params[n]) for n in names}
+        src = self._source(source)
+        src._build_engine()
+        try:
+            with src.engine.connect() as conn:
+                result = conn.execution_options(stream_results=True).execute(text(q), binds)
+                rows = [dict(r._mapping) for r in result.fetchmany(max_rows + 1)]
+                result.close()
+                conn.rollback()
+        except SQLAlchemyError as exc:
+            raise _err(f"report query failed: {str(getattr(exc, 'orig', exc))[:300]}") from None
+        finally:
+            src.engine.dispose()
+        return rows[:max_rows], len(rows) > max_rows
+
+
+def _as_rows(data: Any) -> list[dict]:
+    if isinstance(data, dict) and isinstance(data.get("items"), list):
+        data = data["items"]
+    elif isinstance(data, dict) and isinstance(data.get("rows"), list):    # a SQL tool result
+        data = data["rows"]
+    if isinstance(data, dict):
+        return [data]
+    if not isinstance(data, list):
+        raise _err("report data must be a list of rows (objects)")
+    return [r if isinstance(r, dict) else {"value": r} for r in data]
 
 
 STARTER_TEMPLATE = """<!DOCTYPE html>
