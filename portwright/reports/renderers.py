@@ -2,6 +2,8 @@
 
 ``pdf`` and ``html`` come from the Jinja2 HTML template (rendered once and shared). ``csv``, ``xlsx``,
 ``json`` and ``md`` are written straight from the rows; ``columns`` / ``rename`` on the report shape them.
+With datasets: ``csv`` and ``md`` hold the master rows, ``xlsx`` adds one sheet per dataset, and ``json``
+nests the attached datasets in each master row.
 Add a format by registering a ``Renderer`` subclass in ``RENDERERS``.
 """
 from __future__ import annotations
@@ -45,14 +47,17 @@ class ReportContext:
     generated_at: datetime | None = None
     html: Callable[[], str] | None = None              # lazily renders the HTML template (pdf/html)
     template_dir: Path | None = None                   # the only folder PDF resources may load from
+    hidden: set[str] = field(default_factory=set)      # attached dataset fields: not table columns
+    sheets: list["ReportContext"] = field(default_factory=list)   # the report's datasets (xlsx: one sheet each)
 
     def column_names(self) -> list[str]:
         if self.columns:
-            return list(self.columns)
+            return [c for c in self.columns if c not in self.hidden]
         seen: dict[str, None] = {}
         for r in self.rows:
             for k in r:
-                seen.setdefault(k, None)
+                if k not in self.hidden:
+                    seen.setdefault(k, None)
         return list(seen)
 
     def headers(self) -> list[str]:
@@ -63,8 +68,11 @@ class ReportContext:
         return [[r.get(c) for c in cols] for r in self.rows]
 
     def records(self) -> list[dict]:
+        """Rows with the chosen columns and headers; attached datasets stay nested under their field."""
         cols, heads = self.column_names(), self.headers()
-        return [{h: r.get(c) for c, h in zip(cols, heads)} for r in self.rows]
+        nested = sorted(self.hidden)
+        return [{**{h: r.get(c) for c, h in zip(cols, heads)}, **{f: r.get(f) for f in nested if f in r}}
+                for r in self.rows]
 
 
 def _plain(v: Any) -> Any:
@@ -158,13 +166,33 @@ class XlsxRenderer(Renderer):
     MAX_WIDTH = 60
 
     def render(self, ctx: ReportContext, out: Path) -> Path:
+        """The master rows on the first sheet, then one sheet per dataset."""
         from openpyxl import Workbook
+
+        wb = Workbook()
+        used: set[str] = set()
+        self._sheet(wb.active, ctx, self._title(ctx.name or "Report", used))
+        for sheet in ctx.sheets:
+            self._sheet(wb.create_sheet(), sheet, self._title(sheet.name, used))
+        wb.save(out)
+        return out
+
+    @staticmethod
+    def _title(name: str, used: set[str]) -> str:
+        """An Excel-safe, unique sheet name (31 characters, none of []:*?/\\)."""
+        base = "".join("_" if ch in '[]:*?/\\' else ch for ch in name).strip("'") or "Sheet"
+        title, n = base[:31], 2
+        while title.lower() in used:
+            suffix = f" ({n})"
+            title, n = base[:31 - len(suffix)] + suffix, n + 1
+        used.add(title.lower())
+        return title
+
+    def _sheet(self, ws, ctx: ReportContext, title: str) -> None:
         from openpyxl.styles import Font, PatternFill
         from openpyxl.utils import get_column_letter
 
-        wb = Workbook()
-        ws = wb.active
-        ws.title = (ctx.name or "Report")[:31]
+        ws.title = title
         heads = ctx.headers()
         ws.append(heads)
         for c in ws[1]:
@@ -183,8 +211,6 @@ class XlsxRenderer(Renderer):
         if heads:
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
-        wb.save(out)
-        return out
 
     @staticmethod
     def _cell(v: Any) -> Any:

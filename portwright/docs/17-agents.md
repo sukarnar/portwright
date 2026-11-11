@@ -141,7 +141,9 @@ workflows:
 ```
 
 - `report`: runs a saved report (`input` = its params; `formats`, `vars` and `output_path` override the report's
-  own). `data: ${steps.q.output.rows}` uses rows from an earlier step instead of the report's source; without
+  own). `data: ${steps.q.output.rows}` uses rows from an earlier step instead of the report's source, and
+  `datasets: {lines: ${steps.l.output.rows}}` does the same for the report's named datasets (the others are
+  read as usual; see *Master-detail: datasets* in the reports guide); without
   `report`, `formats` + `data` (+ `template` for pdf/html) make an inline report. The output is
   `{outputs: [{path, format, bytes, sha256}], row_count, ...}`. Needs the scope `reports:run`.
 - `report_design`: an AI `model` writes the template of `report` (`input` = what it should show; see *Templates

@@ -134,6 +134,7 @@ class WorkflowStep(BaseModel):
     report: str | None = None
     template: str | None = None          # report: inline template (pdf/html)
     data: Any = None                     # report: rows to use instead of the report's own source
+    datasets: dict[str, Any] | None = None   # report: rows for named datasets (the others are read as usual)
     formats: list[str] | str | None = None   # report: override the formats - a list, "pdf,xlsx" or ${...}
     vars: dict[str, Any] | None = None   # report: extra template variables
     output_path: str | None = None       # report: output path stem

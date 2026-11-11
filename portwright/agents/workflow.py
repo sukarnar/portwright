@@ -255,6 +255,9 @@ async def _report(st, raw_input: Any, scope: dict, env: "_Env") -> dict:
     if not isinstance(params, dict):
         raise ToolError("report step 'input' must be a mapping of report params")
     data = resolve(st.data, scope) if st.data is not None else None
+    sets = resolve(st.datasets, scope) if st.datasets else None
+    if sets is not None and not st.report:
+        raise ToolError("report step 'datasets' needs 'report' (a report that defines those datasets)")
     formats = _formats(resolve(st.formats, scope)) if st.formats else None
     extra = resolve(st.vars, scope) if st.vars else None
     out = resolve(st.output_path, scope) if st.output_path else None
@@ -262,7 +265,7 @@ async def _report(st, raw_input: Any, scope: dict, env: "_Env") -> dict:
     try:
         if st.report:
             res = await asyncio.to_thread(svc.run, st.report, formats=formats, output=out, params=params,
-                                          data=data, extra_vars=extra)
+                                          data=data, datasets=sets, extra_vars=extra)
         else:
             res = await asyncio.to_thread(svc.render_inline, data, formats, out or f"reports/output/{st.id}",
                                           name=st.id, template=resolve(st.template, scope) if st.template else None,

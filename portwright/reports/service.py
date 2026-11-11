@@ -21,8 +21,9 @@ class ReportResult:
     outputs: list[ReportArtifact]
     row_count: int
     seconds: float
-    truncated: bool = False          # the source had more rows than from.max_rows
+    truncated: bool = False          # the source had more rows than from.max_rows (master or any dataset)
     warnings: list[str] = field(default_factory=list)
+    dataset_rows: dict[str, int] = field(default_factory=dict)     # rows read per dataset (not the master)
 
     @property
     def output_path(self) -> Path:   # first output (kept for single-format callers)
@@ -40,7 +41,26 @@ class ReportResult:
     def to_dict(self) -> dict:
         return {"report": self.name, "outputs": [o.to_dict() for o in self.outputs], "row_count": self.row_count,
                 "seconds": self.seconds, "truncated": self.truncated, "warnings": self.warnings,
+                **({"dataset_rows": self.dataset_rows} if self.dataset_rows else {}),
                 "exit_code": self.exit_code}
+
+
+@dataclass
+class ReportData:
+    """The rows of one run: the master, each dataset, and what was cut off."""
+    master: list[dict]
+    datasets: dict[str, list[dict]] = field(default_factory=dict)
+    truncated: list[str] = field(default_factory=list)       # "master" and/or dataset names
+
+    def warnings(self) -> list[str]:
+        out = []
+        for n in self.truncated:
+            if n == "master":
+                out.append(f"stopped after {len(self.master)} rows (from.max_rows); the source has more")
+            else:
+                out.append(f"dataset '{n}' stopped after {len(self.datasets.get(n, []))} rows (from.max_rows); "
+                           "some detail rows are missing")
+        return out
 
 
 @dataclass
@@ -78,6 +98,7 @@ class ReportService:
                 "name": r.name,
                 "description": r.description,
                 "from": src,
+                "datasets": list(r.datasets),
                 "template": r.template or "",
                 "formats": r.effective_formats(),
                 "output": r.output,
@@ -109,25 +130,51 @@ class ReportService:
         output: str | None = None,
         params: dict[str, Any] | None = None,
         data: list[dict] | dict | None = None,
+        datasets: dict[str, Any] | None = None,
         extra_vars: dict[str, Any] | None = None,
         as_html: bool = False,
     ) -> ReportResult:
         """Run a registered report.
 
         ``formats`` overrides the report's formats (``as_html=True`` is the old spelling of ``["html"]``);
-        ``data`` supplies the rows directly (e.g. from a workflow step) instead of reading ``from``.
+        ``data`` supplies the master rows directly (e.g. from a workflow step) instead of reading ``from``,
+        and ``datasets`` does the same for named datasets. Everything not supplied is read.
         """
         spec = self.get(name)
         t0 = time.monotonic()
         fmts = list(formats or (["html"] if as_html else spec.effective_formats()))
-        truncated = False
-        if data is None:
-            rows, truncated = self._fetch(spec, params or {})
-        else:
-            rows = _as_rows(data)
+        rd = self.read(spec, params or {}, data=data, datasets=datasets)
         merged_vars = {**(spec.vars or {}), **(extra_vars or {})}
-        return self._render(name, spec.template, rows, fmts, output or spec.output, merged_vars,
-                            spec.columns, spec.rename, t0, truncated)
+        return self._render(name, spec.template, rd, fmts, output or spec.output, merged_vars,
+                            spec.columns, spec.rename, t0, spec=spec)
+
+    def read(self, spec: ReportSpec, params: dict[str, Any], *, data: Any = None,
+             datasets: dict[str, Any] | None = None, limit: int | None = None) -> ReportData:
+        """Every row the report needs. *limit* caps each read (AI sampling); overrides skip the read."""
+        given = dict(datasets or {})
+        unknown = sorted(set(given) - set(spec.datasets))
+        if unknown:
+            raise _err(f"report '{spec.name}' has no dataset(s) {unknown}; it has: "
+                       f"{', '.join(spec.datasets) or 'none'}")
+        rd = ReportData([])
+        if data is None:
+            frm = spec.from_ if limit is None else spec.from_.model_copy(update={"max_rows": max(1, limit)})
+            rows, cut = self._read_from(spec.name, "master", frm, params, also_used=self._dataset_params(spec))
+            rd.master = rows
+            if cut and limit is None:
+                rd.truncated.append("master")
+        else:
+            rd.master = _as_rows(data)
+        for n, ds in spec.datasets.items():
+            if n in given:
+                rd.datasets[n] = _as_rows(given[n])
+                continue
+            frm = ds.from_ if limit is None else ds.from_.model_copy(update={"max_rows": max(1, limit)})
+            rows, cut = self._read_from(spec.name, n, frm, params)
+            rd.datasets[n] = rows
+            if cut and limit is None:
+                rd.truncated.append(n)
+        return rd
 
     def render_inline(
         self,
@@ -142,13 +189,13 @@ class ReportService:
         rename: dict[str, str] | None = None,
     ) -> ReportResult:
         """Render rows that are not tied to a registered report."""
-        return self._render(name, template, _as_rows(rows), list(formats), output, vars or {},
-                            columns or [], rename or {}, time.monotonic(), False)
+        return self._render(name, template, ReportData(_as_rows(rows)), list(formats), output, vars or {},
+                            columns or [], rename or {}, time.monotonic())
 
     # ------------------------------------------------------------------ render
-    def _render(self, name: str, template: str | None, rows: list[dict], fmts: list[str], raw_output: str | None,
+    def _render(self, name: str, template: str | None, rd: ReportData, fmts: list[str], raw_output: str | None,
                 vars: dict[str, Any], columns: list[str], rename: dict[str, str], t0: float,
-                truncated: bool) -> ReportResult:
+                spec: ReportSpec | None = None) -> ReportResult:
         if not fmts:
             raise _err("no output format given")
         fmts = list(dict.fromkeys(fmts))
@@ -157,7 +204,14 @@ class ReportService:
         if need and not template:
             raise _err(f"report '{name}': format(s) {need} need a template")
 
+        from .datasets import DatasetError, join
         from .engine import _resolve_output_path, render_html, resolve_template_path
+        rows, sets, join_warnings = rd.master, rd.datasets, []
+        if spec is not None and spec.datasets:
+            try:
+                rows, sets, join_warnings = join(spec, rd.master, rd.datasets)
+            except DatasetError as exc:
+                raise _err(f"report '{name}': {exc}") from None
         now = datetime.now(timezone.utc)
         tpl_dir = resolve_template_path(template, self._p.root).parent if need else None
         cache: dict[str, str] = {}
@@ -165,10 +219,16 @@ class ReportService:
         def html() -> str:
             if "html" not in cache:
                 cache["html"] = render_html(template, rows, project_root=self._p.root, report_name=name,
-                                            extra_vars=vars or None, now=now)
+                                            extra_vars=vars or None, now=now, datasets=sets)
             return cache["html"]
 
-        ctx = ReportContext(name, rows, columns, rename, now, html, tpl_dir)
+        sheets = []
+        if spec is not None:
+            for n, ds in spec.datasets.items():
+                sheets.append(ReportContext(n, sets.get(n, []), ds.columns, ds.rename,
+                                            hidden=set(spec.attached_fields(n))))
+        ctx = ReportContext(name, rows, columns, rename, now, html, tpl_dir,
+                            hidden=set(spec.attached_fields()) if spec is not None else set(), sheets=sheets)
         stem = output_stem(_resolve_output_path(raw_output or f"reports/output/{name}", now, report_name=name))
         base = Path(stem)
         if not base.is_absolute():
@@ -180,21 +240,48 @@ class ReportService:
             out = base.parent / (base.name + r.extension)
             r.render(ctx, out)
             outputs.append(ReportArtifact.of(out, r.format))
-        warnings = [f"stopped after {len(rows)} rows (from.max_rows); the source has more"] if truncated else []
-        return ReportResult(name, outputs, len(rows), round(time.monotonic() - t0, 2), truncated, warnings)
+        warnings = rd.warnings() + join_warnings
+        return ReportResult(name, outputs, len(rows), round(time.monotonic() - t0, 2), bool(rd.truncated), warnings,
+                            {n: len(v) for n, v in rd.datasets.items()})
 
     # ------------------------------------------------------------------ fetch
     def _fetch(self, spec: ReportSpec, extra_params: dict[str, Any]) -> tuple[list[dict], bool]:
-        """Rows for the report from its configured endpoint or source, plus a truncated flag."""
-        frm = spec.from_
+        """The master rows from the report's ``from``, plus a truncated flag."""
+        return self._read_from(spec.name, "master", spec.from_, extra_params)
+
+    def _dataset_params(self, spec: ReportSpec) -> set[str]:
+        """Param names the report's datasets use (SQL binds, declared endpoint params)."""
+        used: set[str] = set()
+        for n, frm in spec.all_froms():
+            if n == "master":
+                continue
+            if frm.query:
+                used |= set(_BIND.findall(frm.query))
+            elif frm.endpoint and self._p.config.endpoint(frm.endpoint):
+                used |= {p.name for p in self._p.config.endpoint(frm.endpoint).params}
+        return used
+
+    def _read_from(self, report: str, dataset: str, frm, extra_params: dict[str, Any],
+                   also_used: set[str] = frozenset()) -> tuple[list[dict], bool]:
+        """Rows from one ``from`` (the master's or a dataset's). The run's params go to every query:
+        the master's endpoint gets them all except those only a dataset uses (*also_used*), so a misspelt
+        param is still an error; a dataset's endpoint only gets those it declares, and a SQL query only
+        binds the names it uses."""
+        who = f"report '{report}'" + ("" if dataset == "master" else f" dataset '{dataset}'")
         merged = {**(frm.params or {}), **extra_params}
         if frm.endpoint:
             from ..services.runtime import RuntimeService
+            ep = self._p.config.endpoint(frm.endpoint)
+            declared = {p.name for p in ep.params} if ep else set()
+            if dataset != "master":
+                merged = {k: v for k, v in merged.items() if k in declared or k in (frm.params or {})}
+            elif also_used:
+                merged = {k: v for k, v in merged.items() if k in declared or k not in also_used}
             return RuntimeService(self._p).fetch_rows(frm.endpoint, merged, paginate=frm.paginate,
-                                                      max_rows=frm.max_rows, actor=f"report:{spec.name}")
+                                                      max_rows=frm.max_rows, actor=f"report:{report}")
         src = self._p.config.sources.get(frm.source)
         if src is None:
-            raise _err(f"report references unknown source '{frm.source}'")
+            raise _err(f"{who} references unknown source '{frm.source}'")
         if src.type == "file":
             rows = self._source(frm.source)._load()
             return list(rows[:frm.max_rows]), len(rows) > frm.max_rows
@@ -205,8 +292,13 @@ class ReportService:
             else:
                 merged.pop("_sql", None)
             if not query:
-                raise _err(f"report '{spec.name}': SQL sources need 'from.query' (one SELECT statement)")
-            return self._read_sql(frm.source, query, merged, frm.max_rows)
+                raise _err(f"{who}: SQL sources need 'from.query' (one SELECT statement)")
+            try:
+                return self._read_sql(frm.source, query, merged, frm.max_rows)
+            except Exception as exc:
+                if dataset == "master":
+                    raise
+                raise _err(f"dataset '{dataset}': {exc}") from None
         raise _err(
             f"source type '{src.type}' is not directly supported for reports; "
             "expose it via an endpoint and use 'from.endpoint' instead"
