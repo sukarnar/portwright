@@ -64,6 +64,17 @@ class Place:
         return f"{self.name}:{rel}"
 
 
+def all_roots(config: ProjectConfig) -> dict[str, FsRoot]:
+    """Configured roots plus the implicit ones: reports (read_write), templates (read_write), data (read)."""
+    out = {
+        "reports": FsRoot(path="reports/output", mode="read_write"),
+        "templates": FsRoot(path="templates", mode="read_write"),
+        "data": FsRoot(path=config.security.data_root, mode="read"),
+    }
+    out.update(config.filesystem.roots)
+    return out
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -118,14 +129,7 @@ class Sandbox:
 
     # ------------------------------------------------------------------ roots
     def roots(self) -> dict[str, FsRoot]:
-        """Configured roots plus the implicit ones: reports (read_write), templates (read_write), data (read)."""
-        out = {
-            "reports": FsRoot(path="reports/output", mode="read_write"),
-            "templates": FsRoot(path="templates", mode="read_write"),
-            "data": FsRoot(path=self.cfg.security.data_root, mode="read"),
-        }
-        out.update(self.cfg.filesystem.roots)
-        return out
+        return all_roots(self.cfg)
 
     def _base(self, raw: str, what: str) -> Path:
         if is_absolute_path(raw):

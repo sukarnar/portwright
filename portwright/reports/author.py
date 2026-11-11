@@ -357,7 +357,7 @@ class ReportAuthor:
                             warnings=warnings)
 
     def sample(self, name: str | None, *, frm: ReportFrom | dict | None = None, params: dict | None = None,
-               model: str | None = None, sample_rows: int | None = None) -> dict:
+               model: str | None = None, sample_rows: int | None = None, data_access: str | None = None) -> dict:
         """What a model may see of a report's data (the policy payload), for agents' report_sample."""
         existing = self.cfg.report(name) if name else None
         if isinstance(frm, dict):
@@ -366,8 +366,12 @@ class ReportAuthor:
         if frm is None:
             raise _err("give a report name or 'from' (an endpoint, or a SQL source and query)")
         model_name, model_spec = self._model(model)
-        policy = pol.resolve(self.cfg, model_spec=model_spec, model_name=model_name,
-                             source=pol.source_of(self.cfg, frm), report=existing, sample_rows=sample_rows)
+        try:
+            policy = pol.resolve(self.cfg, model_spec=model_spec, model_name=model_name,
+                                 source=pol.source_of(self.cfg, frm), report=existing, override=data_access,
+                                 sample_rows=sample_rows)
+        except ValueError as exc:
+            raise _err(str(exc)) from None
         if not policy.allowed:
             raise _err(f"this data is closed to AI: {policy.explain()}")
         rows = self._sample(name or "sample", frm, params, pol.fetch_limit(policy))

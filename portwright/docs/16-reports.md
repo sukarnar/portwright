@@ -89,6 +89,30 @@ Click the gallery icon in the report toolbar to browse built-in and project temp
 Click **Use** to pre-fill the template path in the report editor, or **Copy to project** to
 copy the file to `<project root>/templates/` for editing.
 
+**AI templates** (`.portwright/templates/`, not in git) are listed in their own section with an
+*AI draft* badge, the report that uses each one, the model, the data access level, the prompt and the
+columns the model saw. **Promote** copies one into `templates/` and points its report at it.
+
+### Design with AI
+
+**Design with AI** (in the toolbar for a new report, or the ✨ button on a report row) opens a dialog:
+
+| Field | Description |
+|---|---|
+| Report name | A new name, or the report you clicked |
+| What should the report show? | The request for the model |
+| Data from endpoint / source / query | New reports only: where the data comes from |
+| Formats | Formats the template must suit (PDF adds a test PDF build to the checks) |
+| Model | A model from Agents > Models (preselected when there is only one) |
+| Start from | A built-in template the model uses as an example |
+| What the model may see | The allowed level is shown with the reason; you can only lower it |
+| Sample rows | Rows read for the run |
+| Replace an existing AI template | Otherwise an existing AI template is not overwritten |
+
+**What the model will see** shows the exact data part of the prompt before anything is sent. **Design**
+runs the model, checks the template, saves it and shows what was sent (level, rows, columns). Reports using
+an AI template show an *AI draft* badge and a **Promote** button (⇪) in the list.
+
 ### Template Editor
 
 Click `<>` on a report row to open the full-screen editor.

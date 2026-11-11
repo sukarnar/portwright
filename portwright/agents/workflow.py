@@ -224,15 +224,20 @@ def _need_scope(env: "_Env", scope: str) -> None:
         raise ToolError(f"this step needs the scope '{scope}' on the workflow (scopes: [{scope}, ...])")
 
 
+def _formats(value: Any) -> list[str] | None:
+    """A step's formats: a list, or text like "pdf, xlsx" (e.g. from ${input.formats})."""
+    if isinstance(value, str):
+        value = [f.strip() for f in value.split(",") if f.strip()]
+    return list(value) if value else None
+
+
 async def _report(st, raw_input: Any, scope: dict, env: "_Env") -> dict:
     _need_scope(env, "reports:run")
     params = resolve(raw_input, scope) if raw_input is not None else {}
     if not isinstance(params, dict):
         raise ToolError("report step 'input' must be a mapping of report params")
     data = resolve(st.data, scope) if st.data is not None else None
-    formats = resolve(st.formats, scope) if st.formats else None
-    if isinstance(formats, str):
-        formats = [f.strip() for f in formats.split(",") if f.strip()]
+    formats = _formats(resolve(st.formats, scope)) if st.formats else None
     extra = resolve(st.vars, scope) if st.vars else None
     out = resolve(st.output_path, scope) if st.output_path else None
     svc = env.reports()
@@ -260,7 +265,8 @@ async def _report_design(st, scope: dict, env: "_Env") -> tuple[dict, int]:
     try:
         res = await author.design(st.report, prompt if isinstance(prompt, str) else json.dumps(prompt, default=str),
                                   frm=resolve(st.from_, scope) if st.from_ else None,
-                                  formats=resolve(st.formats, scope) if st.formats else None, model=st.model,
+                                  formats=_formats(resolve(st.formats, scope)) if st.formats else None,
+                                  model=st.model,
                                   base=st.base, sample_rows=st.sample_rows, data_access=st.data_access,
                                   if_exists="replace" if st.overwrite == "always" else "keep")
     except _fs_errors() as exc:

@@ -5,7 +5,9 @@ import flet as ft
 
 from ...reports.renderers import RENDERERS
 from ...services import ServiceError
-from ..common import Ctx, dropdown, empty, header, icon_btn, mono, text_field, help_btn
+from .. import report_vm as rvm
+from ..common import Ctx, checkbox_rows, dropdown, empty, header, icon_btn, mono, tag, text_field, help_btn
+from .report_design import DesignDialog
 from .template_editor import TemplateEditorView
 from .template_gallery import TemplateGalleryView
 
@@ -66,6 +68,9 @@ class ReportsView:
                 ft.OutlinedButton("Templates", icon=ft.Icons.PHOTO_LIBRARY,
                                   on_click=lambda _: self._open_gallery(),
                                   tooltip="Browse and manage Jinja2 templates"),
+                ft.OutlinedButton("Design with AI", icon=ft.Icons.AUTO_AWESOME,
+                                  on_click=lambda _: self._design(None),
+                                  tooltip="Have a model write a new report's template"),
                 ft.FilledButton("Add report", icon=ft.Icons.ADD,
                                 on_click=lambda _: self._open_editor(None)),
             ],
@@ -76,17 +81,25 @@ class ReportsView:
             return controls
 
         rows = []
+        cfg = self.ctx.svc.project.config
         for r in items:
+            ai = rvm.is_ai_report(self.ctx.svc, cfg.report(r["name"]))
+            tpl_cell = ft.Row([_small(r["template"] or ""), tag("AI draft", "warn")], spacing=6) if ai                 else _small(r["template"] or "")
+            extra = [icon_btn(ft.Icons.PUBLISH, "Promote: copy the AI template into templates/ (git)",
+                              lambda _, n=r["name"]: self._promote(n), ft.Colors.AMBER_800)] if ai else []
             rows.append(ft.DataRow(cells=[
                 ft.DataCell(ft.Text(r["name"], weight=ft.FontWeight.W_500)),
                 ft.DataCell(_small(r["from"])),
                 ft.DataCell(_small(", ".join(r["formats"]))),
-                ft.DataCell(_small(r["template"] or "")),
+                ft.DataCell(tpl_cell),
                 ft.DataCell(_small(r["description"] or "")),
                 ft.DataCell(ft.Row([
                     icon_btn(ft.Icons.PLAY_ARROW, "Run report",
                              lambda _, n=r["name"]: self._show_run_dialog(n),
                              ft.Colors.GREEN_700),
+                    icon_btn(ft.Icons.AUTO_AWESOME, "Design the template with AI",
+                             lambda _, n=r["name"]: self._design(n), ft.Colors.PURPLE_700),
+                    *extra,
                     icon_btn(ft.Icons.CODE, "Edit template",
                              lambda _, n=r["name"], t=r["template"]: self._open_template_editor(n, t),
                              ft.Colors.TERTIARY),
@@ -118,6 +131,24 @@ class ReportsView:
                     size=11, color=ft.Colors.ON_SURFACE_VARIANT),
         ], spacing=6))
         return controls
+
+    # ---------------------------------------------------------------- AI
+    def _design(self, name: str | None) -> None:
+        DesignDialog(self.ctx, name, on_done=self.refresh).open()
+
+    def _promote(self, name: str) -> None:
+        from ...reports.author import ReportAuthor
+
+        def go():
+            try:
+                dest = ReportAuthor(self.ctx.svc.project, actor="studio").promote(name)
+            except ServiceError as exc:
+                self.ctx.fail(exc)
+                return
+            self.ctx.toast(f"'{name}' now uses {dest.relative_to(self.ctx.svc.project.root).as_posix()} (in git)")
+            self.refresh()
+        self.ctx.confirm("Promote template", f"Copy the AI template of '{name}' into templates/ so it is kept in "
+                         "git, and point the report at it?", go, danger=False, yes="Promote")
 
     # ---------------------------------------------------------------- template gallery
     def _open_gallery(self) -> None:
@@ -190,7 +221,7 @@ class ReportsView:
         dlg = ft.AlertDialog(
             title=ft.Text(f"Run report: {name}"),
             content=ft.Column([output, params_field, _small("Formats"),
-                               ft.Row(list(fmt_boxes.values()), wrap=True, spacing=4), status],
+                               checkbox_rows(fmt_boxes.values()), status],
                               spacing=12, width=460),
             actions=[
                 ft.FilledButton("Run", icon=ft.Icons.PLAY_ARROW, on_click=run),
@@ -347,7 +378,7 @@ class _ReportEditor:
             self.output,
             self.query,
             _small("Output formats:"),
-            ft.Row(list(self.formats.values()), wrap=True, spacing=4),
+            checkbox_rows(self.formats.values(), 6),
             _small("Output path supports Jinja2 e.g. reports/{{ now | strftime('%Y-%m') }}/sales  "
                    "(each format adds its own suffix: .pdf, .xlsx, …)"),
             self.error,

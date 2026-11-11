@@ -75,15 +75,32 @@ class Node:
 
     @property
     def target_kind(self) -> str | None:
-        """The kind of thing this node needs picked: tool | agent | model | load (None if nothing)."""
+        """The kind of thing this node needs picked: tool | agent | model | load | report (None if nothing)."""
+        if self.type == "report":
+            return "report"
         kind = self.do if self.type == "foreach" else self.type
         return {"tool": "tool", "agent": "agent", "llm": "model", "report_design": "model", "load": "load"}.get(kind)
 
+    def _opts(self) -> dict:
+        v = _parse(self.settings)
+        return dict(v) if isinstance(v, dict) else {}
+
+    def is_inline_report(self) -> bool:
+        """A report step with its own rows and formats needs no saved report."""
+        o = self._opts()
+        return self.type == "report" and not o.get("report") and bool(o.get("formats")) and "data" in o
+
     def target(self) -> str:
+        if self.target_kind == "report":
+            return str(self._opts().get("report") or "")
         return {"tool": self.tool, "agent": self.agent, "model": self.model, "load": self.load}.get(self.target_kind or "", "")
 
     def set_target(self, name: str) -> None:
-        if self.target_kind:
+        if self.target_kind == "report":
+            rest = {k: v for k, v in self._opts().items() if k != "report"}
+            o = {"report": name, **rest} if name else rest
+            self.settings = yaml.safe_dump(o, sort_keys=False, allow_unicode=True).strip() if o else ""
+        elif self.target_kind:
             setattr(self, self.target_kind, name)
 
 
@@ -314,9 +331,10 @@ def blank_choices(g: Graph) -> list[str]:
     return out
 
 
-def prefill_choices(g: Graph, tools: list[str], agents: list[str], models: list[str] = (), loads: list[str] = ()) -> None:
+def prefill_choices(g: Graph, tools: list[str], agents: list[str], models: list[str] = (), loads: list[str] = (),
+                    reports: list[str] = ()) -> None:
     """Template nodes arrive with nothing picked; fill them in when the project has only one to choose."""
-    pool = {"tool": tools, "agent": agents, "model": models, "load": loads}
+    pool = {"tool": tools, "agent": agents, "model": models, "load": loads, "report": reports}
     for n in g.nodes:
         k = n.target_kind
         if k and not n.target() and len(pool[k]) == 1:
@@ -373,15 +391,17 @@ def canvas_size(g: Graph) -> tuple[int, int]:
 
 # ---------------------------------------------------------------- checking
 def problems(g: Graph, tools: list[str], agents: list[str], models: list[str] | None = None,
-             loads: list[str] | None = None) -> list[str]:
-    """Things to fix before saving. models / loads are checked only when given."""
+             loads: list[str] | None = None, reports: list[str] | None = None) -> list[str]:
+    """Things to fix before saving. models / loads / reports are checked only when given."""
     out = []
     if not g.nodes:
         return ["Add at least one step."]
     ok = set(reachable(g))
-    pools = {"tool": tools, "agent": agents, "model": models, "load": loads}
+    pools = {"tool": tools, "agent": agents, "model": models, "load": loads, "report": reports}
     for n in g.nodes:
         k = n.target_kind
+        if k == "report" and n.is_inline_report():
+            k = None
         if k and pools[k] is not None and n.target() not in pools[k]:
             out.append(f"{n.id}: choose {'an' if k in ('agent',) else 'a'} {k}")
         if n.type == "tool" and _parse(n.input) is not None and not isinstance(_parse(n.input), dict):
@@ -405,8 +425,8 @@ def problems(g: Graph, tools: list[str], agents: list[str], models: list[str] | 
             out.append(f"{n.id}: settings must be a YAML mapping of option: value")
         if n.type in SETTINGS_TYPES:
             opts = _parse(n.settings) if isinstance(_parse(n.settings), dict) else {}
-            if n.type == "report" and not (opts.get("report") or opts.get("formats")):
-                out.append(f"{n.id}: name the report to run (report: <name>)")
+            if n.type == "report" and reports is None and not (opts.get("report") or n.is_inline_report()):
+                out.append(f"{n.id}: choose a report")
             if n.type == "report_design":
                 if not opts.get("report"):
                     out.append(f"{n.id}: name the report to design (report: <name>)")

@@ -181,13 +181,27 @@ out of a root are refused. Absolute or UNC root and destination paths must be li
 
 Scopes: `fs:<root>:read` (or `fs:<root>:write`, which includes reading) for files a step reads,
 `fs:<root>:write` for files it writes or moves away, `fs:dest:<name>` to deliver to a destination, and `*` for
-everything. In the workflow canvas, **Report**, **Copy**, **Move** and **Files** nodes take their options as
-YAML under *Settings*.
+everything.
+
+In the workflow canvas these are the **Report**, **Design report (AI)**, **Copy**, **Move** (orange: it removes
+the source files) and **Files** nodes, each with its own form:
+
+- **Copy / Move**: the files (a button fills in `${steps.<report>.output.outputs}` when a Report node leads into
+  it), **Deliver to** (your destinations and writable folders), a sub-folder (`${run.date.year}` works), what to
+  do when a file is already there, how to check each copy, the manifest and folder options.
+- **Report**: the report, its params, formats (or `${input.formats}`), rows from an earlier step, output path.
+- **Design report (AI)**: model, report name (for a new one, where its data comes from), the request, formats,
+  a template to start from, whether to reuse an existing AI template, and what the model may see (only the
+  allowed level or lower is offered).
+- **Files**: the operation, then just the fields it needs.
+
+*All options (YAML)* under each form shows every option and takes the ones the form does not show.
 
 **Templates.** Ready-made workflows to start from: `hello` (needs no tools), `ask-an-agent`,
 `query-and-summarise`, `check-and-alert`, `draft-and-review`, `with-fallback`, `compare-two-sources`,
-`classify-and-route`, `summarise-each-row` and `load-then-report`.
-Their tool, agent, model and load steps are left blank for you to pick (a single choice is filled in).
+`classify-and-route`, `summarise-each-row`, `load-then-report`, `report-and-deliver` (run a report, copy its files
+into a dated folder with a manifest) and `ask-for-a-report` (pass a request to a report-author agent).
+Their tool, agent, model, load and report steps are left blank for you to pick (a single choice is filled in).
 
 <!-- studio -->
 ## In Studio

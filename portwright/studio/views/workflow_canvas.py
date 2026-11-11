@@ -6,7 +6,8 @@ import flet.canvas as cv
 
 from ...services import ServiceError
 from .. import graph_vm as gv
-from ..common import Ctx, dropdown, text_field
+from .. import report_vm as rvm
+from ..common import Ctx, checkbox_rows, dropdown, text_field
 
 NODE_STYLE = {   # type -> (label, icon, background, accent)
     "input": ("Input", ft.Icons.LOGIN, ft.Colors.TEAL_50, ft.Colors.TEAL_700),
@@ -55,6 +56,10 @@ def window_size(ctx) -> tuple[float, float]:
     return (w if isinstance(w, (int, float)) and w else 1280), (h if isinstance(h, (int, float)) and h else 820)
 
 
+def _help(text: str) -> ft.Text:
+    return ft.Text(text, size=12, color=ft.Colors.ON_SURFACE_VARIANT)
+
+
 def _touch(*controls: ft.Control) -> None:
     """Refresh controls that are on screen; quietly skip ones that are not mounted yet (tests, first build)."""
     for c in controls:
@@ -76,6 +81,10 @@ class WorkflowCanvas:
         self.tools, self.agents = list(cfg.tools), list(cfg.agents)
         self.models = [m["name"] for m in self.svc.list("model")]
         self.loads = [l.name for l in cfg.loads]
+        self.cfg = cfg
+        self.reports = [r.name for r in cfg.reports]
+        self.get_endpoints = [e.name for e in cfg.endpoints if e.method == "GET"]
+        self.sql_sources = [n for n, s in cfg.sources.items() if s.type == "sql"]
         self.base: dict = {}
         steps: list[dict] = []
         if name:
@@ -415,19 +424,191 @@ class WorkflowCanvas:
     }
 
     def _settings_fields(self, n: gv.Node, bind) -> list[ft.Control]:
+        """A form for the node's options; 'All options (YAML)' below shows (and edits) everything."""
+        opts = rvm.node_opts(n)
+        box = text_field("All options (YAML)", n.settings, multiline=True, min_lines=3,
+                         hint="the fields above write these; edit here for options they do not show")
+
+        def put(key: str, value) -> None:
+            rvm.set_opt(n, key, value)
+            box.value = n.settings
+            _touch(box)
+            self.refresh_card(n)
+            self.show_problems()
+
+        def on(ctl, key: str, conv=lambda v: v):
+            def changed(_):
+                put(key, conv(ctl.value))
+            ctl.on_change = changed
+            if isinstance(ctl, ft.Dropdown):
+                ctl.on_select = changed
+            return ctl
+
+        def commit_yaml(_):
+            n.settings = box.value or ""
+            self.refresh_card(n)
+            self.show_problems()
+            self.show_inspector()
+        box.on_blur = commit_yaml
+        form = {"report": self._form_report, "report_design": self._form_design, "copy": self._form_transfer,
+                "move": self._form_transfer, "file": self._form_file}[n.type]
+        return [*form(n, opts, on, put, bind), _help(self._SETTINGS_HELP[n.type]), box]
+
+    def _formats_row(self, opts: dict, put, label: str) -> list[ft.Control]:
+        if isinstance(opts.get("formats"), str):              # e.g. ${input.formats}: keep it as text
+            f = text_field("Formats", opts["formats"], hint="pdf,xlsx or ${input.formats}")
+            f.on_change = lambda _: put("formats", (f.value or "").strip() or None)
+            return [f]
+        cur = set(opts.get("formats") or [])
+        boxes = {f: ft.Checkbox(label=f.upper(), value=f in cur) for f in rvm.FORMATS}
+
+        def changed(_):
+            put("formats", [f for f, b in boxes.items() if b.value])
+        for b in boxes.values():
+            b.on_change = changed
+        return [_help(label), checkbox_rows(boxes.values())]
+
+    def _form_report(self, n: gv.Node, opts: dict, on, put, bind) -> list[ft.Control]:
         out: list[ft.Control] = []
-        if n.type == "report_design":
-            out += [self._pick(n, bind, "model", "Model", self.models, "No models yet. Add one on the Models tab."),
-                    bind("input", text_field("What should the report show?", n.input, multiline=True, min_lines=3,
-                                             hint="e.g. Headcount by department as KPI cards and a table"))]
-        if n.type == "report":
-            out.append(bind("input", text_field("Report params (YAML)", n.input, multiline=True, min_lines=2,
-                                                hint="e.g. dept: ${input.dept}")))
-        out += [bind("settings", text_field("Settings (YAML)", n.settings, multiline=True, min_lines=4)),
-                ft.Text(self._SETTINGS_HELP[n.type], size=12, color=ft.Colors.ON_SURFACE_VARIANT)]
-        if n.type == "move":
-            out.append(ft.Text("Source files are removed after a verified copy.", size=12,
-                               color=ft.Colors.DEEP_ORANGE_800))
+        if self.reports:
+            out.append(on(dropdown("Report", {r: r for r in self.reports}, opts.get("report") or None), "report"))
+        else:
+            out.append(ft.Text("No reports yet. Add one on the Reports screen.", size=12, color=ft.Colors.AMBER_800))
+        out.append(bind("input", text_field("Report params (YAML)", n.input, multiline=True, min_lines=2,
+                                            hint="e.g. dept: ${input.dept}")))
+        out += self._formats_row(opts, put, "Formats (none ticked: the report's own)")
+        out += [on(text_field("Rows from an earlier step (optional)", rvm.show_value(opts.get("data")),
+                              hint="e.g. ${steps.query.output.rows} - instead of the report's source"),
+                   "data", rvm.parse_value),
+                on(text_field("Output path (optional)", opts.get("output_path") or "",
+                              hint="e.g. reports/output/${run.date.iso}/headcount"), "output_path")]
+        return out
+
+    def _form_transfer(self, n: gv.Node, opts: dict, on, put, bind) -> list[ft.Control]:
+        verb = n.type
+        files = text_field(f"Files to {verb}", rvm.show_value(opts.get("files")),
+                           hint="a report step's outputs, paths, or root:path addresses")
+        on(files, "files", rvm.parse_value)
+        out: list[ft.Control] = [files]
+        suggestion = rvm.suggested_files(self.graph, n.id)
+        if suggestion and not opts.get("files"):
+            def use(_):
+                files.value = suggestion
+                _touch(files)
+                put("files", suggestion)
+            out.append(ft.TextButton(f"Use {suggestion}", icon=ft.Icons.SUBDIRECTORY_ARROW_RIGHT, on_click=use))
+        targets = rvm.delivery_targets(self.cfg)
+        base, sub = rvm.split_to(str(opts.get("to") or ""))
+        if base and base not in targets:
+            targets[base] = base
+        dest = dropdown("Deliver to", targets, base or None)
+        f_sub = text_field("Sub-folder (optional)", sub, hint="e.g. ${run.date.year}-${run.date.month}")
+
+        def to_changed(_):
+            put("to", rvm.join_to(dest.value or "", f_sub.value or ""))
+        dest.on_select = dest.on_change = to_changed
+        f_sub.on_change = to_changed
+        out += [dest, f_sub]
+        if not self.cfg.destinations:
+            out.append(_help("No destinations yet: add one under 'destinations:' in portwright.yaml; a share's path "
+                             "must also be in security.allowed_folders."))
+        out += [on(dropdown("If the file is already there", rvm.OVERWRITE_LABELS, opts.get("overwrite") or ""),
+                   "overwrite", lambda v: v or None),
+                on(dropdown("Check each copy", rvm.VERIFY_LABELS, opts.get("verify") or "sha256"), "verify"),
+                on(ft.Checkbox(label="Write manifest.json", value=bool(opts.get("manifest"))),
+                   "manifest"),
+                on(ft.Checkbox(label="Create missing folders", value=opts.get("create_dirs", True) is not False),
+                   "create_dirs")]
+        if verb == "move":
+            out.append(ft.Text("Source files are removed after a verified copy. The source folder must be "
+                               "writable.", size=12, color=ft.Colors.DEEP_ORANGE_800))
+        return out
+
+    def _form_file(self, n: gv.Node, opts: dict, on, put, bind) -> list[ft.Control]:
+        op = opts.get("op") or ""
+        f_op = dropdown("Operation", rvm.FILE_OPS, op or None)
+
+        def op_changed(_):
+            put("op", f_op.value)
+            self.show_inspector()                             # different fields per operation
+        f_op.on_select = f_op.on_change = op_changed
+        out: list[ft.Control] = [f_op]
+        fields = {
+            "to": lambda: on(text_field("Target", opts.get("to") or "", hint="root:path, e.g. reports:notes/today.txt"),
+                             "to"),
+            "path": lambda: on(text_field("Path", opts.get("path") or "", hint="root:path, e.g. reports:2026-11"),
+                               "path"),
+            "files": lambda: on(text_field("Files", rvm.show_value(opts.get("files")),
+                                           hint="${steps.x.output.outputs}, a list, or one root:path"),
+                                "files", rvm.parse_value),
+            "content": lambda: on(text_field("Content", rvm.show_value(opts.get("content")), multiline=True,
+                                             min_lines=3, hint="text, or ${steps.x.output} (written as JSON)"),
+                                  "content", rvm.parse_value),
+            "glob": lambda: on(text_field("Only names like", opts.get("glob") or "", hint="e.g. *.pdf"), "glob"),
+            "recursive": lambda: on(ft.Checkbox(label="Include sub-folders", value=bool(opts.get("recursive"))),
+                                    "recursive"),
+            "overwrite": lambda: on(dropdown("If it exists", {k: v for k, v in rvm.OVERWRITE_LABELS.items() if k},
+                                             opts.get("overwrite") or "never"), "overwrite",
+                                    lambda v: None if v == "never" else v),
+        }
+        out += [fields[f]() for f in rvm.FILE_OP_FIELDS.get(op, ())]
+        return out
+
+    def _form_design(self, n: gv.Node, opts: dict, on, put, bind) -> list[ft.Control]:
+        pick = self._pick(n, bind, "model", "Model", self.models, "No models yet. Add one on the Models tab.")
+        if isinstance(pick, ft.Dropdown):                      # the model changes what it may see: redraw
+            first = pick.on_select
+
+            def model_changed(e):
+                first(e)
+                self.show_inspector()
+            pick.on_select = model_changed
+        out: list[ft.Control] = [pick]
+        name = text_field("Report name", opts.get("report") or "", hint="an existing report, or a new name")
+        on(name, "report")
+        name.on_blur = lambda _: self.show_inspector()          # new name: show where its data comes from
+        out.append(name)
+        report = (opts.get("report") or "").strip()
+        frm = opts.get("from") if isinstance(opts.get("from"), dict) else {}
+        if report and report in self.reports:
+            out.append(_help(f"Updates the template of the existing report '{report}'."))
+        else:
+            f_ep = dropdown("Data from endpoint", {"": "(none)", **{e: e for e in self.get_endpoints}},
+                            frm.get("endpoint") or "")
+            f_src = dropdown("…or SQL source", {"": "(none)", **{s: s for s in self.sql_sources}}, frm.get("source") or "")
+            f_q = text_field("Query (SQL source)", frm.get("query") or "", multiline=True, min_lines=2,
+                             hint="one SELECT; bind values as :name")
+
+            def from_changed(_):
+                ep, src, q = f_ep.value or "", f_src.value or "", (f_q.value or "").strip()
+                put("from", {"endpoint": ep} if ep else ({"source": src, **({"query": q} if q else {})} if src else None))
+            for c in (f_ep, f_src):
+                c.on_select = c.on_change = from_changed
+            f_q.on_change = from_changed
+            out += [_help("A new report: say where its data comes from."), f_ep, f_src, f_q]
+        out.append(bind("input", text_field("What should the report show?", n.input, multiline=True, min_lines=3,
+                                            hint="e.g. Headcount by department as KPI cards and a table")))
+        out += self._formats_row(opts, put, "Formats the template must suit")
+        from ...reports.author import builtin_templates
+        out.append(on(dropdown("Start from", {"": "(nothing)", **{b: b for b in builtin_templates()}},
+                               opts.get("base") or ""), "base", lambda v: v or None))
+        out.append(on(dropdown("When an AI template exists", {"never": "Reuse it (no model call)",
+                                                             "always": "Design again every run"},
+                               opts.get("overwrite") or "never"), "overwrite", lambda v: None if v == "never" else v))
+        try:
+            level, why = rvm.effective_access(self.ctx.svc, n.model or None, report if report in self.reports else None,
+                                              frm.get("endpoint"), frm.get("source"))
+        except Exception:                                    # noqa: BLE001 - models may not load yet
+            level, why = "full", "data access 'full'"
+        if level == "none":
+            out.append(ft.Text(f"AI authoring is not allowed for this data ({why}).", size=12, color=ft.Colors.ERROR))
+        else:
+            out.append(on(dropdown("What the model may see", rvm.access_choices(level),
+                                   opts.get("data_access") or level),
+                          "data_access", lambda v: None if v == level else v))
+            out.append(_help(f"Allowed here: {why}. You can only lower it."))
+        out.append(on(text_field("Sample rows (optional)", str(opts.get("sample_rows") or ""), width=160),
+                      "sample_rows", lambda v: int(v) if str(v).strip().isdigit() else None))
         return out
 
     def _foreach_fields(self, n: gv.Node, bind) -> list[ft.Control]:
@@ -482,7 +663,7 @@ class WorkflowCanvas:
             self.ctx.fail(exc)
             return
         self.graph = gv.from_steps(t["steps"])
-        gv.prefill_choices(self.graph, self.tools, self.agents, self.models, self.loads)
+        gv.prefill_choices(self.graph, self.tools, self.agents, self.models, self.loads, self.reports)
         self.base = {**self.base, "description": t["description"]}
         self.selected, self.linking = self.graph.start, None
         if not (self.f_name.value or "").strip():
@@ -565,7 +746,7 @@ class WorkflowCanvas:
         self.rebuild()
 
     def show_problems(self) -> None:
-        probs = gv.problems(self.graph, self.tools, self.agents, self.models, self.loads)
+        probs = gv.problems(self.graph, self.tools, self.agents, self.models, self.loads, self.reports)
         self.problems.controls = [ft.Row([ft.Icon(ft.Icons.WARNING_AMBER, size=16, color=ft.Colors.AMBER_800),
                                           ft.Text(p, size=12)], spacing=6) for p in probs]
         _touch(self.problems)

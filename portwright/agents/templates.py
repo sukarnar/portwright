@@ -113,6 +113,26 @@ TEMPLATES: list[dict] = [
          "input": "Write a short status report for ${input.audience} from this load result:\n${steps.run_it.output}",
          "next": "result"},
         {"id": "result", "type": "output", "value": "${steps.report.output}"}]),
+    _t("report-and-deliver", "Run a report, then deliver it",
+       "Runs one of your reports in the formats you pick, then copies the files into a dated folder with a "
+       "manifest. Point 'Deliver to' at one of your destinations (a share). Needs the scopes reports:run, "
+       "fs:reports:read and fs:reports:write (or fs:dest:<name> for a destination).",
+       [{"id": "start", "type": "input", "inputs": {"formats": "pdf,xlsx"}, "next": "build"},
+        {"id": "build", "type": "report", "report": "", "formats": "${input.formats}", "next": "deliver"},
+        {"id": "deliver", "type": "copy", "files": "${steps.build.output.outputs}",
+         "to": "reports:delivered/${run.date.year}-${run.date.month}", "overwrite": "rename", "manifest": True,
+         "next": "result"},
+        {"id": "result", "type": "output", "value": {"files": "${steps.deliver.output}"}}],
+       {"formats": "pdf"}),
+    _t("ask-for-a-report", "Ask an agent for a report",
+       "Passes a request to a report-building agent (create one with: portwright agent from-template "
+       "report-author <name> --model <model>). It picks the data, writes and checks a template, saves it and "
+       "runs the report.",
+       [{"id": "start", "type": "input", "inputs": {"request": {"description": "What report do you need?"}},
+         "next": "build"},
+        {"id": "build", "type": "agent", "agent": "", "input": "${input.request}", "next": "result"},
+        {"id": "result", "type": "output", "value": "${steps.build.output}"}],
+       {"request": "Headcount by department as a PDF"}),
 ]
 
 
@@ -138,7 +158,8 @@ def template_yaml(template_id: str) -> str:
     t = get_template(template_id)
     for s in t["steps"]:
         kind = s.get("do") if s["type"] == "foreach" else s["type"]
-        field = {"tool": "tool", "agent": "agent", "llm": "model", "load": "load"}.get(kind)
+        field = {"tool": "tool", "agent": "agent", "llm": "model", "load": "load", "report": "report",
+                 "report_design": "model"}.get(kind)
         if field and not s.get(field):
             s[field] = "CHOOSE_" + field.upper()
     return yaml.safe_dump({"description": t["description"], "steps": t["steps"]}, sort_keys=False, allow_unicode=True)

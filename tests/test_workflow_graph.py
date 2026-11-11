@@ -259,8 +259,8 @@ def test_every_template_is_a_valid_workflow():
         g = gv.from_steps(tpl["steps"])
         assert any(n.type == "input" for n in g.nodes) and any(n.type == "output" for n in g.nodes), t["id"]
         for n in g.nodes:                                       # pick tools, agents, models, loads like a user would
-            n.set_target({"tool": "t", "agent": "a", "model": "m", "load": "l"}.get(n.target_kind, ""))
-        assert gv.problems(g, ["t"], ["a"], ["m"], ["l"]) == [], t["id"]
+            n.set_target({"tool": "t", "agent": "a", "model": "m", "load": "l", "report": "r"}.get(n.target_kind, ""))
+        assert gv.problems(g, ["t"], ["a"], ["m"], ["l"], ["r"]) == [], t["id"]
         WorkflowSpec.model_validate({"steps": gv.to_steps(g)})
         assert "CHOOSE_" in template_yaml(t["id"]) or not gv.blank_choices(gv.from_steps(tpl["steps"])), t["id"]
     with pytest.raises(KeyError):
