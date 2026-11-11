@@ -88,13 +88,70 @@ steps:
   `format: json` the reply is parsed, so later steps can use `${steps.classify.output.label}`; a reply that is not
   JSON fails the step. Token use is recorded on the step.
 - `load`: runs a defined data load and returns its result. The workflow needs the scope `load:run`.
-- `foreach`: runs a `tool`, `agent`, `llm` or `load` once per item of a list and returns the list of results.
+- `foreach`: runs a `tool`, `agent`, `llm`, `load`, `report`, `copy` or `move` once per item of a list and returns
+  the list of results.
   Inside it `${item}` and `${index}` are available. `items` can be a list or a SQL tool result (`{rows: [...]}`).
   A list longer than `max_items` (default 50, up to 1000) stops the step instead of running them all. With
   `on_error: continue` a failed item becomes `{error: ...}` and the loop goes on.
 - `switch`: jumps by value. `when` is the value, `cases` maps each value to a step id (`end` stops), and `default`
   is used when nothing matches (without a default the next step in the list runs). Matching ignores case and
   surrounding spaces.
+
+**Reports and files.** Run a report, then deliver its files to a folder:
+
+```yaml
+destinations:                         # write-only delivery folders, reached as the account running portwright
+  finance: {path: '\\fileserver\finance\reports', overwrite: rename}   # must be in security.allowed_folders
+
+workflows:
+  monthly-headcount:
+    scopes: [reports:run, fs:reports:read, fs:dest:finance]
+    steps:
+      - {id: start,   type: input, inputs: {dept: null}}
+      - {id: build,   type: report, report: dept-headcount, input: {dept: "${input.dept}"}, formats: [pdf, xlsx]}
+      - {id: publish, type: copy, files: "${steps.build.output.outputs}",
+         to: "dest:finance/${run.date.year}-${run.date.month}", manifest: true}
+      - {id: done,    type: output, value: "${steps.publish.output}"}
+```
+
+- `report`: runs a saved report (`input` = its params; `formats`, `vars` and `output_path` override the report's
+  own). `data: ${steps.q.output.rows}` uses rows from an earlier step instead of the report's source; without
+  `report`, `formats` + `data` (+ `template` for pdf/html) make an inline report. The output is
+  `{outputs: [{path, format, bytes, sha256}], row_count, ...}`. Needs the scope `reports:run`.
+- `copy` / `move`: put `files` into the folder `to`. `files` takes a report's `outputs`, a `file list` result,
+  paths, or addresses like `reports:2026-11/a.pdf`. `to` is a folder: `dest:<name>/sub/folder` or `<root>:folder`.
+  - Each file is written to `name.partial`, checked (`verify: sha256` by default; `size` or `none`), then renamed,
+    so a half-written file never appears in the folder.
+  - `overwrite`: `never` (fail), `always`, `rename` (`a (1).pdf`) or `if_newer`. Default: the destination's
+    `overwrite`, else `never`. `create_dirs: false` refuses missing folders; `manifest: true` writes
+    `manifest.json` with names, sizes and checksums.
+  - `move` removes each source only after its copy is verified. If the source can't be removed (file in use),
+    the entry says `copied` with a warning instead of failing. The source root must be writable.
+  - The output lists `{src, dest, address, bytes, sha256, action}` per file (`action`: copied, moved, skipped).
+- `file`: `op: write` (`to`, `content`; a value that isn't text is written as JSON), `read` (`path`), `list`
+  (`path`, `glob`, `recursive`), `mkdir` (`to`), `delete` (`files`; moved to `.portwright/trash` by default) or
+  `zip` (`files`, `to: reports:archive/x.zip`).
+- `${run.id}`, `${run.started_at}` (UTC) and `${run.date.year|month|day|iso}`, `${run.time}` (local time,
+  zero padded) are available in every step for naming folders and files.
+
+**Filesystem roots.** Steps only reach named folders. `reports` (`reports/output`, read-write), `templates`
+(read-write) and `data` (the data folder, read-only) always exist; add more under `filesystem.roots`:
+
+```yaml
+filesystem:
+  roots:
+    inbox: {path: inbox, mode: read_write, patterns: ["*.pdf", "*.xlsx"], delete: trash}   # none | trash | hard
+  max_file_mb: 50
+```
+
+Paths with `..`, alternate data streams (`a.txt:x`), device names (`CON`, `NUL`), or symlinks/junctions leading
+out of a root are refused. Absolute or UNC root and destination paths must be listed in
+`security.allowed_folders`. Every operation is written to the audit log (`fs_copy`, `fs_move`, `fs_write`, ...).
+
+Scopes: `fs:<root>:read` (or `fs:<root>:write`, which includes reading) for files a step reads,
+`fs:<root>:write` for files it writes or moves away, `fs:dest:<name>` to deliver to a destination, and `*` for
+everything. In the workflow canvas, **Report**, **Copy**, **Move** and **Files** nodes take their options as
+YAML under *Settings*.
 
 **Templates.** Ready-made workflows to start from: `hello` (needs no tools), `ask-an-agent`,
 `query-and-summarise`, `check-and-alert`, `draft-and-review`, `with-fallback`, `compare-two-sources`,

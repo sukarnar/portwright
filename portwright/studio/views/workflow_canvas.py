@@ -15,6 +15,10 @@ NODE_STYLE = {   # type -> (label, icon, background, accent)
     "condition": ("Condition", ft.Icons.CALL_SPLIT, ft.Colors.AMBER_50, ft.Colors.AMBER_800),
     "llm": ("LLM prompt", ft.Icons.AUTO_AWESOME, ft.Colors.CYAN_50, ft.Colors.CYAN_800),
     "load": ("Run load", ft.Icons.STORAGE, ft.Colors.ORANGE_50, ft.Colors.ORANGE_800),
+    "report": ("Report", ft.Icons.DESCRIPTION, ft.Colors.LIGHT_BLUE_50, ft.Colors.LIGHT_BLUE_900),
+    "copy": ("Copy", ft.Icons.FILE_COPY, ft.Colors.LIGHT_GREEN_50, ft.Colors.LIGHT_GREEN_900),
+    "move": ("Move", ft.Icons.DRIVE_FILE_MOVE, ft.Colors.DEEP_ORANGE_50, ft.Colors.DEEP_ORANGE_800),
+    "file": ("Files", ft.Icons.FOLDER, ft.Colors.BLUE_GREY_50, ft.Colors.BLUE_GREY_700),
     "foreach": ("For each", ft.Icons.REPEAT, ft.Colors.PINK_50, ft.Colors.PINK_700),
     "switch": ("Switch", ft.Icons.ALT_ROUTE, ft.Colors.DEEP_PURPLE_50, ft.Colors.DEEP_PURPLE_700),
     "set": ("Set value", ft.Icons.EDIT_NOTE, ft.Colors.GREEN_50, ft.Colors.GREEN_700),
@@ -176,11 +180,20 @@ class WorkflowCanvas:
     @staticmethod
     def _summary(n: gv.Node) -> str:
         names = ", ".join(k for k in (gv._parse(n.inputs) if isinstance(gv._parse(n.inputs), dict) else {}))
-        return {"input": names or "declare the inputs", "tool": n.tool or "choose a tool",
+        opts = gv._parse(n.settings) if isinstance(gv._parse(n.settings), dict) else {}
+        to = str(opts.get("to") or "").strip()
+        to = to if to.rstrip("/:") not in ("", "dest") else "choose a folder"
+        fmts = opts.get("formats")
+        fmts = ", ".join(fmts) if isinstance(fmts, list) else (fmts or "")
+        return {"report": (opts.get("report") or "inline report") + (f" · {fmts}" if fmts else ""),
+                "copy": f"→ {to}", "move": f"→ {to} (removes sources)",
+                "file": str(opts.get("op") or "choose an operation") + " " + str(opts.get("to") or opts.get("path") or ""),
+                "input": names or "declare the inputs", "tool": n.tool or "choose a tool",
                 "agent": n.agent or "choose an agent", "condition": n.when or "enter a condition",
                 "llm": (n.model or "choose a model") + (" · JSON" if n.format == "json" else ""),
                 "load": n.load or "choose a load",
-                "foreach": f"each of {n.items or '…'}: " + (n.target() or f"choose a {n.target_kind}"),
+                "foreach": f"each of {n.items or '…'}: " + (n.target() or (n.do if not n.target_kind
+                                                                             else f"choose a {n.target_kind}")),
                 "switch": ("on " + n.when) if n.when else "enter the value to switch on",
                 "set": (n.value or "enter a value"), "output": (n.value or "the last step's result")}[n.type]
 
@@ -325,6 +338,8 @@ class WorkflowCanvas:
                                color=ft.Colors.ON_SURFACE_VARIANT)]
         elif n.type == "foreach":
             fields += self._foreach_fields(n, bind)
+        elif n.type in gv.SETTINGS_TYPES:
+            fields += self._settings_fields(n, bind)
         elif n.type == "switch":
             fields += [bind("when", text_field("Value to switch on", n.when, multiline=True, min_lines=2,
                                                hint="e.g. ${steps.classify.output}")),
@@ -379,7 +394,38 @@ class WorkflowCanvas:
                 bind("format", dropdown("Reply as", {"text": "Plain text", "json": "JSON (parsed for later steps)"},
                                         n.format or "text"))]
 
+    _SETTINGS_HELP = {
+        "report": "report: <name> runs a saved report (formats: [pdf, xlsx] overrides its formats; "
+                  "data: ${steps.q.output.rows} uses rows from an earlier step). Needs the scope reports:run. "
+                  "Later steps use ${steps.<id>.output.outputs}.",
+        "copy": "files: what to copy (a report step's ${steps.<id>.output.outputs}, paths or root:addresses). "
+                "to: a folder, e.g. dest:finance/${run.date.year}-${run.date.month}. "
+                "overwrite: never | always | rename | if_newer. manifest: true writes manifest.json. "
+                "Needs the scope fs:dest:<name> (or fs:<root>:write).",
+        "move": "Like Copy, but each source file is removed after its copy is written and verified. "
+                "The source folder must be writable and the workflow needs fs:<root>:write for it.",
+        "file": "op: write (to, content) | read (path) | list (path, glob, recursive) | mkdir (to) | "
+                "delete (files; goes to the trash folder) | zip (files, to: reports:archive/x.zip).",
+    }
+
+    def _settings_fields(self, n: gv.Node, bind) -> list[ft.Control]:
+        out: list[ft.Control] = []
+        if n.type == "report":
+            out.append(bind("input", text_field("Report params (YAML)", n.input, multiline=True, min_lines=2,
+                                                hint="e.g. dept: ${input.dept}")))
+        out += [bind("settings", text_field("Settings (YAML)", n.settings, multiline=True, min_lines=4)),
+                ft.Text(self._SETTINGS_HELP[n.type], size=12, color=ft.Colors.ON_SURFACE_VARIANT)]
+        if n.type == "move":
+            out.append(ft.Text("Source files are removed after a verified copy.", size=12,
+                               color=ft.Colors.DEEP_ORANGE_800))
+        return out
+
     def _foreach_fields(self, n: gv.Node, bind) -> list[ft.Control]:
+        if n.do not in gv.DO_KINDS:          # report / copy / move per item: edit as YAML
+            return [bind("items", text_field("List to loop over", n.items, multiline=True, min_lines=2)),
+                    bind("settings", text_field(f"Settings for each item ({n.do}, YAML)", n.settings,
+                                                multiline=True, min_lines=4,
+                                                hint="use ${item} and ${index}"))]
         def kind_changed(e):
             n.do = e.control.value or "tool"
             self.rebuild()

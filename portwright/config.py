@@ -532,6 +532,49 @@ class ReportSpec(BaseModel):
         return self
 
 
+# --------------------------------------------------------------------------- #
+# Filesystem roots and destinations (workflow copy/move/file steps, fs tools)
+# --------------------------------------------------------------------------- #
+_ROOT_NAME = r"^[a-zA-Z][a-zA-Z0-9_\-]{1,63}$"     # 2+ characters, so 'C:\x' is never read as a root address
+OverwritePolicy = Literal["never", "always", "rename", "if_newer"]
+
+
+class FsRoot(BaseModel):
+    """A named folder steps and tools may use. Relative paths are inside the project; absolute / UNC paths
+    must also be listed in security.allowed_folders."""
+    path: str
+    mode: Literal["read", "write", "read_write"] = "read"
+    patterns: list[str] = Field(default_factory=list)     # file-name globs allowed here (empty: any)
+    delete: Literal["none", "trash", "hard"] = "trash"    # what 'delete' does on a writable root
+
+
+class DestinationSpec(BaseModel):
+    """A write-only place outputs are delivered to (``dest:<name>/sub/folder``). Reached as the account
+    running portwright - there are no destination credentials."""
+    path: str
+    overwrite: OverwritePolicy = "never"                  # default policy for copy / move steps
+    description: str = ""
+
+
+class FilesystemSettings(BaseModel):
+    roots: dict[str, FsRoot] = Field(default_factory=dict)
+    max_file_mb: int = Field(50, ge=1, le=10_240)
+    trash: str = ".portwright/trash"                      # deleted files go here (inside the project)
+
+
+def is_absolute_path(p: str) -> bool:
+    from pathlib import PureWindowsPath
+    return PureWindowsPath(p).is_absolute() or p.startswith(("/", "\\\\")) or bool(PureWindowsPath(p).drive)
+
+
+def path_allowed(p: str, allowed: list[str]) -> bool:
+    """Is absolute path *p* one of / inside one of the *allowed* folders (case-insensitive, either slash)?"""
+    def norm(x: str) -> str:
+        return str(x).replace("\\", "/").rstrip("/").lower()
+    n = norm(p)
+    return any(n == a or n.startswith(a + "/") for a in (norm(x) for x in allowed))
+
+
 class ProjectConfig(BaseModel):
     project: str = "portwright-project"
     version: str = "1.0.0"
@@ -548,6 +591,8 @@ class ProjectConfig(BaseModel):
     agents: dict[str, AgentSpec] = Field(default_factory=dict)
     workflows: dict[str, WorkflowSpec] = Field(default_factory=dict)
     mcp_servers: dict[str, McpServerSpec] = Field(default_factory=dict)
+    filesystem: FilesystemSettings = Field(default_factory=FilesystemSettings)
+    destinations: dict[str, DestinationSpec] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _integrity(self) -> "ProjectConfig":
@@ -606,8 +651,42 @@ class ProjectConfig(BaseModel):
             if rpt.from_.query is not None and self.sources[rpt.from_.source].type != "sql":
                 raise ValueError(f"report '{rpt.name}': 'from.query' needs a SQL source, "
                                  f"'{rpt.from_.source}' is {self.sources[rpt.from_.source].type}")
+        self._check_filesystem()
         self._check_agents()
         return self
+
+    def _check_address(self, wf: str, step: str, addr: str | None) -> None:
+        """A literal 'root:...' / 'dest:name/...' in a step must name a defined root or destination."""
+        if not addr or "${" in addr.split(":", 1)[0]:          # the root itself is chosen at run time
+            return
+        m = re.match(r"^([A-Za-z][A-Za-z0-9_\-]+):(.*)$", addr)
+        if not m:
+            return
+        name, rest = m.groups()
+        implicit = {"reports", "templates", "data"}
+        if name == "dest":
+            dname = re.split(r"[\\/]", rest.lstrip("/\\"), maxsplit=1)[0]
+            if "${" not in dname and dname not in self.destinations:
+                raise ValueError(f"workflow '{wf}' step '{step}': unknown destination '{dname}'")
+        elif name not in self.filesystem.roots and name not in implicit:
+            raise ValueError(f"workflow '{wf}' step '{step}': unknown filesystem root '{name}'")
+
+    def _check_filesystem(self) -> None:
+        places = [(f"filesystem root '{n}'", n, r.path) for n, r in self.filesystem.roots.items()]
+        places += [(f"destination '{n}'", n, d.path) for n, d in self.destinations.items()]
+        for what, name, path in places:
+            if not re.match(_ROOT_NAME, name):
+                raise ValueError(f"{what}: names are 2-64 letters, digits, - and _, starting with a letter")
+            if not path.strip():
+                raise ValueError(f"{what} has no path")
+            if is_absolute_path(path):
+                if not path_allowed(path, self.security.allowed_folders):
+                    raise ValueError(f"{what}: '{path}' is outside the project; add it to "
+                                     "security.allowed_folders first")
+            elif ".." in re.split(r"[\\/]", path):
+                raise ValueError(f"{what}: '..' is not allowed in '{path}'")
+        if "dest" in self.filesystem.roots:
+            raise ValueError("filesystem root name 'dest' is reserved for destinations (dest:<name>/...)")
 
     def _check_agents(self) -> None:
         """References between tools, skills, agents, workflows and MCP servers.
@@ -646,6 +725,11 @@ class ProjectConfig(BaseModel):
                     raise ValueError(f"workflow '{n}' step '{st.id}': unknown agent '{st.agent}'")
                 if st.type == "load" and st.load not in {x.name for x in self.loads}:
                     raise ValueError(f"workflow '{n}' step '{st.id}': unknown load '{st.load}'")
+                kind = st.do if st.type == "foreach" else st.type
+                if kind == "report" and st.report and self.report(st.report) is None:
+                    raise ValueError(f"workflow '{n}' step '{st.id}': unknown report '{st.report}'")
+                for addr in (st.to, st.path) if st.type in ("copy", "move", "file", "foreach") else ():
+                    self._check_address(n, st.id, addr)
                 if st.type == "foreach":
                     if st.do == "tool" and st.tool not in self.tools:
                         raise ValueError(f"workflow '{n}' step '{st.id}': unknown tool '{st.tool}'")

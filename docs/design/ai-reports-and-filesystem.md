@@ -1,6 +1,6 @@
 # Design: AI-authored reports, report/file workflow nodes, filesystem tools
 
-Status: **phase 1 implemented**, phases 2–5 proposed · Target: portwright 0.9 · Branch: `design/ai-reports-fs-nodes`
+Status: **phases 1–2 implemented**, phases 3–5 proposed · Target: portwright 0.9 · Branch: `design/ai-reports-fs-nodes`
 
 ## 1. Goals
 
@@ -306,7 +306,7 @@ implementation (`Sandbox.transfer(mode=...)`).
   verify: sha256                      # re-hash at destination
   manifest: true                      # writes manifest.json beside the files
 ```
-Output: `[{src, dest, bytes, sha256, action: copied|moved|skipped|renamed}]`.
+Output: `[{src, dest, address, bytes, sha256, action: copied|moved|skipped, renamed, replaced}]`.
 
 - Writes are atomic: write `name.partial`, fsync, then rename. A crash never leaves a half-written
   PDF on the share.
@@ -330,7 +330,8 @@ Output: `[{src, dest, bytes, sha256, action: copied|moved|skipped|renamed}]`.
 - `zip` bundles `files` into one archive at `to`.
 - `write` takes `content:` (text/JSON). This lets an LLM step's output be saved as a file.
 - `delete` moves files to trash (§7.1).
-- **New scope variables**: `${run.id}`, `${run.date}` (`year month day iso`), and `${run.started_at}`. Today
+- **New scope variables**: `${run.id}`, `${run.date}` (`year month day iso`, local time, zero padded),
+  `${run.time}`, and `${run.started_at}` (UTC). Today
   only the report output path supports dates (Jinja), so workflows have no date tokens.
 
 ### 6.5 Example: query → design once → render → publish
@@ -478,7 +479,7 @@ mcp_servers:
 | Phase | Scope | Main files | Tests |
 |---|---|---|---|
 | 1 ✅ | Renderer registry, `formats`, `data=`, pagination, `from.query`, sandboxed env, URL fetcher, bug fixes (incl. file-source reports, which called a missing `FileSource.read_all`) | `reports/renderers.py`, `reports/service.py`, `reports/engine.py`, `config.py` | `test_reports.py` (each format, multi-format, pagination, sandbox escape attempts) |
-| 2 | `fs/sandbox.py`, `filesystem`/`destinations` config, `copy`/`move`/`file` steps, `${run.*}` scope, `report` step | `fs/`, `agents/spec.py`, `agents/workflow.py`, `config.py` | `test_fs_sandbox.py` (traversal, ADS, junction, UNC), move = verified copy then delete (incl. cross-volume, delete failure), `test_workflow_graph.py` additions |
+| 2 ✅ | `fs/sandbox.py`, `filesystem`/`destinations` config, `copy`/`move`/`file` steps, `${run.*}` scope, `report` step | `fs/`, `agents/spec.py`, `agents/workflow.py`, `config.py` | `test_fs_sandbox.py` (traversal, ADS, junction, UNC), move = verified copy then delete (incl. cross-volume, delete failure), `test_workflow_files.py` (report → copy pipeline, scopes, foreach, canvas round trip). Also done early: Report / Copy / Move / Files canvas nodes with a YAML *Settings* field, and the canvas keeps any step keys it has no field for, so saving never drops them |
 | 3 | `ReportAuthor`, `report_design` step, `.portwright/templates/` storage, `pw report design/ask/promote`, `report_author` agent template, `pw validate` warning, AI data access policy (§5.5) | `reports/author.py`, `reports/policy.py`, `reports/prompts/author.md`, `config.py`, `agents/spec.py`, `cli.py`, `agents/templates.py` | fake `provider_factory`: valid reply, invalid → repair, repairs exhausted; author cannot write `templates/`; promote; policy: most restrictive level wins, excluded columns never in payload, override cannot raise above ceiling |
 | 4 | fs/report tool types, MCP expose + blob results + resources | `agents/tools.py`, `mcp/__init__.py` | scope enforcement per tool, `describe_server` output |
 | 5 | Studio: Report / Design / Copy / Move / Files nodes, destination picker, Design-with-AI dialog, gallery badges + promote, docs 16/17/18 | `studio/graph_vm.py`, `studio/views/*`, `docs/*.md` | `test_studio_*` viewmodel tests |

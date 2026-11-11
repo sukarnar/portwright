@@ -13,9 +13,22 @@ import yaml
 
 NODE_W, NODE_H = 200, 78
 GAP_X, GAP_Y = 80, 50
-TYPES = ("input", "tool", "agent", "llm", "load", "foreach", "condition", "switch", "set", "output")
+TYPES = ("input", "tool", "agent", "llm", "load", "report", "copy", "move", "file", "foreach", "condition", "switch",
+         "set", "output")
 OUT_PORTS = {"input": ("next",), "tool": ("next",), "agent": ("next",), "llm": ("next",), "load": ("next",),
+             "report": ("next",), "copy": ("next",), "move": ("next",), "file": ("next",),
              "foreach": ("next",), "set": ("next",), "condition": ("then", "else"), "output": ()}
+SETTINGS_TYPES = ("report", "copy", "move", "file")   # configured through the node's Settings (YAML)
+# step keys the node fields handle; anything else is kept in Node.settings, so saving never drops it
+KNOWN_KEYS = {"id", "type", "x", "y", "tool", "agent", "input", "when", "then", "else", "else_", "next", "value",
+              "inputs", "model", "system", "format", "load", "items", "do", "max_items", "cases", "default",
+              "on_error"}
+DEFAULT_SETTINGS = {
+    "report": "report: \nformats: [pdf]",
+    "copy": "files: ${steps.report_1.output.outputs}\nto: dest:\noverwrite: never\nmanifest: false",
+    "move": "files: ${steps.report_1.output.outputs}\nto: dest:\noverwrite: never",
+    "file": "op: write\nto: reports:notes.txt\ncontent: ${steps.llm_1.output}",
+}
 MAX_CASES = 5
 DO_KINDS = ("tool", "agent", "llm", "load")        # what a foreach node runs for each item
 
@@ -51,6 +64,7 @@ class Node:
     max_items: str = "50"      # foreach
     cases: str = ""            # switch: one value per line
     on_error: str = "fail"
+    settings: str = ""         # YAML of the other step keys (report / copy / move / file options, ...)
 
     @property
     def ports(self) -> tuple[str, ...]:
@@ -119,7 +133,8 @@ def from_steps(steps: list[dict]) -> Graph:
                  value=_text(st.get("value")), inputs=_text(st.get("inputs")), model=st.get("model") or "",
                  system=st.get("system") or "", format=st.get("format") or "text", load=st.get("load") or "",
                  items=_text(st.get("items")), do=st.get("do") or "tool", max_items=str(st.get("max_items") or 50),
-                 cases="\n".join(str(k) for k in (st.get("cases") or {})), on_error=st.get("on_error", "fail"))
+                 cases="\n".join(str(k) for k in (st.get("cases") or {})), on_error=st.get("on_error", "fail"),
+                 settings=_text({k: v for k, v in st.items() if k not in KNOWN_KEYS} or None))
         laid_out = laid_out and st.get("x") is not None and st.get("y") is not None
         g.nodes.append(n)
     ids = [n.id for n in g.nodes]
@@ -170,7 +185,8 @@ def to_steps(g: Graph) -> list[dict]:
         elif n.type == "foreach":
             s["items"] = _parse(n.items) if _parse(n.items) is not None else ""
             s["do"] = n.do
-            s[n.target_kind] = n.target()
+            if n.target_kind:
+                s[n.target_kind] = n.target()
             if (n.input or "").strip():
                 s["input"] = _parse(n.input)
             if n.do == "llm":
@@ -188,8 +204,16 @@ def to_steps(g: Graph) -> list[dict]:
                 s["value"] = _parse(n.value)
         elif n.type == "set":
             s["value"] = _parse(n.value) if _parse(n.value) is not None else ""
+        elif n.type in SETTINGS_TYPES:
+            if n.type == "report" and _parse(n.input) is not None:
+                s["input"] = _parse(n.input)
         else:                                            # condition, switch
             s["when"] = n.when
+        extra = _parse(n.settings)
+        if isinstance(extra, dict):
+            for k, v in extra.items():
+                if k not in KNOWN_KEYS:
+                    s.setdefault(k, v)
         if n.type == "switch":
             s["cases"] = {v: g.links.get((n.id, f"case:{v}"), "end") for v in case_values(n.cases)}
             s["default"] = g.links.get((n.id, "default"), "end")
@@ -230,6 +254,7 @@ def add_node(g: Graph, kind: str, x: float = 40, y: float = 40) -> Node:
     n = Node(new_id(g, kind), kind, x, y, on_error="fail")
     if kind == "switch":
         n.cases = "yes\nno"
+    n.settings = DEFAULT_SETTINGS.get(kind, "")
     g.nodes.append(n)
     return n
 
@@ -371,6 +396,20 @@ def problems(g: Graph, tools: list[str], agents: list[str], models: list[str] | 
                 out.append(f"{n.id}: max items must be a whole number")
         if n.type == "input" and (n.inputs or "").strip() and not isinstance(_parse(n.inputs), dict):
             out.append(f"{n.id}: inputs must be a mapping of name: default")
+        if (n.settings or "").strip() and not isinstance(_parse(n.settings), dict):
+            out.append(f"{n.id}: settings must be a YAML mapping of option: value")
+        if n.type in SETTINGS_TYPES:
+            opts = _parse(n.settings) if isinstance(_parse(n.settings), dict) else {}
+            if n.type == "report" and not (opts.get("report") or opts.get("formats")):
+                out.append(f"{n.id}: name the report to run (report: <name>)")
+            if n.type in ("copy", "move"):
+                if not opts.get("files"):
+                    out.append(f"{n.id}: say which files to {n.type} (files: ${{steps.<report>.output.outputs}})")
+                to = str(opts.get("to") or "").strip()
+                if to.rstrip("/:") in ("dest", ""):
+                    out.append(f"{n.id}: choose the folder to {n.type} to (to: dest:<name>/sub/folder)")
+            if n.type == "file" and not opts.get("op"):
+                out.append(f"{n.id}: choose the file operation (op: write, read, list, mkdir, delete or zip)")
         if n.id not in ok:
             out.append(f"{n.id}: never reached from the start ({g.start})")
     return out

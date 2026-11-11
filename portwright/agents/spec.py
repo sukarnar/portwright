@@ -72,7 +72,10 @@ class AgentSpec(BaseModel):
     scopes: list[str] = Field(default_factory=list)      # scopes of the principal used for tool calls
 
 
-StepType = Literal["input", "tool", "agent", "llm", "load", "foreach", "condition", "switch", "set", "output"]
+StepType = Literal["input", "tool", "agent", "llm", "load", "foreach", "condition", "switch", "set", "output",
+                   "report", "copy", "move", "file"]
+FileOp = Literal["write", "read", "list", "mkdir", "delete", "zip"]
+Overwrite = Literal["never", "always", "rename", "if_newer"]
 
 
 class WorkflowStep(BaseModel):
@@ -94,11 +97,30 @@ class WorkflowStep(BaseModel):
     format: Literal["text", "json"] = "text"   # llm: 'json' asks for a JSON reply and parses it for later steps
     load: str | None = None              # load: the data load to run (needs scope load:run)
     items: Any = None                    # foreach: the list to loop over, e.g. ${steps.q.output.rows}
-    do: Literal["tool", "agent", "llm", "load"] | None = None   # foreach: what to run for each item
+    do: Literal["tool", "agent", "llm", "load", "report", "copy", "move"] | None = None   # foreach: per item
     max_items: int = Field(50, ge=1, le=1000)   # foreach: refuse longer lists instead of running them all
     cases: dict[str, str] | None = None  # switch: value -> step id (or 'end'); 'when' is the value switched on
     default: str | None = None           # switch: step id when no case matches (default: the following step)
     on_error: Literal["fail", "continue"] = "fail"
+    # report: a registered report (input = its params) or an inline one (template / formats / data)
+    report: str | None = None
+    template: str | None = None          # report: inline template (pdf/html)
+    data: Any = None                     # report: rows to use instead of the report's own source
+    formats: list[str] | None = None     # report: override the formats
+    vars: dict[str, Any] | None = None   # report: extra template variables
+    output_path: str | None = None       # report: output path stem
+    # copy / move / file
+    files: Any = None                    # copy / move / zip / delete: paths, addresses or report outputs
+    to: str | None = None                # copy / move: target folder; file write / mkdir / zip: target
+    path: str | None = None              # file read / list: what to read
+    op: FileOp | None = None             # file: the operation
+    content: Any = None                  # file write: text or a value written as JSON
+    overwrite: Overwrite | None = None   # default: the destination's policy, else 'never'
+    create_dirs: bool = True
+    verify: Literal["none", "size", "sha256"] = "sha256"
+    manifest: bool = False               # copy / move: write manifest.json beside the files
+    glob: str | None = None              # file list
+    recursive: bool = False              # file list
 
     model_config = {"populate_by_name": True}
 
@@ -116,12 +138,30 @@ class WorkflowStep(BaseModel):
             raise ValueError(f"step '{self.id}': type load needs 'load'")
         if self.type == "switch" and not self.when:
             raise ValueError(f"step '{self.id}': type switch needs 'when' (the value to switch on)")
+        kind = self.do if self.type == "foreach" else self.type
+        if kind == "report" and not (self.report or self.formats):
+            raise ValueError(f"step '{self.id}': a report step needs 'report' (a report name), or 'formats' "
+                             "and 'data' for an inline report")
+        if kind == "report" and not self.report and self.data is None:
+            raise ValueError(f"step '{self.id}': an inline report step needs 'data'")
+        if kind in ("copy", "move") and (self.files in (None, "", []) or not self.to):
+            raise ValueError(f"step '{self.id}': type {kind} needs 'files' and 'to' (a folder)")
+        if self.type == "file":
+            need = {"write": ("to",), "read": ("path",), "list": ("path",), "mkdir": ("to",),
+                    "delete": ("files",), "zip": ("files", "to")}
+            if not self.op:
+                raise ValueError(f"step '{self.id}': type file needs 'op' ({', '.join(need)})")
+            missing = [f for f in need[self.op] if getattr(self, f) in (None, "", [])]
+            if missing:
+                raise ValueError(f"step '{self.id}': file op '{self.op}' needs {' and '.join(missing)}")
         if self.type == "foreach":
             if self.items is None or self.items == "":
                 raise ValueError(f"step '{self.id}': type foreach needs 'items'")
-            target = {"tool": self.tool, "agent": self.agent, "llm": self.model, "load": self.load}.get(self.do or "")
+            target = {"tool": self.tool, "agent": self.agent, "llm": self.model, "load": self.load,
+                      "report": self.report or self.formats, "copy": self.to, "move": self.to}.get(self.do or "")
             if not target:
-                raise ValueError(f"step '{self.id}': foreach needs 'do' (tool, agent, llm or load) and its name")
+                raise ValueError(f"step '{self.id}': foreach needs 'do' (tool, agent, llm, load, report, copy or "
+                                 "move) and what it runs")
         return self
 
 
