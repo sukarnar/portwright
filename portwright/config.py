@@ -304,6 +304,7 @@ class SecuritySettings(BaseModel):
     allowed_callable_modules: list[str] = Field(default_factory=list)
     allowed_upstream_hosts: list[str] = Field(default_factory=list)
     allowed_llm_hosts: list[str] = Field(default_factory=list)   # hosts LLM models may call
+    allowed_mail_hosts: list[str] = Field(default_factory=list)  # SMTP servers email steps may use
     data_root: str = "data"               # file sources are sandboxed here
     allowed_folders: list[str] = Field(default_factory=list)   # absolute / UNC folders a folder source may use
     cors_origins: list[str] = Field(default_factory=list)
@@ -650,6 +651,52 @@ class DestinationSpec(BaseModel):
     description: str = ""
 
 
+_EMAIL = re.compile(r"^[^@\s<>,;\"]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+
+class MailServerSpec(BaseModel):
+    """An SMTP server email steps send through. The host must be in security.allowed_mail_hosts; the login
+    (a 'basic' credential: username + password) comes from the vault. Mail only goes to addresses that
+    match ``allowed_recipients`` (globs such as ``*@corp.local``); empty means the From address's domain."""
+    host: str = Field(min_length=1)
+    port: int | None = Field(None, ge=1, le=65535)        # default: 587 starttls, 465 ssl, 25 none
+    security: Literal["starttls", "ssl", "none"] = "starttls"
+    credential: str | None = None                         # omit for an internal relay without login
+    from_: str = Field(alias="from")
+    reply_to: str | None = None
+    allowed_recipients: list[str] = Field(default_factory=list)
+    ca_bundle: str | None = None                          # PEM file for a corporate CA (relative to the project)
+    max_attachments_mb: int = Field(20, ge=1, le=150)     # all attachments of one message together
+    max_recipients: int = Field(50, ge=1, le=500)
+    timeout_seconds: float = Field(30, gt=0, le=300)
+    description: str = ""
+
+    model_config = {"populate_by_name": True}
+
+    @field_validator("from_", "reply_to")
+    @classmethod
+    def _address(cls, v: str | None) -> str | None:
+        if v is not None and not _EMAIL.match(v.strip()):
+            raise ValueError(f"'{v}' is not an email address")
+        return v.strip() if v else v
+
+    @model_validator(mode="after")
+    def _safe(self) -> "MailServerSpec":
+        if self.credential and self.security == "none":
+            raise ValueError("a mail server with a login needs security: starttls or ssl (none would send the "
+                             "password unencrypted)")
+        for p in self.allowed_recipients:
+            if "@" not in p:
+                raise ValueError(f"allowed_recipients: '{p}' is not an address or pattern like *@corp.local")
+        return self
+
+    def effective_port(self) -> int:
+        return self.port or {"starttls": 587, "ssl": 465, "none": 25}[self.security]
+
+    def recipient_patterns(self) -> list[str]:
+        return [p.lower() for p in self.allowed_recipients] or ["*@" + self.from_.split("@", 1)[1].lower()]
+
+
 class FilesystemSettings(BaseModel):
     roots: dict[str, FsRoot] = Field(default_factory=dict)
     max_file_mb: int = Field(50, ge=1, le=10_240)
@@ -702,6 +749,7 @@ class ProjectConfig(BaseModel):
     mcp_servers: dict[str, McpServerSpec] = Field(default_factory=dict)
     filesystem: FilesystemSettings = Field(default_factory=FilesystemSettings)
     destinations: dict[str, DestinationSpec] = Field(default_factory=dict)
+    mail_servers: dict[str, MailServerSpec] = Field(default_factory=dict)
     report_ai: ReportAiSettings = Field(default_factory=ReportAiSettings)
 
     @model_validator(mode="after")
@@ -868,7 +916,12 @@ class ProjectConfig(BaseModel):
                     raise ValueError(f"workflow '{n}' step '{st.id}': report '{st.report}' does not exist yet; "
                                      "add 'from' (an endpoint or source) so the step can create it")
                 for addr in (st.to, st.path) if st.type in ("copy", "move", "file", "foreach") else ():
-                    self._check_address(n, st.id, addr)
+                    if not isinstance(addr, list):
+                        self._check_address(n, st.id, addr)
+                if kind == "email" and st.server not in self.mail_servers:
+                    raise ValueError(f"workflow '{n}' step '{st.id}': unknown mail server '{st.server}'"
+                                     + (f"; defined: {', '.join(sorted(self.mail_servers))}" if self.mail_servers
+                                        else " (add one with 'portwright mail add')"))
                 if st.type == "foreach":
                     if st.do == "tool" and st.tool not in self.tools:
                         raise ValueError(f"workflow '{n}' step '{st.id}': unknown tool '{st.tool}'")

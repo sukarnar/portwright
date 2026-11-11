@@ -198,6 +198,7 @@ class _Env:
     save: bool = True
     scopes: list[str] = field(default_factory=list)
     actor: str = "workflow"
+    smtp_factory: Any = None                  # tests: a fake SMTP connection
     _sandbox: Any = None
     _reports: Any = None
 
@@ -305,6 +306,33 @@ async def _transfer(kind: str, st, scope: dict, env: "_Env") -> list:
         raise ToolError(str(exc)) from None
 
 
+async def _email(st, scope: dict, env: "_Env") -> dict:
+    """Send a message with the step's files attached. Needs mail:<server>, plus read scopes for the files."""
+    from ..mail import Attachment, Mailer, MailError
+    r = lambda v: resolve(v, scope) if v is not None else None     # noqa: E731
+    mailer = Mailer(env.config, env.root, env.credentials, actor=env.actor, scopes=env.scopes,
+                    smtp_factory=env.smtp_factory)
+    try:
+        spec = mailer.server(str(st.server))
+        atts = []
+        if st.files not in (None, "", []):
+            read = await asyncio.to_thread(env.sandbox().read_files, r(st.files),
+                                           spec.max_attachments_mb * 1024 * 1024)
+            atts = [Attachment(pl.path.name, data, pl.address) for pl, data in read]
+        res = await asyncio.to_thread(mailer.send, str(st.server), to=r(st.to), cc=r(st.cc), bcc=r(st.bcc),
+                                      subject=str(r(st.subject) or ""), body=_text(r(st.body)), html=st.html,
+                                      attachments=atts)
+    except (MailError, *_fs_errors()) as exc:
+        raise ToolError(str(exc)) from None
+    return res.to_dict()
+
+
+def _text(v: Any) -> str:
+    if v is None:
+        return ""
+    return v if isinstance(v, str) else json.dumps(v, indent=2, default=str)
+
+
 async def _file(st, scope: dict, env: "_Env") -> Any:
     sb = env.sandbox()
     r = lambda v: resolve(v, scope) if v is not None else None     # noqa: E731
@@ -355,6 +383,8 @@ async def _do(kind: str, st, raw_input: Any, scope: dict, env: _Env) -> tuple[An
         return await _report(st, raw_input, scope, env), "", 0
     if kind in ("copy", "move"):
         return await _transfer(kind, st, scope, env), "", 0
+    if kind == "email":
+        return await _email(st, scope, env), "", 0
     if kind == "tool":
         args = resolve(raw_input, scope) if raw_input is not None else {}
         if not isinstance(args, dict):
@@ -389,7 +419,7 @@ def _needs_runtime(steps) -> tuple[list[str], bool]:
 
 async def run_workflow(config: ProjectConfig, root: str | Path, credentials, name: str, input: Any = None, *,
                        provider_factory: ProviderFactory | None = None, transport_factory=None,
-                       save: bool = True) -> WorkflowResult:
+                       save: bool = True, smtp_factory=None) -> WorkflowResult:
     wf = config.workflows.get(name)
     if wf is None:
         raise ConfigError(f"no workflow '{name}'")
@@ -401,7 +431,7 @@ async def run_workflow(config: ProjectConfig, root: str | Path, credentials, nam
     final, has_final = None, False
     order = [s.id for s in wf.steps]
     env = _Env(config, root, credentials, provider_factory=provider_factory, transport_factory=transport_factory,
-               save=save, scopes=list(wf.scopes), actor=f"workflow:{name}")
+               save=save, scopes=list(wf.scopes), actor=f"workflow:{name}", smtp_factory=smtp_factory)
 
     tool_names, needs_load = _needs_runtime(wf.steps)
     rt = None
@@ -419,7 +449,7 @@ async def run_workflow(config: ProjectConfig, root: str | Path, credentials, nam
             t0, jump = time.monotonic(), None
             res = StepResult(st.id, st.type, True)
             try:
-                if st.type in ("tool", "agent", "llm", "load", "report", "copy", "move"):
+                if st.type in ("tool", "agent", "llm", "load", "report", "copy", "move", "email"):
                     res.output, res.run_id, res.tokens = await _do(st.type, st, st.input, scope, env)
                 elif st.type == "file":
                     res.output = await _file(st, scope, env)

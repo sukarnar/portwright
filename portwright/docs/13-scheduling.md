@@ -75,6 +75,17 @@ call C:\apps\portwright\.venv\Scripts\portwright.exe report run monthly_sales -f
 exit /b %ERRORLEVEL%
 ```
 
+Run a report and email it from a scheduler, without a workflow (`portwright mail send` exits 0 when sent,
+1 on any error, such as a recipient the mail server doesn't allow):
+
+```powershell
+& C:\apps\portwright\.venv\Scripts\portwright.exe report run monthly_sales -f pdf
+if ($LASTEXITCODE -eq 1) { exit 1 }
+& C:\apps\portwright\.venv\Scripts\portwright.exe mail send corp --to finance@corp.local `
+  -s "Monthly sales $(Get-Date -Format yyyy-MM)" -b @mail\monthly.txt -a reports:monthly_sales.pdf
+exit $LASTEXITCODE
+```
+
 Wait in a batch file: `timeout /t 30 /nobreak > NUL`. Hide output: add `> NUL 2>&1` (or `-q` for `call`).
 
 Trigger a load over HTTP (needs a key with scope `load:run`):

@@ -13,12 +13,13 @@ import yaml
 
 NODE_W, NODE_H = 200, 78
 GAP_X, GAP_Y = 80, 50
-TYPES = ("input", "tool", "agent", "llm", "load", "report_design", "report", "copy", "move", "file", "foreach",
-         "condition", "switch", "set", "output")
+TYPES = ("input", "tool", "agent", "llm", "load", "report_design", "report", "copy", "move", "file", "email",
+         "foreach", "condition", "switch", "set", "output")
 OUT_PORTS = {"input": ("next",), "tool": ("next",), "agent": ("next",), "llm": ("next",), "load": ("next",),
              "report_design": ("next",), "report": ("next",), "copy": ("next",), "move": ("next",),
-             "file": ("next",), "foreach": ("next",), "set": ("next",), "condition": ("then", "else"), "output": ()}
-SETTINGS_TYPES = ("report_design", "report", "copy", "move", "file")   # configured through Settings (YAML)
+             "file": ("next",), "email": ("next",), "foreach": ("next",), "set": ("next",),
+             "condition": ("then", "else"), "output": ()}
+SETTINGS_TYPES = ("report_design", "report", "copy", "move", "file", "email")   # configured through Settings (YAML)
 # step keys the node fields handle; anything else is kept in Node.settings, so saving never drops it
 KNOWN_KEYS = {"id", "type", "x", "y", "tool", "agent", "input", "when", "then", "else", "else_", "next", "value",
               "inputs", "model", "system", "format", "load", "items", "do", "max_items", "cases", "default",
@@ -29,6 +30,8 @@ DEFAULT_SETTINGS = {
     "copy": "files: ${steps.report_1.output.outputs}\nto: dest:\noverwrite: never\nmanifest: false",
     "move": "files: ${steps.report_1.output.outputs}\nto: dest:\noverwrite: never",
     "file": "op: write\nto: reports:notes.txt\ncontent: ${steps.llm_1.output}",
+    "email": "server: \nto: []\nsubject: Report ${run.date.iso}\nbody: The report is attached.\n"
+             "files: ${steps.report_1.output.outputs}",
 }
 MAX_CASES = 5
 DO_KINDS = ("tool", "agent", "llm", "load")        # what a foreach node runs for each item
@@ -440,6 +443,13 @@ def problems(g: Graph, tools: list[str], agents: list[str], models: list[str] | 
                     out.append(f"{n.id}: choose the folder to {n.type} to (to: dest:<name>/sub/folder)")
             if n.type == "file" and not opts.get("op"):
                 out.append(f"{n.id}: choose the file operation (op: write, read, list, mkdir, delete or zip)")
+            if n.type == "email":
+                if not str(opts.get("server") or "").strip():
+                    out.append(f"{n.id}: choose the mail server")
+                if opts.get("to") in (None, "", []):
+                    out.append(f"{n.id}: say who gets the message (to: [name@corp.local])")
+                if not str(opts.get("subject") or "").strip():
+                    out.append(f"{n.id}: give the message a subject")
         if n.id not in ok:
             out.append(f"{n.id}: never reached from the start ({g.start})")
     return out

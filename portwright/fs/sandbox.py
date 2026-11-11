@@ -367,6 +367,21 @@ class Sandbox:
         self._record("read", path=pl.address, bytes=size, blob=True)
         return pl, data
 
+    def read_files(self, files: Any, max_total: int) -> list[tuple[Place, bytes]]:
+        """Read several files (paths, addresses, report outputs) for one use, e.g. email attachments.
+        Each needs read access; together they may not exceed *max_total* bytes."""
+        items = _as_list(files)
+        places = [self._readable_file(i) for i in items]
+        total = sum(pl.path.stat().st_size for pl in places)
+        if total > max_total:
+            raise FsError(f"the files are {total:,} bytes together; the limit here is {max_total:,}")
+        out = []
+        for pl in places:
+            data = pl.path.read_bytes()
+            self._record("read", path=pl.address, bytes=len(data), blob=True)
+            out.append((pl, data))
+        return out
+
     @staticmethod
     def _addr(pl: Place, p: Path) -> str:
         return Place(pl.kind, pl.name, pl.base, p, pl.readable, pl.writable).address
