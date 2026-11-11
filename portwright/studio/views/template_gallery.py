@@ -6,7 +6,8 @@ from pathlib import Path
 
 import flet as ft
 
-from ..common import Ctx, empty, header, icon_btn, text_field
+from .. import report_vm as rvm
+from ..common import Ctx, empty, header, icon_btn, tag, text_field
 
 # ------------------------------------------------------------------ built-in catalogue
 BUILTIN_DIR = Path(__file__).parent.parent.parent / "reports" / "templates"
@@ -120,7 +121,52 @@ class TemplateGalleryView:
             controls.append(ft.Text("No custom templates yet — copy a built-in or create a blank one below.",
                                     size=11, color=ft.Colors.ON_SURFACE_VARIANT, italic=True))
 
+        ai = rvm.ai_templates(self.ctx.svc)
+        if ai:
+            controls.append(ft.Divider())
+            controls.append(ft.Text(f"AI templates  ({self.ctx.svc.project.config.report_ai.templates_dir} - not in "
+                                    "git until promoted)", size=12, weight=ft.FontWeight.W_600,
+                                    color=ft.Colors.ON_SURFACE_VARIANT))
+            controls += [self._ai_card(t) for t in ai]
+
         self._list_col.controls = controls
+
+    def _ai_card(self, t: dict) -> ft.Control:
+        item = {"file": t["file"], "path": t["path"], "exists": True, "title": t["file"]}
+        facts = " · ".join(x for x in (f"report {t['report']}" if t["report"] else "no report uses it",
+                                         f"by {t['model']}" if t["model"] else "",
+                                         f"data access {t['data_access']}" if t["data_access"] else "",
+                                         t["generated_at"][:16].replace("T", " ") if t["generated_at"] else "") if x)
+        actions = [icon_btn(ft.Icons.CODE, "View source", lambda _, i=item: self._preview(i),
+                            ft.Colors.ON_SURFACE_VARIANT)]
+        if t["report"]:
+            actions.insert(0, ft.TextButton("Promote", icon=ft.Icons.PUBLISH,
+                                            tooltip="Copy into templates/ (git) and point the report at it",
+                                            on_click=lambda _, r=t["report"]: self._promote(r)))
+        body = [ft.Row([ft.Icon(ft.Icons.AUTO_AWESOME, color=ft.Colors.PURPLE_700, size=20),
+                        ft.Text(t["file"], size=13, weight=ft.FontWeight.W_600, expand=True),
+                        tag("AI draft", "warn"), *actions], spacing=8),
+                ft.Text(facts, size=11, color=ft.Colors.ON_SURFACE_VARIANT)]
+        if t["prompt"]:
+            body.append(ft.Text(f"“{t['prompt']}”", size=11, italic=True, color=ft.Colors.PURPLE_700))
+        if t["columns_sent"]:
+            body.append(ft.Text("The model saw columns: " + ", ".join(t["columns_sent"]), size=10,
+                                color=ft.Colors.ON_SURFACE_VARIANT))
+        return ft.Container(border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT), border_radius=8, padding=12,
+                            content=ft.Column(body, spacing=4))
+
+    def _promote(self, report: str) -> None:
+        from ...reports.author import ReportAuthor
+        from ...services import ServiceError
+        try:
+            dest = ReportAuthor(self.ctx.svc.project, actor="studio").promote(report)
+            self._status.value = f"✓ '{report}' now uses {dest.relative_to(self.ctx.svc.project.root).as_posix()}"
+            self._status.color = ft.Colors.GREEN_700
+        except ServiceError as exc:
+            self._status.value = f"✗ {exc}"
+            self._status.color = ft.Colors.ERROR
+        self._refresh_list()
+        self.ctx.page.update()
 
     def _template_card(self, t: dict, builtin: bool) -> ft.Control:
         is_sel = self._selected and self._selected["file"] == t["file"]

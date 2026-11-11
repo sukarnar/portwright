@@ -176,3 +176,9 @@ def cli_dialog(ctx: "Ctx", title: str, commands: list[tuple[str, str]], note: st
                         "(C:\\apps\\portwright\\.venv\\Scripts\\Activate.ps1).", size=12,
                         color=ft.Colors.ON_SURFACE_VARIANT))
     ctx.info(title, body, width=820)
+
+
+def checkbox_rows(boxes, per_row: int = 3) -> ft.Column:
+    """Checkboxes in fixed rows. A wrapping Row puts each box on its own line inside a stretched dialog."""
+    boxes = list(boxes)
+    return ft.Column([ft.Row(boxes[i:i + per_row], spacing=4) for i in range(0, len(boxes), per_row)], spacing=0)

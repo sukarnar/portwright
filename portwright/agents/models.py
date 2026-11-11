@@ -49,6 +49,7 @@ def check_agent_models(config: ProjectConfig, root: str | Path) -> list[str]:
     out = [f"agent '{n}' uses unknown model '{a.model}'" for n, a in config.agents.items() if a.model not in models]
     for n, w in config.workflows.items():
         for st in w.steps:
-            if st.model and (st.type == "llm" or (st.type == "foreach" and st.do == "llm")) and st.model not in models:
+            uses_model = st.type in ("llm", "report_design") or (st.type == "foreach" and st.do == "llm")
+            if st.model and uses_model and st.model not in models:
                 out.append(f"workflow '{n}' step '{st.id}' uses unknown model '{st.model}'")
     return out

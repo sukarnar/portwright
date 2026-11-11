@@ -14,7 +14,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .agents.spec import (AgentSpec, LlmModelSpec, McpServerSpec, SkillSpec, ToolSpec, WorkflowSpec)
+from .agents.spec import (AgentSpec, DataAccess, LlmModelSpec, McpServerSpec, SkillSpec, ToolSpec, WorkflowSpec)
 
 DEFAULT_CONFIG = "portwright.yaml"      # an existing restforge.yaml is used when this is missing
 _ENV_REF = re.compile(r"\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -142,6 +142,9 @@ class SourceSpec(BaseModel):
     ca_file: str | None = None                         # extra CA bundle (PEM); default: system store
     allow_plain_ldap: bool = False                     # ldap:// without TLS is refused unless set
     test_group: str | None = None                      # 'source test' lists this group's members
+    # AI report authoring: ceiling on what a model may see of this source (and endpoints on it)
+    ai_data_access: DataAccess = "full"
+    ai_exclude_columns: list[str] = Field(default_factory=list)   # never sent to a model, whatever the level
 
     @model_validator(mode="after")
     def _check(self) -> "SourceSpec":
@@ -470,33 +473,127 @@ class ServerSettings(BaseModel):
 # Reports  (Jinja2-templated PDF / HTML generation)
 # --------------------------------------------------------------------------- #
 
+REPORT_FORMATS = ("pdf", "html", "md", "csv", "xlsx", "json")
+TEMPLATE_FORMATS = {"pdf", "html"}       # formats rendered from the Jinja2 HTML template
+ReportFormat = Literal["pdf", "html", "md", "csv", "xlsx", "json"]
+
+
 class ReportFrom(BaseModel):
     """Where the report pulls its data from."""
-    endpoint: str | None = None   # a GET endpoint name (all pages fetched automatically)
+    endpoint: str | None = None   # a GET endpoint name
     source: str | None = None     # a file or SQL source (direct read, no HTTP round-trip)
-    params: dict[str, Any] = Field(default_factory=dict)   # endpoint query/path params
+    params: dict[str, Any] = Field(default_factory=dict)   # endpoint params / SQL bind values
+    query: str | None = None      # SQL sources: one read-only SELECT, values bound from params (:name)
+    paginate: bool = True         # endpoints: follow limit/offset until every page is read
+    max_rows: int = Field(50_000, ge=1, le=1_000_000)       # stop reading after this many rows
 
     @model_validator(mode="after")
     def _one(self) -> "ReportFrom":
         if bool(self.endpoint) == bool(self.source):
             raise ValueError("report 'from' needs exactly one of 'endpoint' or 'source'")
+        if self.query is not None and not self.source:
+            raise ValueError("report 'from.query' needs 'from.source' (a SQL source)")
         return self
 
 
 class ReportSpec(BaseModel):
-    """Declaration of one PDF/HTML report."""
+    """Declaration of one report, rendered to one or more formats."""
     name: str = Field(pattern=_NAME)
     description: str = ""
-    # Jinja2 template file path (relative to the project root, or absolute)
-    template: str
+    # Jinja2 HTML template (relative to the project root, or absolute). Needed for pdf/html output only.
+    template: str | None = None
     from_: ReportFrom = Field(alias="from")
-    # Output path; may contain Jinja2 expressions, e.g.
-    #   reports/output/{{ now | strftime('%Y-%m') }}-{{ report_name }}.pdf
+    # Formats to produce on every run. Empty: taken from the output suffix (.html → html), else pdf.
+    formats: list[ReportFormat] = Field(default_factory=list)
+    # Output path *stem*; may contain Jinja2 expressions, e.g.
+    #   reports/output/{{ now | strftime('%Y-%m') }}/{{ report_name }}
+    # A known suffix (.pdf, .html, …) is ignored; each format adds its own.
     output: str | None = None
     # Extra variables injected into every template render
     vars: dict[str, Any] = Field(default_factory=dict)
+    # Data formats (csv / xlsx / json / md): column order/subset and header renames
+    columns: list[str] = Field(default_factory=list)
+    rename: dict[str, str] = Field(default_factory=dict)
+    # AI report authoring: ceiling for this report, and where its AI template came from (written by the author)
+    ai_data_access: DataAccess | None = None
+    provenance: dict[str, Any] | None = None
 
     model_config = {"populate_by_name": True}
+
+    @field_validator("formats")
+    @classmethod
+    def _unique(cls, v: list[str]) -> list[str]:
+        return list(dict.fromkeys(v))
+
+    def effective_formats(self) -> list[str]:
+        if self.formats:
+            return list(self.formats)
+        return ["html"] if (self.output or "").lower().endswith((".html", ".htm")) else ["pdf"]
+
+    @model_validator(mode="after")
+    def _template_needed(self) -> "ReportSpec":
+        need = TEMPLATE_FORMATS & set(self.effective_formats())
+        if need and not self.template:
+            raise ValueError(f"report '{self.name}': format(s) {sorted(need)} need a 'template'")
+        return self
+
+
+# --------------------------------------------------------------------------- #
+# Filesystem roots and destinations (workflow copy/move/file steps, fs tools)
+# --------------------------------------------------------------------------- #
+_ROOT_NAME = r"^[a-zA-Z][a-zA-Z0-9_\-]{1,63}$"     # 2+ characters, so 'C:\x' is never read as a root address
+OverwritePolicy = Literal["never", "always", "rename", "if_newer"]
+
+
+class FsRoot(BaseModel):
+    """A named folder steps and tools may use. Relative paths are inside the project; absolute / UNC paths
+    must also be listed in security.allowed_folders."""
+    path: str
+    mode: Literal["read", "write", "read_write"] = "read"
+    patterns: list[str] = Field(default_factory=list)     # file-name globs allowed here (empty: any)
+    delete: Literal["none", "trash", "hard"] = "trash"    # what 'delete' does on a writable root
+
+
+class DestinationSpec(BaseModel):
+    """A write-only place outputs are delivered to (``dest:<name>/sub/folder``). Reached as the account
+    running portwright - there are no destination credentials."""
+    path: str
+    overwrite: OverwritePolicy = "never"                  # default policy for copy / move steps
+    description: str = ""
+
+
+class FilesystemSettings(BaseModel):
+    roots: dict[str, FsRoot] = Field(default_factory=dict)
+    max_file_mb: int = Field(50, ge=1, le=10_240)
+    trash: str = ".portwright/trash"                      # deleted files go here (inside the project)
+
+
+def is_absolute_path(p: str) -> bool:
+    from pathlib import PureWindowsPath
+    return PureWindowsPath(p).is_absolute() or p.startswith(("/", "\\\\")) or bool(PureWindowsPath(p).drive)
+
+
+def path_allowed(p: str, allowed: list[str]) -> bool:
+    """Is absolute path *p* one of / inside one of the *allowed* folders (case-insensitive, either slash)?"""
+    def norm(x: str) -> str:
+        return str(x).replace("\\", "/").rstrip("/").lower()
+    n = norm(p)
+    return any(n == a or n.startswith(a + "/") for a in (norm(x) for x in allowed))
+
+
+class ReportAiSettings(BaseModel):
+    """Project-wide settings for AI report authoring (`pw report design`, report_design steps)."""
+    data_access: DataAccess = "full"     # project ceiling; models are local, so real rows are allowed by default
+    sample_rows: int = Field(50, ge=0, le=500)      # rows profiled (and sent at 'sample'/'full') per design run
+    max_repairs: int = Field(2, ge=0, le=5)         # times a failing template goes back to the model with the error
+    templates_dir: str = ".portwright/templates"    # where AI templates are written (outside git until promoted)
+
+    @field_validator("templates_dir")
+    @classmethod
+    def _inside_project(cls, v: str) -> str:
+        if is_absolute_path(v) or ".." in re.split(r"[\\/]", v):
+            raise ValueError("report_ai.templates_dir must be a folder inside the project (no '..')")
+        return v
 
 
 class ProjectConfig(BaseModel):
@@ -515,6 +612,9 @@ class ProjectConfig(BaseModel):
     agents: dict[str, AgentSpec] = Field(default_factory=dict)
     workflows: dict[str, WorkflowSpec] = Field(default_factory=dict)
     mcp_servers: dict[str, McpServerSpec] = Field(default_factory=dict)
+    filesystem: FilesystemSettings = Field(default_factory=FilesystemSettings)
+    destinations: dict[str, DestinationSpec] = Field(default_factory=dict)
+    report_ai: ReportAiSettings = Field(default_factory=ReportAiSettings)
 
     @model_validator(mode="after")
     def _integrity(self) -> "ProjectConfig":
@@ -570,8 +670,53 @@ class ProjectConfig(BaseModel):
                 raise ValueError(
                     f"report '{rpt.name}' reads unknown source '{rpt.from_.source}'"
                 )
+            if rpt.from_.query is not None and self.sources[rpt.from_.source].type != "sql":
+                raise ValueError(f"report '{rpt.name}': 'from.query' needs a SQL source, "
+                                 f"'{rpt.from_.source}' is {self.sources[rpt.from_.source].type}")
+        self._check_filesystem()
         self._check_agents()
         return self
+
+    def _check_place(self, who: str, name: str) -> None:
+        """A root name, or dest:<name>, must exist (reports, templates and data always do)."""
+        if name.startswith("dest:"):
+            if name[5:] not in self.destinations:
+                raise ValueError(f"{who} uses unknown destination '{name[5:]}'")
+        elif name not in self.filesystem.roots and name not in ("reports", "templates", "data"):
+            raise ValueError(f"{who} uses unknown filesystem root '{name}'")
+
+    def _check_address(self, wf: str, step: str, addr: str | None) -> None:
+        """A literal 'root:...' / 'dest:name/...' in a step must name a defined root or destination."""
+        if not addr or "${" in addr.split(":", 1)[0]:          # the root itself is chosen at run time
+            return
+        m = re.match(r"^([A-Za-z][A-Za-z0-9_\-]+):(.*)$", addr)
+        if not m:
+            return
+        name, rest = m.groups()
+        implicit = {"reports", "templates", "data"}
+        if name == "dest":
+            dname = re.split(r"[\\/]", rest.lstrip("/\\"), maxsplit=1)[0]
+            if "${" not in dname and dname not in self.destinations:
+                raise ValueError(f"workflow '{wf}' step '{step}': unknown destination '{dname}'")
+        elif name not in self.filesystem.roots and name not in implicit:
+            raise ValueError(f"workflow '{wf}' step '{step}': unknown filesystem root '{name}'")
+
+    def _check_filesystem(self) -> None:
+        places = [(f"filesystem root '{n}'", n, r.path) for n, r in self.filesystem.roots.items()]
+        places += [(f"destination '{n}'", n, d.path) for n, d in self.destinations.items()]
+        for what, name, path in places:
+            if not re.match(_ROOT_NAME, name):
+                raise ValueError(f"{what}: names are 2-64 letters, digits, - and _, starting with a letter")
+            if not path.strip():
+                raise ValueError(f"{what} has no path")
+            if is_absolute_path(path):
+                if not path_allowed(path, self.security.allowed_folders):
+                    raise ValueError(f"{what}: '{path}' is outside the project; add it to "
+                                     "security.allowed_folders first")
+            elif ".." in re.split(r"[\\/]", path):
+                raise ValueError(f"{what}: '..' is not allowed in '{path}'")
+        if "dest" in self.filesystem.roots:
+            raise ValueError("filesystem root name 'dest' is reserved for destinations (dest:<name>/...)")
 
     def _check_agents(self) -> None:
         """References between tools, skills, agents, workflows and MCP servers.
@@ -592,6 +737,21 @@ class ProjectConfig(BaseModel):
                     raise ValueError(f"tool '{n}': source '{t.source}' is read-only; allow writes there first")
             if t.type == "mcp" and t.server not in self.mcp_servers:
                 raise ValueError(f"tool '{n}' uses unknown MCP server '{t.server}'")
+            if t.type == "filesystem":
+                for r in t.roots:
+                    self._check_place(f"tool '{n}'", r)
+            if t.type == "report":
+                for r in t.reports:
+                    if self.report(r) is None:
+                        raise ValueError(f"tool '{n}' uses unknown report '{r}'")
+        for n, m in self.mcp_servers.items():
+            for r in m.expose.reports:
+                if self.report(r) is None:
+                    raise ValueError(f"MCP server '{n}' exposes unknown report '{r}'")
+            for f in m.expose.filesystem:
+                self._check_place(f"MCP server '{n}'", f.root)
+                if f.root.startswith("dest:") and set(f.ops) - {"write", "mkdir", "copy", "move", "zip"}:
+                    raise ValueError(f"MCP server '{n}': {f.root} is write-only; it cannot be listed or read")
         for n, a in self.agents.items():
             for t in a.tools:
                 if t not in self.tools:
@@ -606,10 +766,23 @@ class ProjectConfig(BaseModel):
             for st in w.steps:
                 if st.type == "tool" and st.tool not in self.tools:
                     raise ValueError(f"workflow '{n}' step '{st.id}': unknown tool '{st.tool}'")
+                if st.type in ("tool", "foreach") and st.tool in self.tools and \
+                        self.tools[st.tool].type in ("filesystem", "report"):
+                    raise ValueError(f"workflow '{n}' step '{st.id}': tool '{st.tool}' is for agents; in a workflow "
+                                     "use the report, copy, move and file steps")
                 if st.type == "agent" and st.agent not in self.agents:
                     raise ValueError(f"workflow '{n}' step '{st.id}': unknown agent '{st.agent}'")
                 if st.type == "load" and st.load not in {x.name for x in self.loads}:
                     raise ValueError(f"workflow '{n}' step '{st.id}': unknown load '{st.load}'")
+                kind = st.do if st.type == "foreach" else st.type
+                designed = {x.report for x in w.steps if x.type == "report_design"}
+                if kind == "report" and st.report and self.report(st.report) is None and st.report not in designed:
+                    raise ValueError(f"workflow '{n}' step '{st.id}': unknown report '{st.report}'")
+                if st.type == "report_design" and self.report(st.report) is None and not st.from_:
+                    raise ValueError(f"workflow '{n}' step '{st.id}': report '{st.report}' does not exist yet; "
+                                     "add 'from' (an endpoint or source) so the step can create it")
+                for addr in (st.to, st.path) if st.type in ("copy", "move", "file", "foreach") else ():
+                    self._check_address(n, st.id, addr)
                 if st.type == "foreach":
                     if st.do == "tool" and st.tool not in self.tools:
                         raise ValueError(f"workflow '{n}' step '{st.id}': unknown tool '{st.tool}'")

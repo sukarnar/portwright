@@ -122,6 +122,8 @@ class ToolRuntime:
         self._key = ""
         self._stack = AsyncExitStack()
         self._transport_factory = transport_factory
+        self.agent_model: str | None = None     # report tools: whose data access applies / who designs
+        self.provider_factory = None            # report design: override the model provider (tests)
         sec = self.cfg.security
         self.audit = AuditLogger(str(self.root / sec.audit_log) if sec.audit_log else None)
 
@@ -277,6 +279,19 @@ def mcp_tools(rt: ToolRuntime, server: McpServerSpec, prefix: str = "") -> list[
                                    description=f"Run a read-only SELECT on {s.name}. Tables: {', '.join(s.tables)}"))
     for ln in server.expose.loads:
         out.append(rt.load_tool(f"{prefix}run_load_{ln}", ln))
+    from .file_tools import fs_tools, report_run_tool
+    for rn in server.expose.reports:
+        t = report_run_tool(rt, rn)
+        t.name = prefix + t.name
+        out.append(t)
+    op_roots: dict[str, list[str]] = {}
+    for f in server.expose.filesystem:
+        for op in f.ops:
+            op_roots.setdefault(op, [])
+            if f.root not in op_roots[op]:
+                op_roots[op].append(f.root)
+    if op_roots:
+        out += fs_tools(rt, f"{prefix}fs_", op_roots, blob_mb=server.max_blob_mb)
     return out
 
 
@@ -291,5 +306,13 @@ def build_registry(rt: ToolRuntime, tool_names: list[str], specs: dict[str, Tool
             reg.add(rt.sql_tool(n, t.source, t.description, t.read_only, t.max_rows))
         elif t.type == "mcp":
             for tool in mcp_tools(rt, cfg.mcp_servers[t.server], prefix=f"{n}__"):
+                reg.add(tool)
+        elif t.type == "filesystem":
+            from .file_tools import fs_tools
+            for tool in fs_tools(rt, f"{n}_", {op: list(t.roots) for op in t.ops}):
+                reg.add(tool)
+        elif t.type == "report":
+            from .file_tools import report_tools
+            for tool in report_tools(rt, f"{n}_", t.reports, t.ops, t.model):
                 reg.add(tool)
     return reg

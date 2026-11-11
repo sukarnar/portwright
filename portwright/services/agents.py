@@ -70,6 +70,43 @@ class AgentService:
         self.template(template_id)
         return template_yaml(template_id)
 
+    def agent_templates(self) -> list[dict]:
+        from ..agents.templates import list_agent_templates
+        return list_agent_templates()
+
+    def add_agent_from_template(self, template_id: str, name: str, model: str) -> list[str]:
+        """Create an agent (and the tools it needs) from a ready-made agent template. Existing tools with the same
+        name are reused only when identical. Returns the names of what was created."""
+        from ..agents.spec import AgentSpec, ToolSpec
+        from ..agents.templates import AGENT_TEMPLATES
+        t = AGENT_TEMPLATES.get(template_id)
+        if t is None:
+            raise ServiceError(f"no agent template '{template_id}' (see: {', '.join(AGENT_TEMPLATES)})")
+        if name in self.cfg.agents:
+            raise ServiceError(f"agent '{name}' already exists")
+        created, tools = [], {}
+        for tname, tdata in t["tools"].items():
+            spec = ToolSpec.model_validate(tdata)
+            have = self.cfg.tools.get(tname)
+            if have is not None and have.model_dump() != spec.model_dump():
+                raise ServiceError(f"a different tool '{tname}' already exists; rename or remove it first")
+            tools[tname] = spec
+        agent = AgentSpec.model_validate({**t["agent"], "model": model})
+        before_tools = dict(self.cfg.tools)
+        for tname, spec in tools.items():
+            if tname not in self.cfg.tools:
+                self.cfg.tools[tname] = spec
+                created.append(f"tool {tname}")
+        self.cfg.agents[name] = agent
+        try:
+            self.p.save()
+        except Exception:
+            self.cfg.agents.pop(name, None)
+            self.cfg.tools.clear()
+            self.cfg.tools.update(before_tools)
+            raise
+        return created + [f"agent {name}"]
+
     def workflow_inputs(self, name: str) -> dict[str, dict]:
         """Inputs declared by the workflow's input node(s): {name: {default, required, description}}."""
         out: dict[str, dict] = {}

@@ -1,11 +1,17 @@
-"""Workflows: steps (input | tool | agent | llm | load | foreach | condition | switch | set | output) with
-``${...}`` templating between them."""
+"""Workflows: steps (input | tool | agent | llm | load | report | copy | move | file | foreach | condition |
+switch | set | output) with ``${...}`` templating between them.
+
+Every run also sees ``${run.id}``, ``${run.started_at}`` (UTC, ISO) and ``${run.date.year|month|day|iso}`` /
+``${run.time}`` (local time of the machine running the workflow, zero padded) for building folder names.
+"""
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -172,6 +178,128 @@ class _Env:
     provider_factory: ProviderFactory | None = None
     transport_factory: Any = None
     save: bool = True
+    scopes: list[str] = field(default_factory=list)
+    actor: str = "workflow"
+    _sandbox: Any = None
+    _reports: Any = None
+
+    def sandbox(self):
+        if self._sandbox is None:
+            from ..fs import Sandbox
+            self._sandbox = Sandbox(self.config, self.root, scopes=self.scopes, actor=self.actor)
+        return self._sandbox
+
+    def reports(self):
+        if self._reports is None:
+            from ..reports import ReportService
+            self._reports = ReportService(_ProjectView(self.config, self.root, self.credentials))
+        return self._reports
+
+
+def _ProjectView(config, root, creds):                 # noqa: N802 - kept name; see reports.service.ProjectView
+    from ..reports.service import ProjectView
+    return ProjectView(config, Path(root), creds)
+
+
+def run_info(run_id: str, now: datetime | None = None) -> dict:
+    """The ``${run.*}`` values of one run."""
+    utc = now or datetime.now(timezone.utc)
+    local = utc.astimezone()
+    return {"id": run_id, "started_at": utc.isoformat(timespec="seconds"),
+            "date": {"year": f"{local:%Y}", "month": f"{local:%m}", "day": f"{local:%d}", "iso": f"{local:%Y-%m-%d}"},
+            "time": f"{local:%H%M%S}"}
+
+
+_FS_ERRORS: tuple[type[Exception], ...] = (OSError, ValueError)
+
+
+def _fs_errors() -> tuple[type[Exception], ...]:
+    from ..fs import FsError
+    from ..services.project import ServiceError
+    return (FsError, ServiceError, *_FS_ERRORS)
+
+
+def _need_scope(env: "_Env", scope: str) -> None:
+    if "*" not in env.scopes and scope not in env.scopes:
+        raise ToolError(f"this step needs the scope '{scope}' on the workflow (scopes: [{scope}, ...])")
+
+
+def _formats(value: Any) -> list[str] | None:
+    """A step's formats: a list, or text like "pdf, xlsx" (e.g. from ${input.formats})."""
+    if isinstance(value, str):
+        value = [f.strip() for f in value.split(",") if f.strip()]
+    return list(value) if value else None
+
+
+async def _report(st, raw_input: Any, scope: dict, env: "_Env") -> dict:
+    _need_scope(env, "reports:run")
+    params = resolve(raw_input, scope) if raw_input is not None else {}
+    if not isinstance(params, dict):
+        raise ToolError("report step 'input' must be a mapping of report params")
+    data = resolve(st.data, scope) if st.data is not None else None
+    formats = _formats(resolve(st.formats, scope)) if st.formats else None
+    extra = resolve(st.vars, scope) if st.vars else None
+    out = resolve(st.output_path, scope) if st.output_path else None
+    svc = env.reports()
+    try:
+        if st.report:
+            res = await asyncio.to_thread(svc.run, st.report, formats=formats, output=out, params=params,
+                                          data=data, extra_vars=extra)
+        else:
+            res = await asyncio.to_thread(svc.render_inline, data, formats, out or f"reports/output/{st.id}",
+                                          name=st.id, template=resolve(st.template, scope) if st.template else None,
+                                          vars=extra)
+    except _fs_errors() as exc:
+        raise ToolError(str(exc)) from None
+    return res.to_dict()
+
+
+async def _report_design(st, scope: dict, env: "_Env") -> tuple[dict, int]:
+    """AI-author the report's template. overwrite: never (default) reuses an existing AI template, always
+    designs again. Needs the scope reports:write."""
+    _need_scope(env, "reports:write")
+    from ..reports.author import ReportAuthor
+    prompt = resolve(st.input, scope)
+    author = ReportAuthor(_ProjectView(env.config, env.root, env.credentials), actor=env.actor,
+                          provider_factory=env.provider_factory)
+    try:
+        res = await author.design(st.report, prompt if isinstance(prompt, str) else json.dumps(prompt, default=str),
+                                  frm=resolve(st.from_, scope) if st.from_ else None,
+                                  formats=_formats(resolve(st.formats, scope)) if st.formats else None,
+                                  model=st.model,
+                                  base=st.base, sample_rows=st.sample_rows, data_access=st.data_access,
+                                  if_exists="replace" if st.overwrite == "always" else "keep")
+    except _fs_errors() as exc:
+        raise ToolError(str(exc)) from None
+    env._reports = None                      # the report definition may have changed
+    return res.to_dict(), res.tokens
+
+
+async def _transfer(kind: str, st, scope: dict, env: "_Env") -> list:
+    files, to = resolve(st.files, scope), resolve(st.to, scope)
+    try:
+        return await asyncio.to_thread(env.sandbox().transfer, files, str(to), mode=kind, overwrite=st.overwrite,
+                                       create_dirs=st.create_dirs, verify=st.verify, manifest=st.manifest)
+    except _fs_errors() as exc:
+        raise ToolError(str(exc)) from None
+
+
+async def _file(st, scope: dict, env: "_Env") -> Any:
+    sb = env.sandbox()
+    r = lambda v: resolve(v, scope) if v is not None else None     # noqa: E731
+    calls = {
+        "write": lambda: sb.write_text(str(r(st.to)), r(st.content) if st.content is not None else "",
+                                       st.overwrite or "never"),
+        "read": lambda: sb.read_text(str(r(st.path))),
+        "list": lambda: sb.list(str(r(st.path)), st.glob, st.recursive),
+        "mkdir": lambda: sb.mkdir(str(r(st.to))),
+        "delete": lambda: sb.delete(r(st.files)),
+        "zip": lambda: sb.zip(r(st.files), str(r(st.to)), st.overwrite or "never"),
+    }
+    try:
+        return await asyncio.to_thread(calls[st.op])
+    except _fs_errors() as exc:
+        raise ToolError(str(exc)) from None
 
 
 async def _llm(st, prompt: Any, scope: dict, env: _Env) -> tuple[Any, int]:
@@ -201,7 +329,11 @@ async def _llm(st, prompt: Any, scope: dict, env: _Env) -> tuple[Any, int]:
 
 
 async def _do(kind: str, st, raw_input: Any, scope: dict, env: _Env) -> tuple[Any, str, int]:
-    """Run one tool / agent / llm / load action. Returns (output, agent run id, tokens)."""
+    """Run one tool / agent / llm / load / report / copy / move action. Returns (output, agent run id, tokens)."""
+    if kind == "report":
+        return await _report(st, raw_input, scope, env), "", 0
+    if kind in ("copy", "move"):
+        return await _transfer(kind, st, scope, env), "", 0
     if kind == "tool":
         args = resolve(raw_input, scope) if raw_input is not None else {}
         if not isinstance(args, dict):
@@ -242,13 +374,13 @@ async def run_workflow(config: ProjectConfig, root: str | Path, credentials, nam
         raise ConfigError(f"no workflow '{name}'")
     root = Path(root)
     run_id = new_run_id()
-    scope: dict[str, Any] = {"input": input if input is not None else {}, "steps": {}}
+    scope: dict[str, Any] = {"input": input if input is not None else {}, "steps": {}, "run": run_info(run_id)}
     results: list[StepResult] = []
     status, error, last = "ok", "", None
     final, has_final = None, False
     order = [s.id for s in wf.steps]
     env = _Env(config, root, credentials, provider_factory=provider_factory, transport_factory=transport_factory,
-               save=save)
+               save=save, scopes=list(wf.scopes), actor=f"workflow:{name}")
 
     tool_names, needs_load = _needs_runtime(wf.steps)
     rt = None
@@ -266,8 +398,12 @@ async def run_workflow(config: ProjectConfig, root: str | Path, credentials, nam
             t0, jump = time.monotonic(), None
             res = StepResult(st.id, st.type, True)
             try:
-                if st.type in ("tool", "agent", "llm", "load"):
+                if st.type in ("tool", "agent", "llm", "load", "report", "copy", "move"):
                     res.output, res.run_id, res.tokens = await _do(st.type, st, st.input, scope, env)
+                elif st.type == "file":
+                    res.output = await _file(st, scope, env)
+                elif st.type == "report_design":
+                    res.output, res.tokens = await _report_design(st, scope, env)
                 elif st.type == "foreach":
                     res.output, res.tokens = await _foreach(st, scope, env)
                 elif st.type == "input":

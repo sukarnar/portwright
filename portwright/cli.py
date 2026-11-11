@@ -1135,16 +1135,41 @@ def load_rejects(run_id: str, last: int = typer.Option(20, "--limit", help="Rows
 
 
 # ----------------------------------------------------------------- reports
-report_app = typer.Typer(help="Generate HTML/PDF reports from Jinja2 templates.", no_args_is_help=True)
+def _formats(values: list[str]) -> list[str]:
+    """--format pdf --format xlsx  or  --format pdf,xlsx"""
+    from .reports.renderers import RENDERERS
+    out = [f.strip().lower() for v in values for f in v.split(",") if f.strip()]
+    bad = [f for f in out if f not in RENDERERS]
+    if bad:
+        raise typer.BadParameter(f"unknown format(s) {bad}; choose from {', '.join(RENDERERS)}")
+    return list(dict.fromkeys(out))
+
+
+def _clean_validation(exc: Exception) -> str:
+    errs = getattr(exc, "errors", None)
+    if callable(errs):
+        try:
+            return "; ".join(str(e.get("msg", e)).removeprefix("Value error, ") for e in errs())
+        except Exception:
+            pass
+    return str(exc)
+
+
+report_app = typer.Typer(help="Generate PDF, HTML, Markdown, CSV, Excel and JSON reports.", no_args_is_help=True)
 app.add_typer(report_app, name="report")
 
 
 @report_app.command("add")
 def report_add(
     name: str,
-    template: str = typer.Option(..., "--template", "-t", help="Path to the Jinja2 HTML template file."),
+    template: Optional[str] = typer.Option(None, "--template", "-t",
+                                           help="Path to the Jinja2 HTML template file (needed for pdf/html)."),
     endpoint: Optional[str] = typer.Option(None, "--endpoint", "-e", help="Endpoint to pull data from."),
     source: Optional[str] = typer.Option(None, "--source", "-s", help="Source to pull data from directly."),
+    query: Optional[str] = typer.Option(None, "--query", "-q",
+                                        help="SQL sources: one SELECT; bind values with :name and --param name=value."),
+    fmt: list[str] = typer.Option([], "--format", "-f",
+                                  help="Output format: pdf, html, md, csv, xlsx, json (repeatable or comma-separated)."),
     output: Optional[str] = typer.Option(None, "--output", "-o",
                                          help="Output path (Jinja2 expressions supported, e.g. reports/{{ now | strftime('%Y-%m') }}/sales)."),
     description: str = "",
@@ -1160,16 +1185,21 @@ def report_add(
     if any(r.name == name for r in cfg.reports):
         _fail(Exception(f"report '{name}' exists – remove it first with 'portwright report remove {name}'"))
     from .config import ReportSpec, ReportFrom
-    spec = ReportSpec(
-        name=name,
-        description=description,
-        template=template,
-        **{"from": ReportFrom(endpoint=endpoint, source=source, params=_kv(param))},
-        output=output,
-    )
+    try:
+        spec = ReportSpec(
+            name=name,
+            description=description,
+            template=template,
+            **{"from": ReportFrom(endpoint=endpoint, source=source, params=_kv(param), query=query)},
+            formats=_formats(fmt),
+            output=output,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(_clean_validation(exc))
     cfg.reports.append(spec)
     _save(cfg, config)
-    _ok(f"Report '{name}' added (template: {template})")
+    _ok(f"Report '{name}' added ({', '.join(spec.effective_formats())}"
+        + (f", template: {template})" if template else ")"))
     typer.echo(f"Next: portwright report run {name}")
 
 
@@ -1181,7 +1211,7 @@ def report_list(config: str = CONFIG_OPT):
         typer.echo("No reports yet. Add one with 'portwright report add'.")
         return
     for r in items:
-        typer.echo(f"{r['name']:<20} {r['from']:<32} {r['template']}")
+        typer.echo(f"{r['name']:<20} {r['from']:<32} {','.join(r['formats']):<14} {r['template']}")
         if r["description"]:
             typer.echo(f"  {r['description']}")
 
@@ -1196,19 +1226,25 @@ def report_show(name: str, config: str = CONFIG_OPT):
 @report_app.command("run")
 def report_run(
     name: str,
-    output: Optional[str] = typer.Option(None, "--output", "-o", help="Override the output path."),
-    html: bool = typer.Option(False, "--html", help="Produce HTML instead of PDF."),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Override the output path (stem)."),
+    fmt: list[str] = typer.Option([], "--format", "-f",
+                                  help="Override the formats: pdf, html, md, csv, xlsx, json (repeatable or comma-separated)."),
+    html: bool = typer.Option(False, "--html", help="Produce HTML only (same as --format html)."),
     param: list[str] = typer.Option([], "--param", "-p", help="NAME=VALUE params passed to the data source (repeatable)."),
     var: list[str] = typer.Option([], "--var", help="NAME=VALUE extra template variable (repeatable)."),
     open_: bool = typer.Option(False, "--open", help="Open the output file after rendering."),
     config: str = CONFIG_OPT,
 ):
-    """Render a report to PDF (or HTML with --html)."""
+    """Render a report to its formats (default PDF; override with --format or --html)."""
     svc = _svc(config)
     result = _run(svc.reports.run, name,
-                  output=output, as_html=html,
+                  output=output, as_html=html, formats=_formats(fmt) or None,
                   params=_kv(param), extra_vars=_kv(var) if var else None)
-    _ok(f"Report '{name}' written to {result.output_path}  ({result.format}, {result.row_count} rows, {result.seconds}s)")
+    _ok(f"Report '{name}': {result.row_count} rows, {result.seconds}s")
+    for o in result.outputs:
+        typer.echo(f"  {o.format:<5} {o.path}  ({o.bytes:,} bytes)")
+    for w in result.warnings:
+        typer.secho(f"  warning: {w}", fg=typer.colors.YELLOW)
     if open_:
         import subprocess, sys
         if sys.platform == "win32":
@@ -1228,10 +1264,114 @@ def report_template(
     """Write a starter Jinja2 HTML template for a report."""
     svc = _svc(config)
     spec = _run(svc.reports.get, name)
-    dest_path = path or spec.template
+    dest_path = path or spec.template or f"templates/{name}.html"
     out = _run(svc.reports.scaffold_template, name, dest_path)
     _ok(f"Starter template written to {out}")
     typer.echo("Edit it, then run:  portwright report run " + name + " --html   to preview before generating PDF.")
+
+
+def _print_design(d) -> None:
+    if d.action == "kept":
+        typer.echo(f"  kept the existing AI template {d.template}")
+        return
+    typer.echo(f"  template  {d.template}  (model {d.model}, {d.tokens} tokens, {d.repairs} repair(s))")
+    sent = f"{d.rows_sent} row(s)" if d.rows_sent else "no row values"
+    typer.echo(f"  the model saw: data access '{d.data_access}', {sent}, columns: {', '.join(d.columns_sent) or '-'}")
+    if d.title:
+        typer.echo(f"  title     {d.title}")
+    for w in d.warnings:
+        typer.secho(f"  warning: {w}", fg=typer.colors.YELLOW)
+
+
+@report_app.command("design")
+def report_design(
+    name: str,
+    prompt: str = typer.Option(..., "--prompt", "-P", help="What the report should show and how it should look."),
+    endpoint: Optional[str] = typer.Option(None, "--from-endpoint", "-e", help="Data from this endpoint (new reports)."),
+    source: Optional[str] = typer.Option(None, "--from-source", "-s", help="Data from this source (new reports)."),
+    query: Optional[str] = typer.Option(None, "--query", "-q", help="SQL sources: one SELECT (bind :name)."),
+    param: list[str] = typer.Option([], "--param", "-p", help="NAME=VALUE param for the data (repeatable)."),
+    fmt: list[str] = typer.Option([], "--format", "-f", help="Formats the template must suit: pdf, html, …"),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="LLM model (default: the only one defined)."),
+    base: Optional[str] = typer.Option(None, "--base", help="Gallery template to start from, e.g. summary_dashboard."),
+    sample_rows: Optional[int] = typer.Option(None, "--sample-rows", help="Rows profiled / sent (lower only)."),
+    data_access: Optional[str] = typer.Option(None, "--data-access",
+                                              help="Lower what the model sees: full, sample, profile, schema."),
+    force: bool = typer.Option(False, "--force", help="Replace an existing AI template (old one kept in .history)."),
+    run_after: bool = typer.Option(False, "--run", help="Run the report right after designing it."),
+    config: str = CONFIG_OPT,
+):
+    """Have an AI model write the report's template; it is checked before it is saved.
+
+    The template goes to .portwright/templates/ (outside git); 'report promote' moves it into templates/.
+    """
+    import asyncio
+    from .config import ReportFrom
+    from .reports.author import ReportAuthor
+    svc = _svc(config)
+    frm = None
+    if endpoint or source:
+        try:
+            frm = ReportFrom(endpoint=endpoint, source=source, query=query, params=_kv(param))
+        except ValueError as exc:
+            raise typer.BadParameter(_clean_validation(exc))
+    author = ReportAuthor(svc.project)
+    d = _run(lambda: asyncio.run(author.design(
+        name, prompt, frm=frm, params=None if frm else _kv(param), formats=_formats(fmt) or None, model=model,
+        base=base, sample_rows=sample_rows, data_access=data_access, if_exists="replace" if force else "error")))
+    _ok(f"Report '{name}' designed")
+    _print_design(d)
+    if run_after:
+        result = _run(svc.reports.run, name)
+        for o in result.outputs:
+            typer.echo(f"  {o.format:<5} {o.path}")
+    else:
+        typer.echo(f"Next: portwright report run {name}   ·   keep it in git: portwright report promote {name}")
+
+
+@report_app.command("ask")
+def report_ask(
+    question: str = typer.Argument(..., help="The report you want, in your own words."),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="LLM model (default: the only one defined)."),
+    endpoint: Optional[str] = typer.Option(None, "--endpoint", "-e", help="Only consider this endpoint."),
+    source: Optional[str] = typer.Option(None, "--source", "-s", help="Only consider this source."),
+    fmt: list[str] = typer.Option([], "--format", "-f", help="Formats to produce (default: the model's choice)."),
+    name: Optional[str] = typer.Option(None, "--name", help="Name of the new report (default: the model's choice)."),
+    data_access: Optional[str] = typer.Option(None, "--data-access", help="Lower what the model sees."),
+    no_run: bool = typer.Option(False, "--no-run", help="Register and design the report, but do not run it."),
+    config: str = CONFIG_OPT,
+):
+    """One question → the model picks the data and formats, designs the template, and the report runs."""
+    import asyncio
+    from .reports.author import ReportAuthor
+    svc = _svc(config)
+    author = ReportAuthor(svc.project)
+    out = _run(lambda: asyncio.run(author.ask(question, model=model, endpoint=endpoint, source=source,
+                                              formats=_formats(fmt) or None, name=name, data_access=data_access,
+                                              run=not no_run)))
+    plan = out["plan"]
+    frm = plan["from"]
+    where = f"endpoint {frm.endpoint}" if frm.endpoint else f"source {frm.source}: {frm.query}"
+    _ok(f"Report '{plan['name']}' created from {where}")
+    _print_design(out["design"])
+    if out["run"] is not None:
+        for o in out["run"].outputs:
+            typer.echo(f"  {o.format:<5} {o.path}")
+        for w in out["run"].warnings:
+            typer.secho(f"  warning: {w}", fg=typer.colors.YELLOW)
+
+
+@report_app.command("promote")
+def report_promote(
+    name: str,
+    to: Optional[str] = typer.Option(None, "--to", help="Where in the project (default: templates/<name>.html)."),
+    force: bool = typer.Option(False, "--force", help="Replace an existing file there."),
+    config: str = CONFIG_OPT,
+):
+    """Copy a report's AI template into templates/ (kept in git) and point the report at it."""
+    from .reports.author import ReportAuthor
+    dest = _run(ReportAuthor(_svc(config).project).promote, name, to, force)
+    _ok(f"Report '{name}' now uses {dest}")
 
 
 @report_app.command("remove")
@@ -1492,16 +1632,24 @@ def tool_list(config: str = CONFIG_OPT):
 
 
 @tool_app.command("add")
-def tool_add(name: str, type: str = typer.Option(..., "--type", "-t", help="endpoint | source | mcp"),
+def tool_add(name: str, type: str = typer.Option(..., "--type", "-t", help="endpoint | source | mcp | filesystem | report"),
              endpoint: Optional[str] = None, source: Optional[str] = None,
              server: Optional[str] = typer.Option(None, help="type mcp: an MCP server name."),
              write: bool = typer.Option(False, help="type source: allow non-SELECT statements (writable source)."),
              max_rows: int = typer.Option(200, help="type source: rows returned per call."),
+             root: list[str] = typer.Option([], "--root", help="type filesystem: a root or dest:<name> (repeatable)."),
+             op: list[str] = typer.Option([], "--op", help="filesystem: list stat read search write mkdir copy move "
+                                                         "delete zip · report: sources sample preview save run design"),
+             report: list[str] = typer.Option([], "--report", help="type report: a report it may use (default: all)."),
+             model: Optional[str] = typer.Option(None, help="type report: model for 'design' and data access."),
              description: str = "", replace: bool = False, config: str = CONFIG_OPT):
-    """Define a tool (endpoint: API call through the full pipeline; source: SQL; mcp: an MCP server's tools)."""
-    _run(_svc(config).agents.set, "tool", name, {"type": type, "endpoint": endpoint, "source": source,
-                                                 "server": server, "read_only": not write, "max_rows": max_rows,
-                                                 "description": description}, replace)
+    """Define a tool. endpoint: API call through the full pipeline; source: SQL; mcp: an MCP server's tools;
+    filesystem: <name>_<op> tools on the given roots; report: <name>_<op> report tools."""
+    data: dict = {"type": type, "endpoint": endpoint, "source": source, "server": server, "read_only": not write,
+                  "max_rows": max_rows, "description": description}
+    if type in ("filesystem", "report"):
+        data.update(roots=root, ops=[o for v in op for o in v.split(",") if o], reports=report, model=model)
+    _run(_svc(config).agents.set, "tool", name, data, replace)
     _ok(f"Tool '{name}' saved")
 
 
@@ -1557,6 +1705,24 @@ def agent_add(name: str, model: str = typer.Option(..., help="A model name (see 
         "max_steps": max_steps, "max_tokens_budget": budget, "timeout_seconds": timeout,
         "description": description}, replace)
     _ok(f"Agent '{name}' saved. Run it: portwright agent run {name} \"your task\"")
+
+
+@agent_app.command("templates")
+def agent_templates(config: str = CONFIG_OPT):
+    """Ready-made agents (create one with 'agent from-template')."""
+    for t in _svc(config).agents.agent_templates():
+        typer.echo(f"{t['id']:<16} {t['title']:<16} {t['description']}  (tools: {', '.join(t['tools'])})")
+
+
+@agent_app.command("from-template")
+def agent_from_template(template: str = typer.Argument(..., help="Template id, e.g. report-author."),
+                        name: str = typer.Argument(..., help="Name of the new agent."),
+                        model: str = typer.Option(..., help="The model the agent uses."),
+                        config: str = CONFIG_OPT):
+    """Create an agent and the tools it needs from a ready-made template."""
+    made = _run(_svc(config).agents.add_agent_from_template, template, name, model)
+    _ok("Created " + ", ".join(made))
+    typer.echo(f'Run it: portwright agent run {name} "your request"')
 
 
 @agent_app.command("show")
@@ -1667,15 +1833,33 @@ def mcp_add(name: str, endpoint: list[str] = typer.Option([], "--endpoint", help
             source: list[str] = typer.Option([], "--source", help="SQL source to expose (repeatable)."),
             table: list[str] = typer.Option([], "--table", help="Table the exposed sources may be queried on."),
             load: list[str] = typer.Option([], "--load", help="Load to expose as run_load_<name>."),
+            report: list[str] = typer.Option([], "--report", help="Report to expose as run_report_<name>."),
+            fs: list[str] = typer.Option([], "--fs", help="ROOT[:op,op] folder to expose as fs_<op> tools "
+                                                         "(default ops list,stat,read), e.g. reports:list,read"),
             scope: list[str] = typer.Option([], "--scope", help="Scope of the principal used for tool calls."),
             transport: str = typer.Option("stdio", help="stdio | http"), description: str = "",
             replace: bool = False, config: str = CONFIG_OPT):
     """Define an MCP server. Sources are read-only; --table limits what can be queried."""
     _run(_svc(config).agents.set, "mcp", name, {
         "description": description, "transport": transport, "scopes": scope,
-        "expose": {"endpoints": endpoint, "loads": load,
+        "expose": {"endpoints": endpoint, "loads": load, "reports": report,
+                   "filesystem": [_fs_expose(f) for f in fs],
                    "sources": [{"name": s, "tables": table, "read_only": True} for s in source]}}, replace)
     _ok(f"MCP server '{name}' saved. See its tools: portwright mcp tools {name}")
+
+
+def _fs_expose(value: str) -> dict:
+    """'reports' / 'reports:list,read' / 'dest:finance:copy'"""
+    if value.startswith("dest:"):
+        rest = value[5:]
+        name, _, ops = rest.partition(":")
+        root = f"dest:{name}"
+    else:
+        root, _, ops = value.partition(":")
+    out: dict = {"root": root}
+    if ops:
+        out["ops"] = [o for o in ops.split(",") if o]
+    return out
 
 
 @mcp_app.command("tools")
