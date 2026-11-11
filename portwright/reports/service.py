@@ -32,9 +32,15 @@ class ReportResult:
     def format(self) -> str:
         return self.outputs[0].format
 
+    @property
+    def exit_code(self) -> int:
+        """For schedulers: 0 done, 2 done with warnings (e.g. rows cut off at max_rows). Failures raise."""
+        return 2 if self.warnings else 0
+
     def to_dict(self) -> dict:
         return {"report": self.name, "outputs": [o.to_dict() for o in self.outputs], "row_count": self.row_count,
-                "seconds": self.seconds, "truncated": self.truncated, "warnings": self.warnings}
+                "seconds": self.seconds, "truncated": self.truncated, "warnings": self.warnings,
+                "exit_code": self.exit_code}
 
 
 @dataclass

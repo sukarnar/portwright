@@ -1233,18 +1233,24 @@ def report_run(
     param: list[str] = typer.Option([], "--param", "-p", help="NAME=VALUE params passed to the data source (repeatable)."),
     var: list[str] = typer.Option([], "--var", help="NAME=VALUE extra template variable (repeatable)."),
     open_: bool = typer.Option(False, "--open", help="Open the output file after rendering."),
+    as_json: bool = typer.Option(False, "--json", help="Print the result as JSON (outputs, rows, warnings)."),
     config: str = CONFIG_OPT,
 ):
-    """Render a report to its formats (default PDF; override with --format or --html)."""
+    """Render a report to its formats (default PDF; override with --format or --html).
+
+    Exit code: 0 done, 1 failed, 2 done with warnings (e.g. rows cut off at max_rows)."""
     svc = _svc(config)
     result = _run(svc.reports.run, name,
                   output=output, as_html=html, formats=_formats(fmt) or None,
                   params=_kv(param), extra_vars=_kv(var) if var else None)
-    _ok(f"Report '{name}': {result.row_count} rows, {result.seconds}s")
-    for o in result.outputs:
-        typer.echo(f"  {o.format:<5} {o.path}  ({o.bytes:,} bytes)")
-    for w in result.warnings:
-        typer.secho(f"  warning: {w}", fg=typer.colors.YELLOW)
+    if as_json:
+        typer.echo(json.dumps(result.to_dict(), indent=2, default=str))
+    else:
+        _ok(f"Report '{name}': {result.row_count} rows, {result.seconds}s")
+        for o in result.outputs:
+            typer.echo(f"  {o.format:<5} {o.path}  ({o.bytes:,} bytes)")
+        for w in result.warnings:
+            typer.secho(f"  warning: {w}", fg=typer.colors.YELLOW)
     if open_:
         import subprocess, sys
         if sys.platform == "win32":
@@ -1253,6 +1259,7 @@ def report_run(
             subprocess.Popen(["open", str(result.output_path)])
         else:
             subprocess.Popen(["xdg-open", str(result.output_path)])
+    raise typer.Exit(result.exit_code)
 
 
 @report_app.command("template")
@@ -1831,7 +1838,10 @@ def workflow_templates(name: str = typer.Argument(None, help="Show this template
 @workflow_app.command("run")
 def workflow_run(name: str, input: list[str] = typer.Option([], "--input", "-i", help="Workflow input KEY=VALUE."),
                  as_json: bool = typer.Option(False, "--json"), config: str = CONFIG_OPT):
-    """Run a workflow; ${input.KEY} in its steps reads the --input values."""
+    """Run a workflow; ${input.KEY} in its steps reads the --input values.
+
+    Exit code: 0 done, 1 failed, 2 done with warnings (a step failed under on_error: continue,
+    foreach items failed, or a report hit max_rows)."""
     r = _run(_svc(config).agents.run_workflow, name, _kv(input))
     if as_json:
         typer.echo(json.dumps(r.to_dict(), indent=2, default=str))
@@ -1840,9 +1850,12 @@ def workflow_run(name: str, input: list[str] = typer.Option([], "--input", "-i",
             typer.echo(f"  {s.id:<14} {s.type:<9} {'ok' if s.ok else 'FAILED ' + s.error}")
         out = r.output if isinstance(r.output, str) else json.dumps(r.output, indent=2, default=str)
         typer.echo(out)
-        typer.secho(f"[{r.status} - run {r.run_id}]", dim=True)
+        for w in r.warnings:
+            typer.secho(f"  warning: {w}", fg=typer.colors.YELLOW)
+        typer.secho(f"[{r.status}{' with warnings' if r.ok and r.warnings else ''} - run {r.run_id}]", dim=True)
     if not r.ok:
         _fail(Exception(r.error))
+    raise typer.Exit(r.exit_code)
 
 
 @workflow_app.command("remove")
