@@ -111,6 +111,10 @@ def test_docs_topics_search_reference_cli():
     for t in docs.topics()[:-1]:
         assert t.studio and t.cli, t.slug               # every topic explains Studio and the CLI
         assert "```" in t.cli, t.slug                   # ... with CLI examples
+    dupes = sorted({s for s in slugs if slugs.count(s) > 1})
+    assert not dupes, f"topics in more than one docs file: {dupes}"   # left behind by a renumbering
+    numbers = [p.name[:2] for p in sorted(docs.DOCS_DIR.glob("[0-9][0-9]-*.md"))]
+    assert len(numbers) == len(set(numbers)), f"two docs files share a number: {numbers}"
     assert any(s == "scheduling" for s, _, _ in docs.search("exit code stonebranch"))
     ref = docs.get("cli-reference").cli
     assert "**portwright load run**" in ref and "`--force`" in ref and "**portwright endpoint add**" in ref
