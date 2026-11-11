@@ -287,11 +287,49 @@ internals (for example `''.__class__`). PDF rendering only loads images and styl
 inline (`data:` URLs) or files inside the template's own folder; `http(s)://` URLs, network shares and
 files elsewhere are skipped. Put logos and CSS next to the template, e.g. `templates/img/logo.png`.
 
+### PDF backend
+
+PDFs come from **WeasyPrint** when it works, otherwise from **xhtml2pdf**:
+
+| Backend | CSS | Install |
+|---|---|---|
+| WeasyPrint | full: flex, grid, `@page` headers and page numbers | `pip install portwright[reports]`, plus the GTK/Pango libraries on Windows |
+| xhtml2pdf | limited: simple tables and blocks, no flex/grid | `pip install xhtml2pdf` (pure Python, works anywhere) |
+
+Check which one this machine uses:
+
+```powershell
+portwright doctor            # Python, PDF backends, add-ons; inside a project also what it needs
+portwright doctor --json     # the same as JSON (for scripts and monitoring)
+```
+
+`doctor` exits with code 1 when something the project uses cannot work, such as PDF reports with
+no working backend. `portwright validate` warns about the same thing.
+
+**WeasyPrint on Windows.** `pip` installs WeasyPrint itself, but it also needs the Pango libraries,
+which pip cannot install:
+
+1. Install [MSYS2](https://www.msys2.org/) (default folder `C:\msys64`).
+2. In the MSYS2 shell: `pacman -S mingw-w64-x86_64-pango`
+3. Point WeasyPrint at the libraries, for this user or in the service account's environment:
+
+   ```powershell
+   setx WEASYPRINT_DLL_DIRECTORIES C:\msys64\mingw64\bin
+   ```
+
+4. Open a new terminal (or restart the service) and run `portwright doctor` again.
+
+On a server where you cannot install MSYS2, `pip install xhtml2pdf` is enough. Keep templates simple
+(tables, no flex or grid) so they look the same with either backend. The AI author already does;
+the built-in `invoice`, `summary_dashboard` and `financial_accounting` templates use flex for their
+header and KPI cards, which xhtml2pdf stacks vertically.
+
 ### Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `cannot load library libgobject-2.0-0` | WeasyPrint needs GTK. Install xhtml2pdf (`pip install xhtml2pdf`) – portwright falls back to it automatically |
+| `cannot load library libgobject-2.0-0` | WeasyPrint needs GTK/Pango: see *PDF backend* above, or `pip install xhtml2pdf` – portwright falls back to it automatically |
+| PDF looks different on another machine | That machine uses the other backend: `portwright doctor` on both |
 | Image or stylesheet missing in the PDF | Move it into the template's folder; remote and outside files are blocked |
 | `format(s) ['pdf'] need a template` | Add `template:` or pick a data format (xlsx, csv, json, md) |
 | `Ignoring CSS: border-collapse` | xhtml2pdf limitation — use `border-spacing: 0` instead |

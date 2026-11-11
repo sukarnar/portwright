@@ -8,7 +8,9 @@ so a template cannot make the server fetch remote URLs.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -164,6 +166,67 @@ def _pisa_link_callback(base_dir: Path | None):
     return link
 
 
+@dataclass
+class PdfBackend:
+    """One PDF library and whether it can render here. ``detail`` says why not, or which version."""
+    name: str
+    ok: bool
+    detail: str
+    css: str            # how much CSS it supports, in a few words
+    installed: bool = True
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "ok": self.ok, "installed": self.installed, "detail": self.detail,
+                "css": self.css}
+
+
+_WEASY_FIX = ("WeasyPrint is installed but cannot load the GTK/Pango libraries. On Windows install MSYS2, "
+              "run 'pacman -S mingw-w64-x86_64-pango', and set WEASYPRINT_DLL_DIRECTORIES=C:\\msys64\\mingw64\\bin "
+              "(see 'portwright docs reports'). Until then PDFs use xhtml2pdf if it is installed.")
+
+
+def _probe_weasyprint() -> PdfBackend:
+    import contextlib
+    import io
+    css = "full CSS (flex, grid, @page)"
+    quiet = io.StringIO()                  # WeasyPrint prints a long banner when its libraries are missing
+    with contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
+        try:
+            import weasyprint  # type: ignore[import]
+        except ImportError:
+            return PdfBackend("weasyprint", False, "not installed (pip install weasyprint)", css, installed=False)
+        except OSError:                    # GTK/Pango missing: WeasyPrint fails while importing its libraries
+            return PdfBackend("weasyprint", False, _WEASY_FIX, css)
+        try:                               # some versions load the libraries lazily: render a tiny page to be sure
+            weasyprint.HTML(string="<p>ok</p>").write_pdf()
+        except OSError:
+            return PdfBackend("weasyprint", False, _WEASY_FIX, css)
+        except Exception as exc:           # pragma: no cover - unexpected library failure
+            return PdfBackend("weasyprint", False, f"test render failed: {exc}", css)
+    return PdfBackend("weasyprint", True, f"version {getattr(weasyprint, '__version__', '?')}", css)
+
+
+def _probe_xhtml2pdf() -> PdfBackend:
+    css = "limited CSS (no flex/grid, simple tables)"
+    try:
+        import xhtml2pdf  # type: ignore[import]
+        from xhtml2pdf import pisa  # type: ignore[import]  # noqa: F401
+    except ImportError:
+        return PdfBackend("xhtml2pdf", False, "not installed (pip install xhtml2pdf)", css, installed=False)
+    return PdfBackend("xhtml2pdf", True, f"version {getattr(xhtml2pdf, '__version__', '?')}", css)
+
+
+@lru_cache(maxsize=1)
+def pdf_backends() -> tuple[PdfBackend, ...]:
+    """Every PDF backend in the order render_pdf tries them. Cached: probing WeasyPrint renders a page."""
+    return (_probe_weasyprint(), _probe_xhtml2pdf())
+
+
+def active_pdf_backend() -> PdfBackend | None:
+    """The backend render_pdf will use, or None when no PDF can be made."""
+    return next((b for b in pdf_backends() if b.ok), None)
+
+
 def render_pdf(
     html: str,
     output_path: Path,
@@ -180,30 +243,28 @@ def render_pdf(
     if base_dir is None and base_url and base_url.startswith("file:"):
         base_dir = Path(url2pathname(unquote(urlparse(base_url).path)))
 
-    # Try WeasyPrint first (best quality)
-    try:
+    backend = active_pdf_backend()
+    # WeasyPrint first (best quality). Only a usable WeasyPrint is tried, so a real write error
+    # (output file open in a viewer, disk full) is reported instead of silently switching library.
+    if backend is not None and backend.name == "weasyprint":
         import weasyprint  # type: ignore[import]
         wp = weasyprint.HTML(string=html, base_url=(base_dir.resolve().as_uri() + "/") if base_dir else None,
                              url_fetcher=_weasy_fetcher(base_dir))
         wp.write_pdf(str(output_path))
         return output_path
-    except (ImportError, OSError):      # OSError: WeasyPrint is installed but the GTK/Pango libraries are missing
-        pass
 
-    # Fallback: xhtml2pdf
-    try:
+    if backend is not None and backend.name == "xhtml2pdf":
         from xhtml2pdf import pisa  # type: ignore[import]
         with open(output_path, "wb") as fh:
             result = pisa.CreatePDF(html, dest=fh, encoding="utf-8", link_callback=_pisa_link_callback(base_dir))
         if result.err:
             raise RuntimeError(f"xhtml2pdf error (code {result.err})")
         return output_path
-    except ImportError:
-        pass
 
     raise ImportError(
         "A PDF backend is required.  Install one of:\n"
         "    pip install weasyprint       (recommended – full CSS support)\n"
         "    pip install xhtml2pdf        (simpler; limited CSS; works without GTK)\n"
-        "On Windows WeasyPrint also needs the GTK3 runtime ('cannot load library libgobject-2.0-0')."
+        "On Windows WeasyPrint also needs the GTK/Pango libraries ('cannot load library libgobject-2.0-0'); "
+        "run 'portwright doctor' to see what is missing."
     )
