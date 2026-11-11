@@ -5,6 +5,7 @@ validated, atomic and backed up, and edits made elsewhere are detected.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 import shutil
@@ -13,6 +14,15 @@ from pathlib import Path
 
 from ..config import DEFAULT_CONFIG, ConfigError, ProjectConfig
 from ..credentials import CredentialManager, generate_master_key
+
+
+def file_fingerprint(path: Path) -> str | None:
+    """SHA-256 of a file's bytes (None when it is missing). Used instead of the modified time, which on Windows
+    can stay the same for two writes in quick succession and so miss an edit made elsewhere."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
 
 
 class ServiceError(Exception):
@@ -96,11 +106,13 @@ class Project:
 
     # ----------------------------------------------------------- load/save
     def reload(self) -> None:
+        # fingerprint first: an edit landing between the two reads then shows up as a change (safe side)
+        fingerprint = file_fingerprint(self.path)
         try:
             self.config = ProjectConfig.load(self.path)
         except ConfigError as exc:
             raise ServiceError(str(exc)) from None
-        self._mtime = self.path.stat().st_mtime
+        self._fingerprint = fingerprint
         self._last_good = self.config.model_copy(deep=True)
         try:                                  # log edits made to the file outside Portwright
             self.activity.check_external(self.config, ProjectConfig)
@@ -119,10 +131,7 @@ class Project:
         self.config = self._last_good.model_copy(deep=True)
 
     def changed_on_disk(self) -> bool:
-        try:
-            return self.path.stat().st_mtime != self._mtime
-        except FileNotFoundError:
-            return True
+        return file_fingerprint(self.path) != self._fingerprint
 
     def save(self, force: bool = False) -> None:
         """Validate the whole document, keep a .bak of the previous version, write atomically."""
@@ -141,11 +150,12 @@ class Project:
         os.close(fd)
         try:
             self.config.save(tmp)
+            written = file_fingerprint(Path(tmp))         # what we wrote, not whatever is there a moment later
             os.replace(tmp, self.path)
         finally:
             if os.path.exists(tmp):
                 os.unlink(tmp)
-        self._mtime = self.path.stat().st_mtime
+        self._fingerprint = written
         self._last_good = self.config.model_copy(deep=True)
         self.audit("config_saved", file=self.path.name)
         try:                                  # what changed, who did it, and the pw command for it

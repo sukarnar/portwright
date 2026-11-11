@@ -88,6 +88,26 @@ def test_save_is_atomic_backed_up_and_detects_outside_edits(svc):
     assert p.config.project == "renamed"
 
 
+def test_outside_edit_with_same_size_and_mtime_is_detected(svc):
+    import os
+    p = svc.project
+    p.config.project = "renamed"
+    p.save()
+    st = p.path.stat()
+    text = p.path.read_text()
+    p.path.write_text(text.replace("renamed", "RENAMED"))                  # same length
+    os.utime(p.path, ns=(st.st_atime_ns, st.st_mtime_ns))                  # same modified time
+    assert p.path.stat().st_size == st.st_size and p.path.stat().st_mtime_ns == st.st_mtime_ns
+    assert p.changed_on_disk()
+    p.config.project = "again"
+    with pytest.raises(ServiceError, match="changed outside"):
+        p.save()
+    p.reload()
+    assert p.config.project == "RENAMED"
+    os.utime(p.path)                                                        # touched, content unchanged
+    assert not p.changed_on_disk()
+
+
 def test_invalid_save_is_refused_and_file_untouched(svc):
     before = svc.project.path.read_text()
     with pytest.raises(ServiceError):
