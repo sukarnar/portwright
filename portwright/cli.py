@@ -1417,6 +1417,35 @@ def validate(config: str = CONFIG_OPT):
 
 
 @app.command()
+def doctor(config: str = CONFIG_OPT,
+           as_json: bool = typer.Option(False, "--json", help="Print the checks as JSON.")):
+    """Check this machine: Python, the PDF backend reports will use, and the optional add-ons.
+
+    Inside a project it also checks what that project needs (e.g. PDF reports need a working PDF backend).
+    Exit code 1 when something the project uses cannot work."""
+    import json as _json
+    from .doctor import run_checks
+    cfg = None
+    if Path(config).is_file():
+        try:
+            cfg = ProjectConfig.load(config)
+        except ConfigError as exc:
+            typer.secho(f"⚠ {config} has errors, so project checks are skipped: {exc}", fg="yellow")
+    checks = run_checks(cfg)
+    if as_json:
+        typer.echo(_json.dumps([c.to_dict() for c in checks], indent=2))
+    else:
+        marks = {"ok": ("✓", "green"), "warn": ("⚠", "yellow"), "fail": ("✗", "red"), "off": ("–", None)}
+        width = max(len(c.name) for c in checks)
+        for c in checks:
+            mark, colour = marks[c.status]
+            typer.secho(f"{mark} {c.name.ljust(width)}  {c.detail}", fg=colour)
+        if cfg is None:
+            typer.echo(f"(no project at {config}: project checks skipped)")
+    raise typer.Exit(1 if any(c.status == "fail" for c in checks) else 0)
+
+
+@app.command()
 def call(
     endpoint: str = typer.Argument(..., help="Endpoint name (see 'portwright endpoint list')."),
     param: list[str] = typer.Option([], "--param", "-p", help="NAME=VALUE (repeatable): path, query or body param."),

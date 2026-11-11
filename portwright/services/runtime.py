@@ -52,6 +52,16 @@ class RuntimeService:
         if unpromoted:
             warnings.append(f"reports using AI templates outside git ({ai_dir}): {', '.join(unpromoted)} - "
                             "they won't exist in another checkout; run 'portwright report promote <name>'")
+        pdf = [r.name for r in cfg.reports if "pdf" in r.effective_formats()]
+        if pdf:
+            from ..reports.engine import active_pdf_backend
+            backend = active_pdf_backend()
+            if backend is None:
+                warnings.append(f"no PDF backend works on this machine, so these reports cannot make PDFs: "
+                                f"{', '.join(pdf)} - run 'portwright doctor'")
+            elif backend.name != "weasyprint":
+                warnings.append(f"PDFs use {backend.name} ({backend.css}) because WeasyPrint is not usable - "
+                                "run 'portwright doctor'")
         return Validation(True, f"{len(cfg.endpoints)} endpoints across {len(cfg.sources)} sources are valid",
                           warnings)
 
