@@ -83,6 +83,13 @@ Every step can say where to go with `next: <step id>` (or `end`); without it the
 list runs. Conditions use `then` and `else`. The visual editor writes all of these, plus the node position
 (`x`, `y`), so the picture is exactly what runs.
 
+**Step order in the visual editor.** The connectors decide the order, not the order steps were added:
+- each step shows its number in run order; a step with **–** isn't reached from the start;
+- the saved list follows that order, keeping each branch of a condition or switch together (the *then* branch,
+  then the *else* branch);
+- linking a step in front of the start makes it the new start; **Make start** sets it by hand;
+- **Tidy layout** lays the steps out left to right in that order.
+
 **Input and output steps.** A step of type `input` declares what the workflow is run with; an `output` step
 returns the result and ends the workflow:
 
