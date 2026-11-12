@@ -107,6 +107,70 @@ class AgentService:
             raise
         return created + [f"agent {name}"]
 
+    # ------------------------------------------------------------- library
+    def library(self, kind: str | None = None, category: str | None = None, query: str | None = None,
+                use: str | None = None) -> list[dict]:
+        from ..agents import library as lib
+        try:
+            return [i.to_dict() for i in lib.items(kind, category, query, use)]
+        except lib.LibraryError as exc:
+            raise ServiceError(str(exc)) from None
+
+    def library_item(self, ref: str, kind: str | None = None) -> dict:
+        """One library item by 'kind/id', a unique id, or (with *kind*) an id of that kind."""
+        from ..agents import library as lib
+        try:
+            return (lib.get(kind, ref) if kind else lib.find(ref)).to_dict()
+        except lib.LibraryError as exc:
+            raise ServiceError(str(exc)) from None
+
+    def add_skill_from_library(self, item_id: str, name: str | None = None, file: str | None = None,
+                               replace: bool = False) -> str:
+        """Copy a library skill into the project (skills/<name>.md) and register it. Returns the skill name."""
+        it = self.library_item(item_id, "skill")
+        name = name or it["id"]
+        file = file or f"skills/{name}.md"
+        path = self._skill_path(file)
+        if path.exists() and not replace:
+            raise ServiceError(f"{file} already exists; use replace to overwrite it, or choose another name")
+        if name in self.cfg.skills and not replace:
+            raise ServiceError(f"skill '{name}' already exists")
+        self.save_skill_file(file, f"<!-- from the portwright library: skill/{it['id']} -->\n" + it["text"])
+        self.set("skill", name, {"file": file, "description": it["description"]}, replace=True)
+        return name
+
+    def add_tool_from_library(self, item_id: str, name: str | None = None, *, sql_source: str | None = None,
+                              endpoint: str | None = None, destination: str | None = None,
+                              replace: bool = False) -> str:
+        """Add a sample tool, filling in what it needs from this project. Returns the tool name."""
+        from ..agents import library as lib
+        it = lib.get("tool", item_id) if item_id in {i.id for i in lib.items("tool")} else None
+        if it is None:
+            raise ServiceError(self._lib_missing("tool", item_id))
+        choices = {k: v for k, v in {"sql_source": sql_source, "endpoint": endpoint,
+                                     "destination": destination}.items() if v}
+        if not choices.get("sql_source") and "sql_source" in it.needs:
+            sql = [n for n, s in self.cfg.sources.items() if s.type == "sql"]
+            if len(sql) == 1:
+                choices["sql_source"] = sql[0]                 # the only choice
+        if not choices.get("destination") and "destination" in it.needs and len(self.cfg.destinations) == 1:
+            choices["destination"] = next(iter(self.cfg.destinations))
+        try:
+            data = lib.tool_spec(it, choices)
+        except lib.LibraryError as exc:
+            raise ServiceError(str(exc)) from None
+        name = name or it.name
+        self.set("tool", name, data, replace)
+        return name
+
+    def prompt_text(self, item_id: str) -> str:
+        return self.library_item(item_id, "prompt")["text"].strip()
+
+    @staticmethod
+    def _lib_missing(kind: str, item_id: str) -> str:
+        from ..agents import library as lib
+        return f"no library {kind} '{item_id}'; available: {', '.join(i.id for i in lib.items(kind))}"
+
     def workflow_inputs(self, name: str) -> dict[str, dict]:
         """Inputs declared by the workflow's input node(s): {name: {default, required, description}}."""
         out: dict[str, dict] = {}

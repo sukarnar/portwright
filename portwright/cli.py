@@ -1762,7 +1762,11 @@ def tool_list(config: str = CONFIG_OPT):
 
 
 @tool_app.command("add")
-def tool_add(name: str, type: str = typer.Option(..., "--type", "-t", help="endpoint | source | mcp | filesystem | report"),
+def tool_add(name: str, type: Optional[str] = typer.Option(None, "--type", "-t",
+                                                           help="endpoint | source | mcp | filesystem | report"),
+             from_: Optional[str] = typer.Option(None, "--from", help="Start from a library sample tool (see: "
+                                                                       "portwright library list --kind tool)."),
+             destination: Optional[str] = typer.Option(None, help="--from samples that deliver: a destination."),
              endpoint: Optional[str] = None, source: Optional[str] = None,
              server: Optional[str] = typer.Option(None, help="type mcp: an MCP server name."),
              write: bool = typer.Option(False, help="type source: allow non-SELECT statements (writable source)."),
@@ -1774,7 +1778,15 @@ def tool_add(name: str, type: str = typer.Option(..., "--type", "-t", help="endp
              model: Optional[str] = typer.Option(None, help="type report: model for 'design' and data access."),
              description: str = "", replace: bool = False, config: str = CONFIG_OPT):
     """Define a tool. endpoint: API call through the full pipeline; source: SQL; mcp: an MCP server's tools;
-    filesystem: <name>_<op> tools on the given roots; report: <name>_<op> report tools."""
+    filesystem: <name>_<op> tools on the given roots; report: <name>_<op> report tools.
+    --from <sample> fills everything from a library sample (give --source / --endpoint / --destination it needs)."""
+    if from_:
+        made = _run(_svc(config).agents.add_tool_from_library, from_, name, sql_source=source, endpoint=endpoint,
+                    destination=destination, replace=replace)
+        _ok(f"Tool '{made}' added from the library sample '{from_}'")
+        return
+    if not type:
+        raise typer.BadParameter("give --type, or --from <library sample tool>")
     data: dict = {"type": type, "endpoint": endpoint, "source": source, "server": server, "read_only": not write,
                   "max_rows": max_rows, "description": description}
     if type in ("filesystem", "report"):
@@ -1796,10 +1808,20 @@ def skill_list(config: str = CONFIG_OPT):
 
 
 @skill_app.command("add")
-def skill_add(name: str, file: str = typer.Option(..., help="Markdown file inside the project, e.g. skills/audit.md"),
+def skill_add(name: str, file: Optional[str] = typer.Option(None, help="Markdown file inside the project, e.g. "
+                                                                         "skills/audit.md (default with --from: "
+                                                                         "skills/<name>.md)"),
+              from_: Optional[str] = typer.Option(None, "--from", help="Copy a library skill into the project "
+                                                                        "(see: portwright library list --kind skill)."),
               description: str = "", replace: bool = False, config: str = CONFIG_OPT):
-    """Register a skill file (optional front-matter: description)."""
+    """Register a skill file (optional front-matter: description), or copy one from the library with --from."""
     svc = _svc(config)
+    if from_:
+        _run(svc.agents.add_skill_from_library, from_, name, file, replace)
+        _ok(f"Skill '{name}' added from the library ({file or f'skills/{name}.md'}); edit the file to suit")
+        return
+    if not file:
+        raise typer.BadParameter("give --file (a markdown file in the project) or --from <library skill>")
     _run(svc.agents.set, "skill", name, {"file": file, "description": description}, replace)
     for problem in svc.agents.validate():
         if problem.startswith(f"skill '{name}'"):
@@ -1822,6 +1844,9 @@ def agent_list(config: str = CONFIG_OPT):
 @agent_app.command("add")
 def agent_add(name: str, model: str = typer.Option(..., help="A model name (see 'portwright model list')."),
               instructions: str = typer.Option("", help="System prompt."),
+              prompt: Optional[str] = typer.Option(None, "--prompt", help="Use a library system prompt as the "
+                                                                           "instructions (see: portwright library "
+                                                                           "list --kind prompt)."),
               tool: list[str] = typer.Option([], "--tool", help="Tool the agent may use (repeatable)."),
               skill: list[str] = typer.Option([], "--skill", help="Skill the agent may read (repeatable)."),
               scope: list[str] = typer.Option([], "--scope", help="Scope of the principal used for tool calls."),
@@ -1829,12 +1854,28 @@ def agent_add(name: str, model: str = typer.Option(..., help="A model name (see 
               budget: Optional[int] = typer.Option(None, help="Stop after this many total tokens."),
               timeout: float = typer.Option(300, help="Seconds."), description: str = "",
               replace: bool = False, config: str = CONFIG_OPT):
-    """Define an agent."""
-    _run(_svc(config).agents.set, "agent", name, {
+    """Define an agent. --prompt takes its instructions from the library (edit them later with --replace)."""
+    svc = _svc(config)
+    lib = None
+    if prompt:
+        if instructions:
+            raise typer.BadParameter("give --instructions or --prompt, not both")
+        lib = _run(svc.agents.library_item, prompt, "prompt")
+        instructions = lib["text"].strip()
+        description = description or lib["description"]
+    _run(svc.agents.set, "agent", name, {
         "model": model, "instructions": instructions, "tools": tool, "skills": skill, "scopes": scope,
         "max_steps": max_steps, "max_tokens_budget": budget, "timeout_seconds": timeout,
         "description": description}, replace)
     _ok(f"Agent '{name}' saved. Run it: portwright agent run {name} \"your task\"")
+    if lib:
+        missing_skills = [s for s in lib.get("skills", []) if s not in skill]
+        if lib.get("tools"):
+            typer.echo(f"  The prompt works best with tools like: {', '.join(lib['tools'])} "
+                       f"(portwright tool add <name> --from <sample>)")
+        if missing_skills:
+            typer.echo(f"  ...and the skills: {', '.join(missing_skills)} "
+                       f"(portwright skill add <name> --from <skill>, then --skill <name>)")
 
 
 @agent_app.command("templates")
@@ -2016,6 +2057,72 @@ def mcp_serve(name: str, transport: Optional[str] = typer.Option(None, help="std
 def mcp_remove(name: str, config: str = CONFIG_OPT):
     """Remove an MCP server definition."""
     _remove_kind("mcp", name, config)
+
+
+# -------------------------------------------------------------------------------- library
+library_app = typer.Typer(help="Built-in system prompts, skills and sample tools to start agents and workflow steps "
+                               "from.", no_args_is_help=True)
+app.add_typer(library_app, name="library")
+
+
+@library_app.command("list")
+def library_list(kind: Optional[str] = typer.Option(None, "--kind", "-k", help="prompt | skill | tool"),
+                 category: Optional[str] = typer.Option(None, "--category", help="e.g. reports, data, quality"),
+                 search: Optional[str] = typer.Option(None, "--search", "-s", help="Only items with these words."),
+                 use: Optional[str] = typer.Option(None, "--use", help="Prompts for: agent | llm"),
+                 config: str = CONFIG_OPT):
+    """List the library. Use an item with: agent add --prompt, skill add --from, tool add --from, or copy the
+    text of 'library show <id> --text' into an LLM step's system prompt."""
+    from .agents import library as lib
+    try:
+        found = lib.items(kind, category, search, use)
+    except lib.LibraryError as exc:
+        _fail(exc)
+    if not found:
+        typer.echo("Nothing in the library matches.")
+    current = None
+    for it in found:
+        if it.kind != current:
+            current = it.kind
+            typer.secho({"prompt": "System prompts", "skill": "Skills", "tool": "Sample tools"}[it.kind], bold=True)
+        extra = (f"  [{'/'.join(it.use)}{', JSON' if it.output == 'json' else ''}]" if it.kind == "prompt"
+                 else f"  [needs {', '.join(it.needs)}]" if it.needs else "")
+        typer.echo(f"  {it.id:<24} {it.category:<9} {it.description}{extra}")
+
+
+@library_app.command("show")
+def library_show(ref: str = typer.Argument(..., help="An id, or kind/id when two kinds share it (prompt/x)."),
+                 text: bool = typer.Option(False, "--text", help="Print only the prompt or skill text."),
+                 config: str = CONFIG_OPT):
+    """Show a library item: what it is for, what it works with, and its text."""
+    from .agents import library as lib
+    try:
+        it = lib.find(ref)
+    except lib.LibraryError as exc:
+        _fail(exc)
+    if text:
+        typer.echo(it.text.rstrip() if it.kind != "tool" else yaml.safe_dump(it.spec, sort_keys=False).rstrip())
+        return
+    typer.secho(f"{it.title}  ({it.kind}/{it.id}, {it.category})", bold=True)
+    typer.echo(it.description)
+    if it.kind == "prompt":
+        typer.echo(f"Use as: {' or '.join({'agent': 'agent instructions', 'llm': 'LLM step system prompt'}[u] for u in it.use)}"
+                   + (" - replies in JSON (set format: json on an LLM step)" if it.output == "json" else ""))
+        if it.tools:
+            typer.echo(f"Works with tools: {', '.join(it.tools)}")
+        if it.skills:
+            typer.echo(f"Works with skills: {', '.join(it.skills)}")
+        if it.example_input:
+            typer.echo(f"Example input: {it.example_input}")
+        typer.echo(f"\nAdd it: portwright agent add <name> --model <model> --prompt {it.id}\n")
+    elif it.kind == "skill":
+        typer.echo(f"\nAdd it: portwright skill add <name> --from {it.id}\n")
+    else:
+        needs = " ".join(f"--{n.replace('sql_source', 'source')} <{n}>" for n in it.needs)
+        typer.echo(f"\nAdd it: portwright tool add {it.name} --from {it.id} {needs}".rstrip() + "\n")
+        typer.echo(yaml.safe_dump(it.spec, sort_keys=False).rstrip())
+        return
+    typer.echo(it.text.rstrip())
 
 
 # ----------------------------------------------------------------------------------- mail
