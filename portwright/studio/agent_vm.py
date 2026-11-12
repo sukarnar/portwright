@@ -163,6 +163,53 @@ def save_item(svc: Services, kind: str, values: dict, editing: bool) -> list[str
     return warnings + problems
 
 
+# ------------------------------------------------------------------ library
+LIBRARY_KIND = {"agent": "prompt", "skill": "skill", "tool": "tool"}     # Agents tab -> library kind
+NEED_LABELS = {"sql_source": "SQL source", "endpoint": "Endpoint", "destination": "Destination"}
+
+
+def library_options(svc: Services, kind: str, use: str | None = None) -> dict[str, str]:
+    """{id: 'Title - category'} of the library items for an Agents tab (agent -> prompts), or LLM steps (use)."""
+    lib_kind = LIBRARY_KIND.get(kind, kind)
+    return {i["id"]: f"{i['title']} - {i['category']}" for i in svc.agents.library(lib_kind, use=use)}
+
+
+def need_choices(svc: Services, needs: list[str]) -> dict[str, list[str]]:
+    """What a sample tool asks for, with this project's options."""
+    cfg = svc.project.config
+    pools = {"sql_source": [n for n, s in cfg.sources.items() if s.type == "sql"],
+             "endpoint": [e.name for e in cfg.endpoints], "destination": sorted(cfg.destinations)}
+    return {n: pools[n] for n in needs}
+
+
+def add_from_library(svc: Services, kind: str, item_id: str, name: str, *, model: str | None = None,
+                     picks: dict[str, str] | None = None, with_skills: bool = False) -> list[str]:
+    """Create a skill, tool or agent from a library item. Returns what was created (for the toast)."""
+    name = (name or "").strip()
+    if not name:
+        raise ServiceError("Name is required")
+    if kind == "skill":
+        return [f"skill {svc.agents.add_skill_from_library(item_id, name)}"]
+    if kind == "tool":
+        picks = {k: v for k, v in (picks or {}).items() if v}
+        return [f"tool {svc.agents.add_tool_from_library(item_id, name, **picks)}"]
+    if kind != "agent":
+        raise ServiceError(f"nothing in the library for '{kind}'")
+    if not model:
+        raise ServiceError("Choose a model (add one on the Models tab first)")
+    item = svc.agents.library_item(item_id, "prompt")
+    created, skills = [], []
+    if with_skills:
+        for s in item.get("skills", []):
+            if s not in svc.project.config.skills:
+                svc.agents.add_skill_from_library(s, s)
+                created.append(f"skill {s}")
+            skills.append(s)
+    svc.agents.set("agent", name, {"model": model, "instructions": item["text"].strip(),
+                                   "description": item["description"], "skills": skills})
+    return created + [f"agent {name}"]
+
+
 # ------------------------------------------------------------------ choices
 def choices(svc: Services) -> dict[str, list[str]]:
     cfg = svc.project.config

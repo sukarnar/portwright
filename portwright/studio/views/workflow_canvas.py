@@ -401,12 +401,31 @@ class WorkflowCanvas:
         return bind(field, dropdown(label, options, getattr(n, field) or None))
 
     def _llm_fields(self, n: gv.Node, bind) -> list[ft.Control]:
+        f_input = bind("input", text_field("Prompt", n.input, multiline=True, min_lines=3,
+                                           hint="e.g. Summarise ${steps.pull.output}"))
+        f_system = bind("system", text_field("System prompt (optional)", n.system, multiline=True, min_lines=2))
+        f_format = bind("format", dropdown("Reply as", {"text": "Plain text", "json": "JSON (parsed for later steps)"},
+                                           n.format or "text"))
+        try:
+            prompts = {i["id"]: f"{i['title']} - {i['category']}" for i in self.svc.library("prompt", use="llm")}
+        except ServiceError:
+            prompts = {}
+        f_lib = dropdown("System prompt from the library", {"": "(write my own)", **prompts}, "")
+
+        def use_prompt(_):
+            if not f_lib.value:
+                return
+            it = self.svc.library_item(f_lib.value, "prompt")
+            n.system = f_system.value = it["text"].strip()
+            n.format = f_format.value = "json" if it.get("output") == "json" else "text"
+            if not (n.input or "").strip() and it.get("example_input"):
+                n.input = f_input.value = it["example_input"]       # a starting point to edit
+            _touch(f_system, f_format, f_input)
+            self.refresh_card(n)
+            self.show_problems()
+        f_lib.on_select = use_prompt
         return [self._pick(n, bind, "model", "Model", self.models, "No models yet. Add one on the Models tab."),
-                bind("input", text_field("Prompt", n.input, multiline=True, min_lines=3,
-                                         hint="e.g. Summarise ${steps.pull.output}")),
-                bind("system", text_field("System prompt (optional)", n.system, multiline=True, min_lines=2)),
-                bind("format", dropdown("Reply as", {"text": "Plain text", "json": "JSON (parsed for later steps)"},
-                                        n.format or "text"))]
+                f_lib, f_input, f_system, f_format]
 
     _SETTINGS_HELP = {
         "report_design": "report: the report to design (it is created when it does not exist; then add from: "

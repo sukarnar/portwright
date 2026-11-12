@@ -243,6 +243,36 @@ the source files) and **Files** nodes, each with its own form:
 into a dated folder with a manifest) and `ask-for-a-report` (pass a request to a report-author agent).
 Their tool, agent, model, load and report steps are left blank for you to pick (a single choice is filled in).
 
+**Library.** Ready-made pieces to start agents and workflow steps from. Each is copied into your project when
+you use it, so edit it freely; upgrading portwright never changes what you copied.
+
+| System prompt | For | Replies |
+|---|---|---|
+| `report-summary` | executive summary of a report's rows | text |
+| `report-commentary-json` | headline, highlights, risks, actions for later steps | JSON |
+| `email-draft` | the body of the email that delivers a report | text |
+| `data-analyst` | agent answering questions with SQL / endpoint tools | text |
+| `extract-fields` | named fields out of free text | JSON |
+| `anomaly-check` | flags suspicious rows; branch on `flagged` | JSON |
+| `load-rejects-review` | why rows of a load were rejected, and the fix | text |
+| `classify-route` | one label from a list, for a `switch` step | JSON |
+| `draft-reviewer` | checks a draft against the facts: `approved`, `issues`, `revised` | JSON |
+| `file-triage` | agent that says what each inbox file is and where it goes | text |
+| `report-author` | agent that builds, checks and saves a report (used by the agent template) | text |
+
+**Skills:**
+- `safe-sql`, `report-layout` and `kpi-glossary` (a template to fill in with your own KPI definitions);
+- `data-quality-checks`, `json-replies`, `writing-for-business` and `untrusted-data`.
+
+**Sample tools:**
+- `sql-readonly` (needs a SQL source) and `api-lookup` (needs an endpoint);
+- `report-runner`, `report-author-kit` and `report-outputs-reader`;
+- `inbox-reader`, and `share-delivery` (needs a destination).
+
+Every prompt tells the model to treat data as data, never as instructions. JSON prompts spell out the exact
+object, so set `format: json` on the LLM step and later steps can use `${steps.<id>.output.<field>}`. For example,
+`anomaly-check` with a condition on `${steps.check.output.flagged}`.
+
 <!-- studio -->
 ## In Studio
 
@@ -252,8 +282,14 @@ Open **Agents**. The tabs follow the order you build things in:
    certificate and (for mutual TLS) client certificate and key. The **plug** button makes one real call to
    prove URL, certificates and key work. The host is added to the allowed LLM hosts when you save.
 2. **Tools** > Add: pick an endpoint, a SQL source (SELECT only unless you allow writes) or an MCP server.
+   **From library** adds a sample tool and asks for what it needs (a SQL source, an endpoint, a destination).
 3. **Skills** > Add: a markdown playbook; write the text in the dialog and it is saved to the file.
+   **From library** copies a ready-made skill into `skills/`.
 4. **Agents** > Add: choose the model, tick tools and skills, set scopes and limits (steps, tokens, time).
+   **Instructions from the library** fills in a system prompt. **From library** creates the agent in one step,
+   with the skills the prompt works with if you tick that box, and shows which sample tools fit.
+   On the workflow canvas, an **LLM prompt** node has **System prompt from the library**: it fills in the
+   system prompt, sets *Reply as* to JSON for JSON prompts, and puts an example prompt in an empty prompt box.
    The **play** button runs it: tool calls appear as they happen, then the answer and a step table.
 5. **Workflows**: **Add visually** (or the tree icon on a row) opens the node editor: add Tool, Agent,
    Condition and Set nodes, drag them where you like, click an output port (blue = next, green = true,
@@ -282,6 +318,14 @@ portwright model test corp                                       # one real call
 portwright tool add employees -t endpoint --endpoint emp-list
 portwright tool add hr_sql -t source --source hr
 portwright skill add payroll_audit --file skills/payroll_audit.md
+
+portwright library list                                          # system prompts, skills, sample tools
+portwright library list --kind prompt --use llm                  # prompts for LLM steps
+portwright library show anomaly-check                            # what it is for, what it works with, its text
+portwright library show classify-route --text > prompts\route.txt   # just the text, to paste into a step
+portwright skill add sql_rules --from safe-sql                   # copied to skills\sql_rules.md
+portwright tool add sql --from sql-readonly --source hr
+portwright agent add analyst --model corp --prompt data-analyst --tool sql --skill sql_rules
 portwright agent add analyst --model corp --tool employees --tool hr_sql --skill payroll_audit `
   --scope emp:read --max-steps 8 --instructions "You are an HR data analyst."
 

@@ -6,8 +6,9 @@ import json
 import flet as ft
 
 from ...services import ServiceError
-from ..agent_vm import (KINDS, PROVIDERS, TOOL_TYPES, WORKFLOW_TEMPLATE, agent_steps_rows, choices,
-                        claude_desktop_config, item_values, lines, save_item, summary_rows, trace_rows)
+from ..agent_vm import (KINDS, LIBRARY_KIND, NEED_LABELS, PROVIDERS, TOOL_TYPES, WORKFLOW_TEMPLATE,
+                        add_from_library, agent_steps_rows, choices, claude_desktop_config, item_values,
+                        library_options, lines, need_choices, save_item, summary_rows, trace_rows)
 from ..common import Ctx, dropdown, empty, header, icon_btn, mono, table, tag, text_field, help_btn
 
 NONE = "(none)"
@@ -71,6 +72,10 @@ class AgentsView:
         if kind == "workflow":
             actions.append(ft.OutlinedButton("Add visually", icon=ft.Icons.ACCOUNT_TREE,
                                              on_click=lambda _: self.visual_editor(None)))
+        if kind in LIBRARY_KIND:
+            actions.append(ft.OutlinedButton("From library", icon=ft.Icons.LOCAL_LIBRARY,
+                                             tooltip="Start from a ready-made system prompt, skill or sample tool",
+                                             on_click=lambda _: self.library_dialog(kind)))
         if kind != "history":
             actions.append(ft.FilledButton("Add", icon=ft.Icons.ADD, on_click=lambda _: self.edit_dialog(kind)))
         controls: list[ft.Control] = [
@@ -147,6 +152,85 @@ class AgentsView:
                         [ft.TextButton("Cancel", on_click=lambda _: self.ctx.close()),
                          ft.FilledButton("Save", on_click=save)], width=width)
 
+    # --------------------------------------------------------- library
+    def library_dialog(self, kind: str) -> None:
+        """Pick a library prompt (-> agent), skill or sample tool, see its text, and add it to the project."""
+        svc = self.ctx.svc
+        try:
+            options = library_options(svc, kind)
+        except ServiceError as exc:
+            self.ctx.fail(exc)
+            return
+        ch = choices(svc)
+        f_item = dropdown({"agent": "System prompt", "skill": "Skill", "tool": "Sample tool"}[kind], options,
+                          next(iter(options), None), width=560)
+        f_name = text_field("Name", "", hint="letters, digits, - and _")
+        f_model = dropdown("Model *", ch["models"], (ch["models"] or [None])[0])
+        f_with = ft.Checkbox(label="Also add the skills it works with", value=True)
+        about = ft.Text("", size=13)
+        uses = _note("")
+        preview = text_field("Text", "", multiline=True, min_lines=8, max_lines=14, read_only=True)
+        picks_box = ft.Column(spacing=8)
+        picks: dict[str, ft.Dropdown] = {}
+
+        def show(_=None):
+            try:
+                it = svc.agents.library_item(f_item.value, LIBRARY_KIND[kind])
+            except ServiceError as exc:
+                self.ctx.fail(exc)
+                return
+            about.value = it["description"]
+            f_name.value = f_name.value if f_name.data else (it.get("name") or it["id"])
+            preview.value = it.get("text") or ""
+            hints = []
+            if kind == "agent":
+                if it.get("tools"):
+                    hints.append(f"Works with sample tools: {', '.join(it['tools'])} (Tools tab > From library)")
+                if it.get("skills"):
+                    hints.append(f"Skills: {', '.join(it['skills'])}")
+                if it.get("output") == "json":
+                    hints.append("Replies in JSON.")
+            uses.value = "  ·  ".join(hints)
+            picks.clear()
+            rows = []
+            for need, opts in need_choices(svc, it.get("needs", [])).items():
+                if not opts:
+                    rows.append(_note(f"This sample needs a {NEED_LABELS[need].lower()}; none is defined yet."))
+                    continue
+                picks[need] = dropdown(NEED_LABELS[need], opts, opts[0])
+                rows.append(picks[need])
+            if kind == "tool":
+                import yaml
+                preview.value = yaml.safe_dump(svc.agents.library_item(f_item.value, "tool")["spec"], sort_keys=False)
+            picks_box.controls = rows
+            self.ctx.page.update()
+
+        def named(_):
+            f_name.data = True                          # typed by the person: keep it when the item changes
+        f_name.on_change = named
+        f_item.on_select = show
+
+        def add(_):
+            try:
+                made = add_from_library(svc, kind, f_item.value, f_name.value, model=f_model.value,
+                                        picks={k: d.value for k, d in picks.items()}, with_skills=bool(f_with.value))
+            except ServiceError as exc:
+                self.ctx.fail(exc)
+                return
+            self.ctx.close()
+            self.ctx.toast("Added " + ", ".join(made) + (" - edit it to suit your data" if kind != "tool" else ""))
+            self.refresh()
+
+        body: list[ft.Control] = [f_item, about, uses, f_name]
+        if kind == "agent":
+            body += [f_model, f_with] if ch["models"] else [_note("No models yet - add one on the Models tab first.")]
+        body += [picks_box, preview]
+        self.ctx.dialog(f"Add {dict(KINDS)[kind].lower().rstrip('s')} from the library", body,
+                        [ft.TextButton("Cancel", on_click=lambda _: self.ctx.close()),
+                         ft.FilledButton("Add", icon=ft.Icons.ADD, on_click=add)], width=760)
+        if options:
+            show()
+
     def _form_model(self, v: dict, ch: dict):
         f_provider = dropdown("Provider", PROVIDERS, v.get("provider", "openai_compatible"))
         f_url = text_field("Base URL *", v.get("base_url", ""), hint="https://llm.corp.local/v1")
@@ -214,7 +298,23 @@ class AgentsView:
         f_desc = text_field("Description", v.get("description", ""))
         hint = (_note("No models yet – add one on the Models tab first.") if not ch["models"] else
                 _note("An agent can only call endpoints its scopes allow."))
-        return [f_model, f_instr, g_tools, g_skills, f_scopes, ft.Row([f_steps, f_budget, f_time]), f_desc, hint], \
+        try:
+            prompts = library_options(self.ctx.svc, "agent", use="agent")
+        except ServiceError:
+            prompts = {}
+        f_lib = dropdown("Instructions from the library (replaces the text below)", {"": "(keep my own)", **prompts},
+                         "")
+
+        def use_prompt(_):
+            if f_lib.value:
+                it = self.ctx.svc.agents.library_item(f_lib.value, "prompt")
+                f_instr.value = it["text"].strip()
+                if not (f_desc.value or "").strip():
+                    f_desc.value = it["description"]
+                self.ctx.page.update()
+        f_lib.on_select = use_prompt
+        return [f_model, f_lib, f_instr, g_tools, g_skills, f_scopes, ft.Row([f_steps, f_budget, f_time]), f_desc,
+                hint], \
             lambda: {"model": f_model.value, "instructions": f_instr.value, "tools": tools(), "skills": skills(),
                      "scopes": f_scopes.value, "max_steps": f_steps.value, "budget": f_budget.value,
                      "timeout": f_time.value, "description": f_desc.value}
