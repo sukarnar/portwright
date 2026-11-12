@@ -51,6 +51,23 @@ def _pdf_reports(cfg: Any) -> list[str]:
     return [r.name for r in getattr(cfg, "reports", []) if "pdf" in r.effective_formats()]
 
 
+def dll_checks() -> list[Check]:
+    """Name the DLLs WeasyPrint cannot find in WEASYPRINT_DLL_DIRECTORIES (Windows), and who needs them."""
+    from .reports.dlls import dll_folders, missing
+    folders = [f for f in dll_folders() if f.is_dir()]
+    if not folders:
+        return []
+    gone = missing(folders)
+    where = "; ".join(str(f) for f in folders)
+    if not gone:
+        return [Check("reports", "PDF: DLLs", "warn", f"every DLL WeasyPrint needs is in {where}, yet it does not "
+                      "load: check they all come from the same MSYS2 install (mingw64, 64-bit)")]
+    lines = [f"{dll} (needed by {', '.join(users)})" for dll, users in gone.items()]
+    return [Check("reports", "PDF: missing DLLs", "warn",
+                  f"{len(gone)} DLL(s) missing from {where}: " + "; ".join(lines)
+                  + ". Copy them from MSYS2's mingw64\\bin (or rebuild the folder with pango\\collect-pango.py)")]
+
+
 def pdf_checks(cfg: Any = None) -> list[Check]:
     """The PDF backends, and whether the project's PDF reports can be made with them."""
     from .reports.engine import active_pdf_backend, pdf_backends
@@ -66,6 +83,9 @@ def pdf_checks(cfg: Any = None) -> list[Check]:
         if missing:
             out.append(Check("reports", "WEASYPRINT_DLL_DIRECTORIES", "warn",
                              f"folder not found: {', '.join(missing)}"))
+    weasy = pdf_backends()[0]
+    if sys.platform == "win32" and weasy.installed and not weasy.ok:
+        out.extend(dll_checks())
     active = active_pdf_backend()
     needing = _pdf_reports(cfg)
     if active is None:

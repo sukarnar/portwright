@@ -1,12 +1,14 @@
 """Rebuild this folder from an MSYS2 install: WeasyPrint's DLLs, every DLL they depend on, and etc/fonts.
 
-Run on a machine with MSYS2 and Pango installed (in the MINGW64 shell: pacman -S mingw-w64-x86_64-pango):
+This is a BUILD step: run it on a machine that has MSYS2 with Pango installed (in the MINGW64 shell:
+pacman -S mingw-w64-x86_64-pango), from the portwright folder:
 
     python pango\\collect-pango.py C:\\msys64\\mingw64 pango
 
-Then copy the folder to the offline server and point WeasyPrint at its bin folder, for example in the
+Then copy the pango folder to the offline server and point WeasyPrint at its bin folder, e.g. in the
 project's .env:  WEASYPRINT_DLL_DIRECTORIES=C:\\apps\\portwright\\pango\\bin
-Check with:  pw doctor   (PDF: weasyprint should show ✓). This script warns about any DLL it could not find.
+The offline server needs neither MSYS2 nor this script: check it there with 'pw doctor', which names any
+DLL still missing.
 
 Only DLLs found in MSYS2's bin folder are copied; Windows' own DLLs (System32, api-ms-*) are left out.
 """
@@ -14,55 +16,27 @@ from __future__ import annotations
 
 import os
 import shutil
-import struct
 import sys
 from pathlib import Path
 
-# What WeasyPrint opens by name (weasyprint/text/ffi.py); everything else is found by following imports.
-ROOTS = ["libgobject-2.0-0.dll", "libpango-1.0-0.dll", "libpangoft2-1.0-0.dll", "libharfbuzz-0.dll",
-         "libharfbuzz-subset-0.dll", "libfontconfig-1.dll"]
-
-
-def imports(path: Path) -> list[str]:
-    """The DLL names in a PE file's import table."""
-    b = path.read_bytes()
-    pe = struct.unpack_from("<I", b, 0x3C)[0]
-    if b[pe:pe + 4] != b"PE\0\0":
-        raise ValueError(f"{path.name} is not a Windows DLL")
-    nsec = struct.unpack_from("<H", b, pe + 6)[0]
-    opt_size = struct.unpack_from("<H", b, pe + 20)[0]
-    opt = pe + 24
-    dirs = opt + (112 if struct.unpack_from("<H", b, opt)[0] == 0x20B else 96)
-    imp_rva = struct.unpack_from("<I", b, dirs + 8)[0]
-    if not imp_rva:
-        return []
-    sections = []
-    for i in range(nsec):
-        s = opt + opt_size + 40 * i
-        vsize, va, rsize, raw = struct.unpack_from("<IIII", b, s + 8)
-        sections.append((va, max(vsize, rsize), raw))
-
-    def offset(rva: int) -> int:
-        for va, size, raw in sections:
-            if va <= rva < va + size:
-                return rva - va + raw
-        raise ValueError(f"{path.name}: bad import table")
-
-    names, p = [], offset(imp_rva)
-    while (name_rva := struct.unpack_from("<I", b, p + 12)[0]) != 0:
-        n = offset(name_rva)
-        names.append(b[n:b.index(b"\0", n)].decode("ascii"))
-        p += 20
-    return names
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))    # the portwright folder, for its DLL reader
+from portwright.reports.dlls import WEASYPRINT_DLLS, imports  # noqa: E402
 
 
 def main(mingw: Path, out: Path) -> int:
     src = mingw / "bin"
+    if not src.is_dir():
+        print(f"{src} does not exist: give the MSYS2 mingw64 folder, e.g. C:\\msys64\\mingw64 "
+              "(this script runs where MSYS2 is installed, not on the offline server)")
+        return 1
+    if out.resolve() / "bin" == src.resolve():
+        print("the source and the target are the same folder")
+        return 1
     system = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32"
     by_lower = {p.name.lower(): p for p in src.glob("*.dll")}
     need: dict[str, Path] = {}
     unknown: dict[str, set[str]] = {}
-    todo = list(ROOTS)
+    todo = list(WEASYPRINT_DLLS)
     while todo:
         name = todo.pop()
         key = name.lower()
