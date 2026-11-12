@@ -27,7 +27,8 @@ postgres = ["psycopg[binary]>=3.1"]
 mysql = ["pymysql>=1.1"]
 mssql = ["pyodbc>=5"]
 oracle = ["oracledb>=2.0"]
-agents = ["mcp>=1.2"]       # MCP servers (agents themselves need no extra package)
+agents = ["mcp>=1.2,<2"]    # MCP servers (agents themselves need no extra package); 2.x adds a hard
+                            # dependency on opentelemetry-api and has not been tested with portwright
 keyring = ["keyring>=25"]   # Windows Credential Manager / macOS Keychain
 gui = ["flet==1.0.4", "flet-desktop==1.0.4", "flet-web==1.0.4"]   # portwright studio
 reports = ["jinja2>=3.1", "weasyprint>=62"]   # HTML/PDF report generation
