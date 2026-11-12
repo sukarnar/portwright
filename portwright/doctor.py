@@ -83,6 +83,44 @@ def pdf_checks(cfg: Any = None) -> list[Check]:
     return out
 
 
+KNOWN_WEASYPRINT_VARS = ("WEASYPRINT_DLL_DIRECTORIES",)
+
+
+def _dotenv_values(path: Path) -> dict[str, str]:
+    """KEY=VALUE lines of a .env file, read the same way the project loader reads them."""
+    out: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def load_project_env(env_path: Path) -> list[Check]:
+    """Load the project's .env (as every other command does) and check its PDF settings: a misspelt
+    WEASYPRINT_ variable, or a value that a machine-wide setting overrides."""
+    import difflib
+    from .services.project import load_dotenv
+    values = _dotenv_values(env_path)
+    out: list[Check] = []
+    for key, val in values.items():
+        if key.upper().startswith("WEASYPRINT_") and key not in KNOWN_WEASYPRINT_VARS:
+            close = difflib.get_close_matches(key.upper(), KNOWN_WEASYPRINT_VARS, n=1, cutoff=0.6)
+            out.append(Check("reports", key, "warn", f"in {env_path.name}: WeasyPrint does not read this variable"
+                             + (f"; did you mean {close[0]}?" if close else "")))
+        if key in KNOWN_WEASYPRINT_VARS and os.environ.get(key) not in (None, val):
+            out.append(Check("reports", key, "warn", f"{env_path.name} sets {val}, but the machine-wide value "
+                             f"{os.environ[key]} wins (remove one of them)"))
+    load_dotenv(env_path)
+    return out
+
+
 def run_checks(cfg: Any = None) -> list[Check]:
     """Every check. *cfg* (a loaded ProjectConfig) adds checks for what this project uses; None skips them."""
     py = sys.version_info
