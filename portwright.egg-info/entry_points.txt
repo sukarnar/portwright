@@ -1,0 +1,4 @@
+[console_scripts]
+portwright = portwright.cli:app
+pw = portwright.cli:app
+restforge = portwright.cli:app
