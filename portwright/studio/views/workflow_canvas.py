@@ -160,6 +160,7 @@ class WorkflowCanvas:
         w, h = gv.canvas_size(self.graph)
         self.stack.width, self.stack.height = w, h
         self.link_layer.width, self.link_layer.height = w, h
+        self.numbers = gv.step_numbers(self.graph)            # run order, from the links
         self.cards = {n.id: self._card(n) for n in self.graph.nodes}
         ports: list[ft.Control] = []
         for n in self.graph.nodes:
@@ -173,11 +174,18 @@ class WorkflowCanvas:
     def _card(self, n: gv.Node) -> ft.GestureDetector:
         label, icon, bg, accent = NODE_STYLE[n.type]
         sel = n.id == self.selected
+        num = getattr(self, "numbers", {}).get(n.id)
+        badge = ft.Container(
+            ft.Text(str(num) if num else "–", size=11, weight=ft.FontWeight.W_700,
+                    color=ft.Colors.WHITE if num else ft.Colors.BLACK_54),
+            bgcolor=accent if num else ft.Colors.GREY_300, border_radius=9, width=22, height=18,
+            alignment=ft.Alignment.CENTER,
+            tooltip=f"Step {num} in run order" if num else "Not reached: no link leads here from the start")
         card = ft.Container(
             width=gv.NODE_W, height=gv.node_h(n), bgcolor=bg, border_radius=10, padding=ft.Padding.symmetric(horizontal=10, vertical=8),
             border=ft.Border.all(3 if sel else 1, accent if sel else ft.Colors.OUTLINE_VARIANT),
             content=ft.Column([
-                ft.Row([ft.Icon(icon, size=16, color=accent),
+                ft.Row([badge, ft.Icon(icon, size=16, color=accent),
                         ft.Text(n.id, weight=ft.FontWeight.W_600, size=13, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS,
                                 expand=True, color=ft.Colors.BLACK_87),
                         *([ft.Icon(ft.Icons.FLAG, size=14, color=ft.Colors.GREEN_700, tooltip="Start")]

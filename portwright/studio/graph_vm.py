@@ -178,9 +178,10 @@ def from_steps(steps: list[dict]) -> Graph:
 
 
 def to_steps(g: Graph) -> list[dict]:
-    """Steps in run order: the start node first, then the rest as reached; every link written explicitly."""
-    order = reachable(g)
-    order += [n.id for n in g.nodes if n.id not in order]
+    """Steps in run order (see run_order); every link written explicitly, so the list order never changes
+    what runs. Steps no link reaches go last, left to right as drawn."""
+    order = run_order(g)
+    order += [n.id for n in sorted((n for n in g.nodes if n.id not in order), key=lambda n: (n.x, n.y))]
     out = []
     for nid in order:
         n = g.node(nid)
@@ -252,6 +253,69 @@ def to_steps(g: Graph) -> list[dict]:
     return out
 
 
+def run_order(g: Graph) -> list[str]:
+    """Node ids in the order the workflow reads: from the start, follow 'next' (or 'then') to the end of the
+    path, then come back for 'else' and each switch case in turn. A straight chain is numbered 1, 2, 3 in the
+    order it runs, and each branch stays together instead of being interleaved with the other."""
+    if not g.nodes:
+        return []
+    seen: list[str] = []
+    stack = [g.start]
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.append(cur)
+        n = g.node(cur)
+        targets = [g.links.get((cur, p)) for p in n.ports]
+        for tgt in reversed([t for t in targets if t]):     # first port on top: followed first
+            if tgt not in seen:
+                stack.append(tgt)
+    return seen
+
+
+def step_numbers(g: Graph) -> dict[str, int]:
+    """{node id: 1, 2, ...} in run order; nodes no link reaches from the start have no number."""
+    return {nid: i for i, nid in enumerate(run_order(g), start=1)}
+
+
+def incoming(g: Graph) -> dict[str, int]:
+    count = {n.id: 0 for n in g.nodes}
+    for (src, _), dst in g.links.items():
+        if dst in count and src != dst:
+            count[dst] += 1
+    return count
+
+
+def auto_start(g: Graph) -> bool:
+    """Make the step everything flows from the start, when the links say so unambiguously: the current start
+    has a step pointing to it, and exactly one step has nothing pointing to it and leads to the start.
+    (A loop back to the start does not move it.) Returns True when the start changed."""
+    if len(g.nodes) < 2:
+        return False
+    into = incoming(g)
+    if not into.get(g.start):
+        return False
+    roots = [n.id for n in g.nodes if into[n.id] == 0 and n.id != g.start]
+    leads = [r for r in roots if g.start in _reach_from(g, r)]
+    if len(leads) != 1:
+        return False
+    set_start(g, leads[0])
+    return True
+
+
+def _reach_from(g: Graph, node_id: str) -> set[str]:
+    seen, stack = {node_id}, [node_id]
+    while stack:
+        cur = stack.pop()
+        for p in g.node(cur).ports:
+            tgt = g.links.get((cur, p))
+            if tgt and tgt not in seen:
+                seen.add(tgt)
+                stack.append(tgt)
+    return seen
+
+
 def reachable(g: Graph) -> list[str]:
     """Node ids in the order a run could reach them from the start (breadth first)."""
     if not g.nodes:
@@ -299,6 +363,7 @@ def connect(g: Graph, src: str, port: str, dst: str) -> None:
     if node is None or g.node(dst) is None or port not in node.ports:
         raise ValueError("cannot connect")
     g.links[(src, port)] = dst
+    auto_start(g)                    # linking a step in front of the start makes it the new start
 
 
 def disconnect(g: Graph, src: str, port: str) -> None:
@@ -346,7 +411,8 @@ def prefill_choices(g: Graph, tools: list[str], agents: list[str], models: list[
 
 # ----------------------------------------------------------------- layout
 def auto_layout(g: Graph) -> None:
-    """Columns by distance from the start, rows within a column; unreachable nodes go in a last column."""
+    """Columns by distance from the start, rows within a column in run order; unreachable nodes go in a last
+    column. So steps read left to right in the order they run."""
     depth: dict[str, int] = {}
     if g.nodes:
         depth[g.start] = 0
@@ -360,7 +426,8 @@ def auto_layout(g: Graph) -> None:
                     queue.append(tgt)
     last = (max(depth.values()) + 1) if depth else 0
     used: dict[int, float] = {}
-    for n in g.nodes:
+    rank = {nid: i for i, nid in enumerate(run_order(g))}
+    for n in sorted(g.nodes, key=lambda m: rank.get(m.id, len(rank))):
         d = depth.get(n.id, last)
         n.x = 40 + d * (NODE_W + GAP_X)
         n.y = used.get(d, 40)
