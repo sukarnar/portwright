@@ -184,9 +184,10 @@ class PdfBackend:
                 "css": self.css}
 
 
-_WEASY_FIX = ("WeasyPrint is installed but cannot load the GTK/Pango libraries. On Windows install MSYS2, "
-              "run 'pacman -S mingw-w64-x86_64-pango', and set WEASYPRINT_DLL_DIRECTORIES=C:\\msys64\\mingw64\\bin "
-              "(see 'portwright docs reports'). Until then PDFs use xhtml2pdf if it is installed.")
+_WEASY_FIX = ("WeasyPrint is installed but cannot load the GTK/Pango libraries. On Windows set "
+              "WEASYPRINT_DLL_DIRECTORIES to a folder with them: MSYS2's mingw64\\bin, or a copied pango\\bin "
+              "(any DLL still missing is listed below; see 'portwright docs reports'). Until then PDFs use "
+              "xhtml2pdf if it is installed.")
 
 
 def _probe_weasyprint() -> PdfBackend:

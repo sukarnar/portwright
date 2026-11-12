@@ -414,7 +414,14 @@ which pip cannot install:
 
 4. Open a new terminal (or restart the service) and run `portwright doctor` again.
 
-On a server where you cannot install MSYS2, `pip install xhtml2pdf` is enough. Keep templates simple
+**Offline servers (no MSYS2).** Copy just the DLLs instead. On a machine with MSYS2 and Pango, build the
+folder with `python pango\collect-pango.py C:\msys64\mingw64 pango`: it copies the DLLs WeasyPrint opens,
+every DLL they depend on (27 in all, about 16 MB) and `etc\fonts`. Copy the `pango` folder to the server,
+make it writable only by administrators, and set `WEASYPRINT_DLL_DIRECTORIES` to its `bin` folder (machine-wide,
+in the project's `.env`, or in a one-line `.pth` file in the venv's `site-packages`). If a DLL is still
+missing, `portwright doctor` names it and the DLLs that need it.
+
+On a server where you cannot install MSYS2 or copy DLLs, `pip install xhtml2pdf` is enough. Keep templates simple
 (tables, no flex or grid) so they look the same with either backend. The AI author already does;
 the built-in `invoice`, `summary_dashboard` and `financial_accounting` templates use flex for their
 header and KPI cards, which xhtml2pdf stacks vertically.

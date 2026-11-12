@@ -1522,14 +1522,17 @@ def doctor(config: str = CONFIG_OPT,
     Inside a project it also checks what that project needs (e.g. PDF reports need a working PDF backend).
     Exit code 1 when something the project uses cannot work."""
     import json as _json
-    from .doctor import run_checks
-    cfg = None
+    from .doctor import load_project_env, run_checks
+    cfg, env_checks = None, []
     if Path(config).is_file():
+        # the project's .env first, as for every other command: it may set WEASYPRINT_DLL_DIRECTORIES
+        env_checks = load_project_env(Path(config).resolve().parent / ".env")
         try:
             cfg = ProjectConfig.load(config)
         except ConfigError as exc:
             typer.secho(f"⚠ {config} has errors, so project checks are skipped: {exc}", fg="yellow")
     checks = run_checks(cfg)
+    checks[1:1] = env_checks                                 # after Python, before the report checks
     if as_json:
         typer.echo(_json.dumps([c.to_dict() for c in checks], indent=2))
     else:

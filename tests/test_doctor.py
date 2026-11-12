@@ -93,6 +93,32 @@ def test_run_checks_lists_core_and_addons(monkeypatch):
     assert names["Python"].status == "ok"
 
 
+def test_doctor_reads_the_project_env(monkeypatch, svc, tmp_path):
+    use(monkeypatch, WEASY_OK, PISA_OK)
+    monkeypatch.delenv("WEASYPRINT_DLL_DIRECTORIES", raising=False)
+    monkeypatch.delenv("WEASYPRINT_ALL_DIRECTORIES", raising=False)
+    dlls = tmp_path / "pango" / "bin"
+    dlls.mkdir(parents=True)
+    env = svc.project.root / ".env"                # first line, after a BOM as Windows PowerShell writes it
+    env.write_text(f"﻿WEASYPRINT_DLL_DIRECTORIES={dlls}\n" + env.read_text() + "WEASYPRINT_ALL_DIRECTORIES=x\n",
+                   encoding="utf-8")
+    seen = {}
+    real = engine.active_pdf_backend
+
+    def spy():                                   # what WeasyPrint would see when it is probed
+        seen["dll"] = __import__("os").environ.get("WEASYPRINT_DLL_DIRECTORIES")
+        return real()
+    monkeypatch.setattr(engine, "active_pdf_backend", spy)
+    r = CliRunner().invoke(app, ["doctor", "-c", str(svc.project.path), "--json"])
+    out = {c["name"]: c for c in json.loads(r.output)}
+    assert seen["dll"] == str(dlls)
+    assert "did you mean WEASYPRINT_DLL_DIRECTORIES" in out["WEASYPRINT_ALL_DIRECTORIES"]["detail"]
+    monkeypatch.setenv("WEASYPRINT_DLL_DIRECTORIES", "C:/elsewhere")      # a machine-wide value wins
+    r = CliRunner().invoke(app, ["doctor", "-c", str(svc.project.path), "--json"])
+    details = [c["detail"] for c in json.loads(r.output) if c["name"] == "WEASYPRINT_DLL_DIRECTORIES"]
+    assert any("machine-wide value C:/elsewhere wins" in d for d in details)
+
+
 def test_doctor_cli_exit_code_and_json(monkeypatch, svc):
     cfg = str(svc.project.path)
     runner = CliRunner()

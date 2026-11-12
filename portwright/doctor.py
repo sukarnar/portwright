@@ -51,6 +51,23 @@ def _pdf_reports(cfg: Any) -> list[str]:
     return [r.name for r in getattr(cfg, "reports", []) if "pdf" in r.effective_formats()]
 
 
+def dll_checks() -> list[Check]:
+    """Name the DLLs WeasyPrint cannot find in WEASYPRINT_DLL_DIRECTORIES (Windows), and who needs them."""
+    from .reports.dlls import dll_folders, missing
+    folders = [f for f in dll_folders() if f.is_dir()]
+    if not folders:
+        return []
+    gone = missing(folders)
+    where = "; ".join(str(f) for f in folders)
+    if not gone:
+        return [Check("reports", "PDF: DLLs", "warn", f"every DLL WeasyPrint needs is in {where}, yet it does not "
+                      "load: check they all come from the same MSYS2 install (mingw64, 64-bit)")]
+    lines = [f"{dll} (needed by {', '.join(users)})" for dll, users in gone.items()]
+    return [Check("reports", "PDF: missing DLLs", "warn",
+                  f"{len(gone)} DLL(s) missing from {where}: " + "; ".join(lines)
+                  + ". Copy them from MSYS2's mingw64\\bin (or rebuild the folder with pango\\collect-pango.py)")]
+
+
 def pdf_checks(cfg: Any = None) -> list[Check]:
     """The PDF backends, and whether the project's PDF reports can be made with them."""
     from .reports.engine import active_pdf_backend, pdf_backends
@@ -66,6 +83,9 @@ def pdf_checks(cfg: Any = None) -> list[Check]:
         if missing:
             out.append(Check("reports", "WEASYPRINT_DLL_DIRECTORIES", "warn",
                              f"folder not found: {', '.join(missing)}"))
+    weasy = pdf_backends()[0]
+    if sys.platform == "win32" and weasy.installed and not weasy.ok:
+        out.extend(dll_checks())
     active = active_pdf_backend()
     needing = _pdf_reports(cfg)
     if active is None:
@@ -80,6 +100,44 @@ def pdf_checks(cfg: Any = None) -> list[Check]:
                          "will look different. Install WeasyPrint's GTK/Pango libraries for full CSS"))
     else:
         out.append(Check("reports", "PDF output", "ok", "PDFs use WeasyPrint"))
+    return out
+
+
+KNOWN_WEASYPRINT_VARS = ("WEASYPRINT_DLL_DIRECTORIES",)
+
+
+def _dotenv_values(path: Path) -> dict[str, str]:
+    """KEY=VALUE lines of a .env file, read the same way the project loader reads them."""
+    out: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def load_project_env(env_path: Path) -> list[Check]:
+    """Load the project's .env (as every other command does) and check its PDF settings: a misspelt
+    WEASYPRINT_ variable, or a value that a machine-wide setting overrides."""
+    import difflib
+    from .services.project import load_dotenv
+    values = _dotenv_values(env_path)
+    out: list[Check] = []
+    for key, val in values.items():
+        if key.upper().startswith("WEASYPRINT_") and key not in KNOWN_WEASYPRINT_VARS:
+            close = difflib.get_close_matches(key.upper(), KNOWN_WEASYPRINT_VARS, n=1, cutoff=0.6)
+            out.append(Check("reports", key, "warn", f"in {env_path.name}: WeasyPrint does not read this variable"
+                             + (f"; did you mean {close[0]}?" if close else "")))
+        if key in KNOWN_WEASYPRINT_VARS and os.environ.get(key) not in (None, val):
+            out.append(Check("reports", key, "warn", f"{env_path.name} sets {val}, but the machine-wide value "
+                             f"{os.environ[key]} wins (remove one of them)"))
+    load_dotenv(env_path)
     return out
 
 
