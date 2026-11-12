@@ -21,6 +21,7 @@ NODE_STYLE = {   # type -> (label, icon, background, accent)
     "copy": ("Copy", ft.Icons.FILE_COPY, ft.Colors.LIGHT_GREEN_50, ft.Colors.LIGHT_GREEN_900),
     "move": ("Move", ft.Icons.DRIVE_FILE_MOVE, ft.Colors.DEEP_ORANGE_50, ft.Colors.DEEP_ORANGE_800),
     "file": ("Files", ft.Icons.FOLDER, ft.Colors.BLUE_GREY_50, ft.Colors.BLUE_GREY_700),
+    "email": ("Email", ft.Icons.EMAIL, ft.Colors.RED_50, ft.Colors.RED_800),
     "foreach": ("For each", ft.Icons.REPEAT, ft.Colors.PINK_50, ft.Colors.PINK_700),
     "switch": ("Switch", ft.Icons.ALT_ROUTE, ft.Colors.DEEP_PURPLE_50, ft.Colors.DEEP_PURPLE_700),
     "set": ("Set value", ft.Icons.EDIT_NOTE, ft.Colors.GREEN_50, ft.Colors.GREEN_700),
@@ -199,6 +200,8 @@ class WorkflowCanvas:
                 "report": (opts.get("report") or "inline report") + (f" · {fmts}" if fmts else ""),
                 "copy": f"→ {to}", "move": f"→ {to} (removes sources)",
                 "file": str(opts.get("op") or "choose an operation") + " " + str(opts.get("to") or opts.get("path") or ""),
+                "email": ("to " + rvm.show_value(opts.get("to")) if opts.get("to") else "choose recipients")
+                         + (f" · {opts['server']}" if opts.get("server") else ""),
                 "input": names or "declare the inputs", "tool": n.tool or "choose a tool",
                 "agent": n.agent or "choose an agent", "condition": n.when or "enter a condition",
                 "llm": (n.model or "choose a model") + (" · JSON" if n.format == "json" else ""),
@@ -421,6 +424,10 @@ class WorkflowCanvas:
                 "The source folder must be writable and the workflow needs fs:<root>:write for it.",
         "file": "op: write (to, content) | read (path) | list (path, glob, recursive) | mkdir (to) | "
                 "delete (files; goes to the trash folder) | zip (files, to: reports:archive/x.zip).",
+        "email": "Sends a message through a mail server (portwright mail add). to / cc / bcc: a list or "
+                 "\"a@corp.local, b@corp.local\"; only addresses the server allows. files: attachments, e.g. "
+                 "${steps.<report>.output.outputs}. html: true sends body as HTML. Needs the scope "
+                 "mail:<server>, and fs:reports:read for report outputs.",
     }
 
     def _settings_fields(self, n: gv.Node, bind) -> list[ft.Control]:
@@ -451,7 +458,7 @@ class WorkflowCanvas:
             self.show_inspector()
         box.on_blur = commit_yaml
         form = {"report": self._form_report, "report_design": self._form_design, "copy": self._form_transfer,
-                "move": self._form_transfer, "file": self._form_file}[n.type]
+                "move": self._form_transfer, "file": self._form_file, "email": self._form_email}[n.type]
         return [*form(n, opts, on, put, bind), _help(self._SETTINGS_HELP[n.type]), box]
 
     def _formats_row(self, opts: dict, put, label: str) -> list[ft.Control]:
@@ -522,6 +529,42 @@ class WorkflowCanvas:
         if verb == "move":
             out.append(ft.Text("Source files are removed after a verified copy. The source folder must be "
                                "writable.", size=12, color=ft.Colors.DEEP_ORANGE_800))
+        return out
+
+    def _form_email(self, n: gv.Node, opts: dict, on, put, bind) -> list[ft.Control]:
+        servers = sorted(self.cfg.mail_servers)
+        out: list[ft.Control] = []
+        if servers:
+            out.append(on(dropdown("Mail server", {s: f"{s} ({self.cfg.mail_servers[s].host})" for s in servers},
+                                   opts.get("server") or (servers[0] if len(servers) == 1 else None)), "server"))
+            if len(servers) == 1 and not opts.get("server"):
+                rvm.set_opt(n, "server", servers[0])
+            spec = self.cfg.mail_servers.get(opts.get("server") or servers[0])
+            if spec:
+                out.append(_help(f"From {spec.from_}; allowed recipients: {', '.join(spec.recipient_patterns())}"))
+        else:
+            out.append(ft.Text("No mail servers yet: portwright mail add <name> --host … --from …",
+                               size=12, color=ft.Colors.AMBER_800))
+        for key, label, hint in (("to", "To", "a@corp.local, b@corp.local or ${input.recipients}"),
+                                 ("cc", "Cc (optional)", ""), ("bcc", "Bcc (optional)", "")):
+            out.append(on(text_field(label, rvm.show_value(opts.get(key)), hint=hint), key, rvm.parse_value))
+        out.append(on(text_field("Subject", opts.get("subject") or "", hint="e.g. Headcount ${run.date.iso}"),
+                      "subject"))
+        out.append(on(text_field("Message", rvm.show_value(opts.get("body")), multiline=True, min_lines=3,
+                                 hint="plain text; ${steps.<id>.output} values are filled in"), "body"))
+        out.append(on(ft.Checkbox(label="The message is HTML", value=bool(opts.get("html"))), "html",
+                      lambda v: True if v else None))
+        files = text_field("Attachments", rvm.show_value(opts.get("files")),
+                           hint="a report step's ${steps.<id>.output.outputs}, paths or root:path addresses")
+        on(files, "files", rvm.parse_value)
+        out.append(files)
+        suggestion = rvm.suggested_files(self.graph, n.id)
+        if suggestion and not opts.get("files"):
+            def use(_):
+                files.value = suggestion
+                _touch(files)
+                put("files", suggestion)
+            out.append(ft.TextButton(f"Attach {suggestion}", icon=ft.Icons.ATTACH_FILE, on_click=use))
         return out
 
     def _form_file(self, n: gv.Node, opts: dict, on, put, bind) -> list[ft.Control]:

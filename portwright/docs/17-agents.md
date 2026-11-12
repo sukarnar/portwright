@@ -164,8 +164,46 @@ workflows:
 - `file`: `op: write` (`to`, `content`; a value that isn't text is written as JSON), `read` (`path`), `list`
   (`path`, `glob`, `recursive`), `mkdir` (`to`), `delete` (`files`; moved to `.portwright/trash` by default) or
   `zip` (`files`, `to: reports:archive/x.zip`).
+- `email`: sends a message through a mail server, with `files` attached (see *Email* below).
 - `${run.id}`, `${run.started_at}` (UTC) and `${run.date.year|month|day|iso}`, `${run.time}` (local time,
   zero padded) are available in every step for naming folders and files.
+
+**Email.** Define a mail server once, then send report outputs from any workflow:
+
+```yaml
+security:
+  allowed_mail_hosts: [smtp.corp.local]       # portwright mail add adds the host for you
+mail_servers:
+  corp:
+    host: smtp.corp.local
+    security: starttls                        # starttls (port 587) | ssl (465) | none (25, internal relay only)
+    credential: smtp_login                    # a basic credential: username + password (omit for a relay)
+    from: reports@corp.local
+    allowed_recipients: ["*@corp.local", "auditor@partner.com"]   # default: the From address's domain
+    max_attachments_mb: 20
+    ca_bundle: certs/corp-ca.pem              # optional corporate CA
+
+workflows:
+  monthly-headcount:
+    scopes: [reports:run, fs:reports:read, mail:corp]
+    steps:
+      - {id: build, type: report, report: dept-headcount, formats: [pdf, xlsx]}
+      - {id: send,  type: email, server: corp, to: [hr-leads@corp.local], cc: "${input.cc}",
+         subject: "Headcount ${run.date.iso}", body: "Attached: ${steps.build.output.row_count} rows.",
+         files: "${steps.build.output.outputs}"}
+```
+
+- `to`, `cc`, `bcc`: a list, or text like `"a@corp.local, Team <b@corp.local>"`. Every address must match the
+  server's `allowed_recipients`, up to `max_recipients` (default 50). Bcc addresses never appear in the headers.
+- `subject` and `body` can use `${...}`; `html: true` sends the body as HTML. Line breaks in the subject or an
+  address are refused, so values from inputs can't add headers.
+- `files` are read through the filesystem roots, so the workflow needs read scopes for them
+  (`fs:reports:read` for report outputs). All attachments together stay under `max_attachments_mb`; for bigger
+  files, copy them to a share and send the link instead.
+- A login is only sent over TLS (`starttls` must succeed, or `ssl`); certificates are checked.
+- The workflow needs the scope `mail:<server>`. Each message is audited as `mail_sent` (server, recipients,
+  subject, attachment names and SHA-256). The body is never logged.
+- The output is `{message_id, to, cc, bcc, subject, attachments: [{name, bytes, sha256}], bytes}`.
 
 **Filesystem roots.** Steps only reach named folders. `reports` (`reports/output`, read-write), `templates`
 (read-write) and `data` (the data folder, read-only) always exist; add more under `filesystem.roots`:
@@ -223,7 +261,9 @@ Open **Agents**. The tabs follow the order you build things in:
    condition on the right. On a Tool node, **Query a SQL source** or **Call an endpoint** picks it straight away
    and creates the tool behind it. **Input** and **Output** nodes declare what the workflow takes and returns; **LLM prompt**, **Run load**,
    **For each** and **Switch** nodes cover single model calls, loads, loops and multi-way branches
-   (a Switch node grows one port per case, one case per line).
+   (a Switch node grows one port per case, one case per line). An **Email** node picks a mail server, the
+   recipients, subject and message, and attaches files (**Attach** fills in the outputs of the report before it);
+   mail servers themselves are set up with `portwright mail add`.
    For a new workflow, **Start from a template** loads a ready-made layout. **Add** edits the same steps as YAML.
    **Play** asks for the input values (pre-filled with the defaults from the Input node).
 6. **Run history** lists saved runs; **eye** opens every step and tool call.
@@ -251,6 +291,12 @@ portwright workflow templates                                  # ready-made work
 portwright workflow templates hello > hello.yaml                 # print one as YAML, then edit it
 portwright workflow add weekly_check --file weekly_check.yaml
 portwright workflow run weekly_check --input dept=ENG
+
+portwright cred add smtp_login -t basic                          # the mail login (prompted, hidden)
+portwright mail add corp --host smtp.corp.local --from reports@corp.local --credential smtp_login `
+  --allow "*@corp.local"
+portwright mail test corp --to me@corp.local                     # host, TLS, login and recipient rules
+portwright mail test corp --to me@corp.local --dry-run --save test.eml   # build it without sending
 ```
 
 Over HTTP (scopes `agent:run` / `workflow:run`): `POST /api/_agents/NAME/run` with `{"task": "..."}` and

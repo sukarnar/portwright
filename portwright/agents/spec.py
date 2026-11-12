@@ -101,7 +101,7 @@ class AgentSpec(BaseModel):
 
 
 StepType = Literal["input", "tool", "agent", "llm", "load", "foreach", "condition", "switch", "set", "output",
-                   "report", "report_design", "copy", "move", "file"]
+                   "report", "report_design", "copy", "move", "file", "email"]
 FileOp = Literal["write", "read", "list", "mkdir", "delete", "zip"]
 Overwrite = Literal["never", "always", "rename", "if_newer"]
 
@@ -125,7 +125,7 @@ class WorkflowStep(BaseModel):
     format: Literal["text", "json"] = "text"   # llm: 'json' asks for a JSON reply and parses it for later steps
     load: str | None = None              # load: the data load to run (needs scope load:run)
     items: Any = None                    # foreach: the list to loop over, e.g. ${steps.q.output.rows}
-    do: Literal["tool", "agent", "llm", "load", "report", "copy", "move"] | None = None   # foreach: per item
+    do: Literal["tool", "agent", "llm", "load", "report", "copy", "move", "email"] | None = None   # foreach: per item
     max_items: int = Field(50, ge=1, le=1000)   # foreach: refuse longer lists instead of running them all
     cases: dict[str, str] | None = None  # switch: value -> step id (or 'end'); 'when' is the value switched on
     default: str | None = None           # switch: step id when no case matches (default: the following step)
@@ -140,7 +140,16 @@ class WorkflowStep(BaseModel):
     output_path: str | None = None       # report: output path stem
     # copy / move / file
     files: Any = None                    # copy / move / zip / delete: paths, addresses or report outputs
-    to: str | None = None                # copy / move: target folder; file write / mkdir / zip: target
+    #                                      email: the attachments
+    to: str | list[str] | None = None    # copy / move: target folder; file write / mkdir / zip: target
+    #                                      email: recipients (a list, or "a@x, b@y")
+    # email: send through a mail server (needs the scope mail:<server>); files are attachments
+    server: str | None = None
+    cc: str | list[str] | None = None
+    bcc: str | list[str] | None = None
+    subject: str | None = None
+    body: str | None = None              # plain text, or HTML with html: true
+    html: bool = False
     path: str | None = None              # file read / list: what to read
     op: FileOp | None = None             # file: the operation
     content: Any = None                  # file write: text or a value written as JSON
@@ -188,6 +197,12 @@ class WorkflowStep(BaseModel):
             raise ValueError(f"step '{self.id}': an inline report step needs 'data'")
         if kind in ("copy", "move") and (self.files in (None, "", []) or not self.to):
             raise ValueError(f"step '{self.id}': type {kind} needs 'files' and 'to' (a folder)")
+        if kind in ("copy", "move") and isinstance(self.to, list):
+            raise ValueError(f"step '{self.id}': type {kind} 'to' is one folder, not a list")
+        if kind == "email":
+            missing = [f for f in ("server", "to", "subject") if getattr(self, f) in (None, "", [])]
+            if missing:
+                raise ValueError(f"step '{self.id}': an email step needs {', '.join(missing)}")
         if self.type == "file":
             need = {"write": ("to",), "read": ("path",), "list": ("path",), "mkdir": ("to",),
                     "delete": ("files",), "zip": ("files", "to")}
@@ -200,10 +215,11 @@ class WorkflowStep(BaseModel):
             if self.items is None or self.items == "":
                 raise ValueError(f"step '{self.id}': type foreach needs 'items'")
             target = {"tool": self.tool, "agent": self.agent, "llm": self.model, "load": self.load,
-                      "report": self.report or self.formats, "copy": self.to, "move": self.to}.get(self.do or "")
+                      "report": self.report or self.formats, "copy": self.to, "move": self.to,
+                      "email": self.server}.get(self.do or "")
             if not target:
-                raise ValueError(f"step '{self.id}': foreach needs 'do' (tool, agent, llm, load, report, copy or "
-                                 "move) and what it runs")
+                raise ValueError(f"step '{self.id}': foreach needs 'do' (tool, agent, llm, load, report, copy, "
+                                 "move or email) and what it runs")
         return self
 
 

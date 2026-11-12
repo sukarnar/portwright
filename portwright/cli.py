@@ -2015,6 +2015,133 @@ def mcp_remove(name: str, config: str = CONFIG_OPT):
     _remove_kind("mcp", name, config)
 
 
+# ----------------------------------------------------------------------------------- mail
+mail_app = typer.Typer(help="Mail servers for email steps (report deliveries) and test sends.", no_args_is_help=True)
+app.add_typer(mail_app, name="mail")
+
+
+@mail_app.command("add")
+def mail_add(
+    name: str,
+    host: str = typer.Option(..., help="SMTP server, e.g. smtp.corp.local"),
+    from_: str = typer.Option(..., "--from", help="Sender address, e.g. reports@corp.local"),
+    port: Optional[int] = typer.Option(None, help="Default: 587 (starttls), 465 (ssl), 25 (none)."),
+    security: str = typer.Option("starttls", help="starttls | ssl | none (none only for a relay without login)"),
+    credential: Optional[str] = typer.Option(None, help="A basic credential (username + password) for the login."),
+    allow: list[str] = typer.Option([], "--allow", help="Allowed recipients, e.g. '*@corp.local' (repeatable). "
+                                                         "Default: the From address's domain."),
+    reply_to: Optional[str] = typer.Option(None, "--reply-to"),
+    ca_bundle: Optional[str] = typer.Option(None, "--ca-bundle", help="PEM file of a corporate CA."),
+    max_mb: int = typer.Option(20, "--max-mb", help="Attachment limit per message (MB)."),
+    replace: bool = False,
+    config: str = CONFIG_OPT,
+):
+    """Define a mail server and allow its host in security.allowed_mail_hosts."""
+    from .config import MailServerSpec
+    cfg = _load(config)
+    if name in cfg.mail_servers and not replace:
+        _fail(Exception(f"mail server '{name}' exists (use --replace)"))
+    try:
+        spec = MailServerSpec.model_validate({
+            "host": host, "port": port, "security": security, "credential": credential, "from": from_,
+            "reply_to": reply_to, "allowed_recipients": list(allow), "ca_bundle": ca_bundle,
+            "max_attachments_mb": max_mb})
+    except ValueError as exc:
+        raise typer.BadParameter(_clean_validation(exc))
+    cfg.mail_servers[name] = spec
+    if host.lower() not in {h.lower() for h in cfg.security.allowed_mail_hosts}:
+        cfg.security.allowed_mail_hosts.append(host)
+    _save(cfg, config)
+    _ok(f"Mail server '{name}' saved ({host}:{spec.effective_port()}, {security}); recipients allowed: "
+        f"{', '.join(spec.recipient_patterns())}")
+    typer.echo(f"Next: portwright mail test {name} --to you@{from_.split('@', 1)[1]}")
+
+
+@mail_app.command("list")
+def mail_list(config: str = CONFIG_OPT):
+    """List mail servers."""
+    cfg = _load(config)
+    if not cfg.mail_servers:
+        typer.echo("No mail servers yet. Add one with 'portwright mail add'.")
+    for n, s in cfg.mail_servers.items():
+        allowed = "" if s.host.lower() in {h.lower() for h in cfg.security.allowed_mail_hosts} else "  (host not allowed)"
+        typer.echo(f"{n:<14} {s.host}:{s.effective_port()} {s.security:<8} from {s.from_}  "
+                   f"to {', '.join(s.recipient_patterns())}{allowed}")
+
+
+@mail_app.command("remove")
+def mail_remove(name: str, config: str = CONFIG_OPT):
+    """Remove a mail server (fails while a workflow step uses it)."""
+    cfg = _load(config)
+    if name not in cfg.mail_servers:
+        _fail(Exception(f"no mail server '{name}'"))
+    users = [f"{w}.{st.id}" for w, spec in cfg.workflows.items() for st in spec.steps if st.server == name]
+    if users:
+        _fail(Exception(f"used by workflow step(s) {', '.join(users)}; change them first"))
+    del cfg.mail_servers[name]
+    _save(cfg, config)
+    _ok(f"Mail server '{name}' removed")
+
+
+def _mail_send(name: str, to: list[str], subject: str, body: str, attach: list[str], dry_run: bool,
+               save: Optional[Path], config: str, html: bool = False, cc: list[str] | None = None):
+    from .fs import Sandbox
+    from .mail import Attachment, Mailer, MailError
+    svc = _svc(config)
+    p = svc.project
+    try:
+        mailer = Mailer(p.config, p.root, p.credentials(), actor="cli")
+        spec = mailer.server(name)
+        atts = []
+        if attach:
+            sb = Sandbox(p.config, p.root, actor="cli")
+            atts = [Attachment(pl.path.name, data, pl.address)
+                    for pl, data in sb.read_files(list(attach), spec.max_attachments_mb * 1024 * 1024)]
+        return mailer.send(name, to=list(to), cc=list(cc or []), subject=subject, body=body, html=html,
+                           attachments=atts, dry_run=dry_run, save_to=save)
+    except Exception as exc:                                     # MailError, FsError, CredentialError
+        _fail(exc if isinstance(exc, MailError) else Exception(str(exc)))
+
+
+@mail_app.command("test")
+def mail_test(name: str, to: list[str] = typer.Option(..., "--to", help="Recipient (repeatable)."),
+              dry_run: bool = typer.Option(False, "--dry-run", help="Check and build the message; don't send."),
+              save: Optional[Path] = typer.Option(None, "--save", help="Also write the message to this .eml file."),
+              config: str = CONFIG_OPT):
+    """Send a short test message: proves host, TLS, login and recipient rules."""
+    import socket
+    res = _mail_send(name, to, f"Portwright test message ({name})",
+                     f"This test message was sent by portwright on {socket.gethostname()} through the mail server "
+                     f"'{name}'.\nIf you can read it, email steps can use this server.", [], dry_run, save, config)
+    _ok(("Checked (not sent): " if dry_run else "Sent: ") + f"{res.message_id} to {', '.join(res.to)}")
+
+
+@mail_app.command("send")
+def mail_send(name: str, to: list[str] = typer.Option(..., "--to", help="Recipient (repeatable)."),
+              subject: str = typer.Option(..., "--subject", "-s"),
+              body: str = typer.Option("", "--body", "-b", help="Text, or @file.txt / @file.html."),
+              attach: list[str] = typer.Option([], "--attach", "-a",
+                                               help="File to attach: a path or address like reports:output/x.pdf "
+                                                    "(repeatable)."),
+              cc: list[str] = typer.Option([], "--cc"),
+              dry_run: bool = typer.Option(False, "--dry-run"),
+              save: Optional[Path] = typer.Option(None, "--save", help="Also write the message to this .eml file."),
+              as_json: bool = typer.Option(False, "--json"),
+              config: str = CONFIG_OPT):
+    """Send a message with attachments (e.g. from a scheduler after 'report run'). Exit code 0 sent, 1 failed."""
+    html = False
+    if body.startswith("@"):
+        f = Path(body[1:])
+        html = f.suffix.lower() in (".html", ".htm")
+        body = f.read_text(encoding="utf-8")
+    res = _mail_send(name, to, subject, body, attach, dry_run, save, config, html=html, cc=cc)
+    if as_json:
+        typer.echo(json.dumps(res.to_dict(), indent=2))
+    else:
+        _ok(("Checked (not sent): " if dry_run else "Sent: ") + f"{res.message_id} to {', '.join(res.to)}"
+            + (f" with {len(res.attachments)} attachment(s)" if res.attachments else ""))
+
+
 @app.command()
 def serve(config: str = CONFIG_OPT,
           host: Optional[str] = typer.Option(None, help="Default from config (127.0.0.1)."),
